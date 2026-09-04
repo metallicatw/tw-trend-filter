@@ -137,3 +137,71 @@ def test_excel_連結有給才出現(tmp_path):
 
 def test_沒有任何標的時不產生檔案(tmp_path):
     assert build_interactive_html([], '2026-09-04', str(tmp_path)) is None
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 切換個股要快。三件事各自都不會讓任何東西壞掉，只會讓桌機上每切一檔就卡
+# 兩三秒——而那種問題沒有測試守著，下次有人「順手」改回去就回來了。
+#
+# 共通的成本：一次 Plotly.relayout 會把五百根 K 棒整個重畫（candlestick
+# 的每一根都是一條 path）。所以規則是：能不 relayout 就不 relayout。
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_預設視窗和它的_y_軸範圍直接寫在圖裡(tmp_path):
+    """畫出來就要是最終樣子，不能畫完再 relayout 三次調成最終樣子。"""
+    import json
+
+    html = _build(tmp_path)
+    fig = json.loads(
+        re.search(r'id="fig-0">(.*?)</script>', html, re.S).group(1).replace(r"<\/", "</")
+    )
+    layout = fig["layout"]
+    assert layout["xaxis2"].get("range"), "X 軸沒有預設範圍，前端就得自己按一次按鈕"
+    assert layout["yaxis"].get("range"), "Y 軸沒有預設範圍"
+    assert layout["yaxis"].get("autorange") is False
+    assert layout["yaxis2"]["range"][0] == 0, "量圖要以 0 為底"
+
+    # 而且那個範圍要真的是近三個月，不是整段歷史。
+    lo, hi = layout["xaxis2"]["range"]
+    assert (
+        __import__("datetime").date.fromisoformat(hi)
+        - __import__("datetime").date.fromisoformat(lo)
+    ).days < 130
+
+
+def test_切回已經畫過的圖不重新套用預設範圍(tmp_path):
+    """讀者捲到的位置是他自己選的，切走再切回來不該被洗掉——而且重套一次
+    就是一次完整 relayout。"""
+    html = _build(tmp_path)
+    switch = html[html.index("function showChart"):]
+    switch = switch[: switch.index("\nwindow.addEventListener")]
+    already = switch[switch.rindex("} else {"):]
+    assert ".click()" not in already, "切回已畫過的圖時又去模擬點了一次時間範圍按鈕"
+
+
+def test_尺寸沒變就不重新排版(tmp_path):
+    html = _build(tmp_path)
+    fit = html[html.index("function fitPlotSize"):]
+    fit = fit[: fit.index("\n}")]
+    assert "_twW" in fit and "return" in fit, "fitPlotSize 每次都無條件 relayout"
+
+
+def test_十字線不透過_plotly_畫(tmp_path):
+    """滑鼠橫著掃過去一秒可以跨三、四十天。每一天一次 relayout 的版本，在
+    桌機上就是連續三、四十次整張圖重畫——手機沒有 hover，所以只有桌機卡。"""
+    html = _build(tmp_path)
+    draw = html[html.index("function drawXLine"):]
+    draw = draw[: draw.index("\nfunction clearXLine")]
+    assert "Plotly.relayout" not in draw, "十字線又改回用 shape + relayout 了"
+    assert "style.left" in draw, "十字線應該是移動一個絕對定位的元素"
+    # 蓋在圖上的東西如果會吃滑鼠事件，plotly 就收不到 hover，線反而不會動。
+    assert "pointer-events:none" in html
+
+
+def test_日期只解析一次(tmp_path):
+    """每次縮放都把五百個日期字串重新 parse 一遍，乘上八條線就是四千次，
+    而那五百個日期從頭到尾都是同一批。"""
+    html = _build(tmp_path)
+    fn = html[html.index("function computeVisibleYRange"):]
+    fn = fn[: fn.index("\n}")]
+    assert "_twMs" in fn, "沒有把日期→毫秒的結果存起來"

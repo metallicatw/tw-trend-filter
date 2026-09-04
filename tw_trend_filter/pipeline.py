@@ -1540,6 +1540,30 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         fig.update_yaxes(title_text='成交量(張)', row=2, col=1,
                          title_font=dict(color='#8b949e', size=11))
 
+        # ── 預設視窗（近三個月）連同它的 Y 軸範圍，直接寫進圖裡 ────────
+        #
+        # 原本這件事是前端做的：畫完圖之後模擬點一下「3月」那顆按鈕 → 一次
+        # relayout 改 X 範圍 → 觸發 plotly_relayout → 算出 Y 範圍 → 再一次
+        # relayout。加上 fitPlotSize 那一次，切換一檔股票要跑**三次**完整
+        # relayout，而每一次 relayout 都會把五百根 K 棒重畫一遍（candlestick
+        # 的每一根都是一條 path，這是整張圖最貴的部分）。
+        #
+        # 這些數字在產生報告的時候就全部算得出來，算一次寫進 JSON，前端
+        # newPlot 出來就已經是對的，三次 relayout 變成零次。
+        d_from = max(0, N - 63)          # 約三個月的交易日
+        win_v = [v for v in vl[d_from:] if v is not None]
+        win_hi = max([v for v in h_l[d_from:] if v is not None] +
+                     [v for v in bu[d_from:] if v is not None] or [1.0])
+        win_lo = min([v for v in l_l[d_from:] if v is not None] +
+                     [v for v in bd[d_from:] if v is not None] + [stop] or [0.0])
+        pad = (win_hi - win_lo) * 0.06 or (abs(win_hi) or 1.0) * 0.05
+        fig.update_layout(
+            xaxis2=dict(range=[dates[d_from], dates[-1]]),
+            yaxis=dict(range=[win_lo - pad, win_hi + pad], autorange=False),
+            yaxis2=dict(range=[0, (max(win_v) if win_v else 1.0) * 1.12],
+                        autorange=False),
+        )
+
         # 將 figure JSON 存成 <script type="application/json"> tag
         fig_json = pio.to_json(fig)
         # 防止 </script> 提前關閉：把 </ 轉義
@@ -1706,7 +1730,11 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
             'display:flex;align-items:center;gap:6px;flex:0 0 auto}'
         '.trig-arrow{color:#ffa657}'
         '.ld{text-align:center;padding:80px;color:#8b949e;font-size:15px}'
-        '.plot{width:100%;flex:1 1 auto;min-height:0}'
+        '.plot{width:100%;flex:1 1 auto;min-height:0;position:relative}'
+        # 十字線。pointer-events:none 很重要——它蓋在圖上，會吃掉滑鼠事件，
+        # 然後 plotly 就再也收不到 hover，線本身也就不會動了。
+        '.xh{position:absolute;top:0;bottom:0;width:1px;background:#58a6ff;'
+            'pointer-events:none;display:none;z-index:5}'
         '[id^="rb-"]{display:flex;align-items:center;gap:6px;flex-wrap:wrap;'
             'justify-content:center;margin-top:8px;flex:0 0 auto}'
         '[id^="rb-"] span{font-size:11px;color:#8b949e;margin-right:4px}'
@@ -1746,11 +1774,18 @@ function syncHdHeight() {
   document.documentElement.style.setProperty('--hd-h', h + 'px');
 }
 
-/* ── 讓圖表填滿 .plot 容器的實際像素高度（而非寫死的 760）──── */
+/* ── 讓圖表填滿 .plot 容器的實際像素高度（而非寫死的 760）────
+
+   尺寸沒變就不要 relayout。一次 relayout 會把五百根 K 棒整個重畫一遍
+   （candlestick 的每一根都是一條 path），而切換股票時視窗尺寸根本沒變——
+   那是這張圖最貴的一次白工。 */
 function fitPlotSize(div) {
   if (!div) return;
   var w = div.clientWidth, h = div.clientHeight;
-  if (w > 0 && h > 0) Plotly.relayout(div, {width: w, height: h});
+  if (!(w > 0 && h > 0)) return;
+  if (div._twW === w && div._twH === h) return;
+  div._twW = w; div._twH = h;
+  Plotly.relayout(div, {width: w, height: h});
 }
 
 /* ── 台灣時間（UTC+8）─────────────────────────────────────── */
@@ -1820,26 +1855,51 @@ function updateIB(i) {
   }
 }
 
-/* ── 貫穿上下兩圖的十字線（自繪 shape，涵蓋 paper 全高）───── */
-var xlineLast = null;
-function drawXLine(div, xv) {
-  if (xlineLast === xv) return;   /* 同一天不重複觸發 relayout */
-  xlineLast = xv;
-  Plotly.relayout(div, {
-    shapes: [{
-      type: 'line', xref: 'x2', yref: 'paper',
-      x0: xv, x1: xv, y0: 0, y1: 1,
-      line: { color: '#58a6ff', width: 1, dash: 'solid' },
-      layer: 'above'
-    }]
-  });
+/* ── 貫穿上下兩圖的十字線 ───────────────────────────────────
+
+   原本這條線是一個 plotly 的 shape，每移到新的一天就 Plotly.relayout 一次。
+   而一次 relayout 會把整張圖重畫——五百根 K 棒，每一根都是一條 path。滑鼠
+   從清單移到圖上、或橫著掃過去，一秒鐘可以跨過三、四十天，那就是三、四十
+   次整張圖重畫。
+
+   這也正是「手機很順、桌機很卡」的原因：手機沒有 hover。
+
+   改成一個絕對定位的 div 蓋在圖上，移動它只是改一個 CSS 的 left。plotly
+   完全不參與，而且因為它是蓋在整個 .plot 容器上，它本來就貫穿上下兩張圖，
+   比原本用 paper 座標的 shape 還準。 */
+function xhairEl(div) {
+  var el = div._twXH;
+  if (!el || !el.parentNode) {
+    el = document.createElement('div');
+    el.className = 'xh';
+    if (!div.style.position) div.style.position = 'relative';
+    div.appendChild(el);
+    div._twXH = el;
+  }
+  return el;
+}
+function drawXLine(div, pt, ev) {
+  var px = null;
+  /* 先問 plotly 這個資料點落在哪個像素——這樣線會**貼齊那一天**，
+     而不是貼齊游標。取不到（plotly 換版動了內部 API）就退回用游標位置：
+     差幾個像素，總比整條線消失好。 */
+  try {
+    var ax = pt.xaxis;
+    if (ax && typeof ax.d2p === 'function') px = ax.d2p(pt.x) + (ax._offset || 0);
+  } catch (e) { px = null; }
+  if (px === null || isNaN(px)) {
+    if (!ev) { return; }
+    px = ev.clientX - div.getBoundingClientRect().left;
+  }
+  var el = xhairEl(div);
+  el.style.left = Math.round(px) + 'px';
+  el.style.display = 'block';
 }
 function clearXLine(div) {
-  xlineLast = null;
-  Plotly.relayout(div, { shapes: [] });
+  if (div._twXH) div._twXH.style.display = 'none';
 }
 
-/* ── Hover：更新可複製資料列 + 繪製貫穿十字線 ─────────────── */
+/* ── Hover：繪製貫穿十字線 ─────────────────────────────────── */
 function attachHover(div) {
   div.on('plotly_hover', function(data) {
     var pts = data.points || [];
@@ -1848,8 +1908,7 @@ function attachHover(div) {
       if (pts[k].customdata && pts[k].customdata.length >= 10) { pp = pts[k]; break; }
     }
     if (!pp) return;
-    var cd = pp.customdata;
-    drawXLine(div, cd[0]);
+    drawXLine(div, pp, data.event);
   });
   div.on('plotly_unhover', function() { clearXLine(div); });
 }
@@ -1865,13 +1924,22 @@ function padRange(lo, hi, ratio) {
 }
 function computeVisibleYRange(div, xStart, xEnd) {
   var loP = Infinity, hiP = -Infinity, loV = Infinity, hiV = -Infinity;
+  var t0 = xStart.getTime(), t1 = xEnd.getTime();
   (div.data || []).forEach(function(tr) {
     if (tr.name === '__hover_price__' || tr.name === '__hover_vol__') return;
     var xs = tr.x || [];
     var isVol = (tr.yaxis === 'y2');
+    /* 日期字串 → 毫秒，每條線只算一次就存起來。原本每次縮放都要把
+       五百個 "YYYY-MM-DD" 重新 parse 一遍，乘上八條線就是四千次；
+       而那五百個日期從頭到尾都是同一批。 */
+    var ms = tr._twMs;
+    if (!ms || ms.length !== xs.length) {
+      ms = new Array(xs.length);
+      for (var q = 0; q < xs.length; q++) ms[q] = new Date(xs[q]).getTime();
+      tr._twMs = ms;
+    }
     for (var i = 0; i < xs.length; i++) {
-      var xd = new Date(xs[i]);
-      if (xd < xStart || xd > xEnd) continue;
+      if (ms[i] < t0 || ms[i] > t1) continue;
       var vals;
       if (tr.type === 'candlestick') vals = [tr.high[i], tr.low[i]];
       else if (tr.y) vals = [tr.y[i]];
@@ -1939,31 +2007,29 @@ function showChart(idx) {
       wrap.innerHTML = '<p class="ld" style="color:#f85149">\u26a0 \u5716\u8868\u8cc7\u6599\u89e3\u6790\u5931\u6557</p>';
       return;
     }
+    /* 預設視窗（近三個月）與它的 Y 軸範圍已經寫在圖裡了，所以這裡先把
+       尺寸也一起放進 layout 再 newPlot——畫出來就是最終的樣子，不必畫完
+       再 relayout 一次。原本這一步要跑三次完整 relayout（尺寸、X 範圍、
+       Y 範圍），而每一次都會把五百根 K 棒重畫一遍。 */
+    var w0 = wrap.clientWidth, h0 = wrap.clientHeight;
+    if (w0 > 0 && h0 > 0) {
+      fig.layout.width = w0; fig.layout.height = h0;
+      wrap._twW = w0; wrap._twH = h0;
+    }
     wrap.innerHTML = '';   /* 清空「載入中」佔位文字，避免殘留在圖表下方 */
     Plotly.newPlot(wrap, fig.data, fig.layout, PLY_CFG)
       .then(function() {
-        fitPlotSize(wrap);
         attachHover(wrap);
         attachAutoY(wrap);
-        /* 預設顯示 3 個月（台灣時間往回推），同時自動調整 Y 軸 */
-        var rbWrap = document.getElementById('rb-' + idx);
-        var activeBtn = rbWrap ? rbWrap.querySelector('.rbtn.rba') : null;
-        if (activeBtn) activeBtn.click();
-        else {
-          /* 找第一個按鈕並觸發 1 月 */
-          var first = rbWrap ? rbWrap.querySelector('.rbtn') : null;
-          if (first) first.click();
-        }
       })
       .catch(function(e) {
         wrap.innerHTML = '<p class="ld" style="color:#f85149">\u26a0 Plotly \u7573\u8b5c\u5931\u6557: ' + e.message + '</p>';
       });
   } else {
+    /* 已經畫過的圖，切回來的時候它的時間範圍和 Y 軸就是離開時的樣子——
+       那正是讀者上次留在的位置。重新套用一次預設範圍會把他捲過的地方
+       洗掉，還多付一次 relayout。只在視窗真的變過大小時才動它。 */
     fitPlotSize(wrap);
-    /* 切換時重新套用目前選中的時間範圍 + 自動調整 Y */
-    var rbWrap = document.getElementById('rb-' + idx);
-    var activeBtn = rbWrap ? rbWrap.querySelector('.rbtn.rba') : null;
-    if (activeBtn) activeBtn.click();
   }
 }
 

@@ -1,0 +1,21 @@
+# 版本下界，不是釘死。
+#
+# 釘死的問題是它會靜靜地爛掉：yfinance 追著 Yahoo 的驗證機制改，釘在某一版
+# 幾個月後就開始收 401 Invalid Crumb，而那時候沒有人記得為什麼要釘。下界寫在
+# 這裡的每一條都對應一個具體的原因：
+#
+#   yfinance   0.2.40  — 舊版拿不到 crumb，Yahoo 一律回 401。
+#   curl_cffi          — 用它模擬 Chrome 的 TLS 指紋；沒有它，上一條也救不了。
+#   pandas     2.0     — read_html 收 StringIO（1.x 收字串，2.2 起會警告）。
+#   openpyxl   3.1     — Excel 分頁三要插圖。
+#   plotly     5.20    — 互動線圖。
+#   lxml               — pandas.read_html 的 parser，抓 ISIN 那張表要用。
+requests>=2.31
+yfinance>=0.2.40
+curl_cffi>=0.7
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+openpyxl>=3.1
+plotly>=5.20
+lxml>=5.0

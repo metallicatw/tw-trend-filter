@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tw-trend-filter"
+version = "3.1.0"
+description = "台股順勢交易篩選系統：全市場四部曲掃描，產出 Excel 與互動技術線圖"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+
+dependencies = [
+  "requests>=2.31",
+  "yfinance>=0.2.40",
+  "curl_cffi>=0.7",
+  "pandas>=2.0",
+  "numpy>=1.24",
+  "matplotlib>=3.7",
+  "openpyxl>=3.1",
+  "plotly>=5.20",
+  "lxml>=5.0",
+]
+
+[project.scripts]
+tw-trend-filter = "tw_trend_filter.__main__:main"
+
+[tool.setuptools]
+packages = ["tw_trend_filter"]

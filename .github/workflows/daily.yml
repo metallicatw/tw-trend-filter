@@ -1,0 +1,98 @@
+name: 每日篩選
+
+# 台股 13:30 收盤，Yahoo 的日線大約 14:30 之後才穩定。台北 15:10 = UTC 07:10。
+#
+# 只在週一到週五跑。週末沒有新的收盤價，跑出來的是禮拜五那一份的複製品，而
+# 每天 commit 一份一模一樣的 index.html 只會讓 git 歷史變成雜訊。
+on:
+  schedule:
+    - cron: "10 7 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "只掃前 N 檔（留空 = 全市場）。用來快速驗證整條路走不走得通。"
+        required: false
+        default: ""
+
+# 同一時間只跑一個。手動觸發撞上排程的話，後來的那個等前一個做完——兩個一起跑
+# 會有兩份 index.html 搶著 commit，其中一個必然失敗。
+concurrency:
+  group: daily
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    # 全市場約 1,900 檔，八條連線大約 20～35 分鐘。90 分鐘的上限是留給
+    # Yahoo 偶爾變慢的那幾天，而不是讓一個卡住的 job 燒掉六小時。
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # matplotlib 畫 Excel 那些 K 線圖要中文字型。沒有它不會報錯，只會把每一個
+      # 中文字畫成一個空心方框——而那要等到有人打開 Excel 才會發現。
+      - name: 安裝中文字型
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk
+          python -c "import matplotlib.font_manager as fm; fm._load_fontmanager(try_read_cache=False)"
+
+      - name: 全市場篩選
+        id: screen
+        run: |
+          python -m tw_trend_filter \
+            --output-dir output \
+            --index index.html \
+            --link-base "https://metallicatw.github.io/tw-six-metrics/stock" \
+            --limit "${{ github.event.inputs.limit || 0 }}"
+
+      # Excel 進 artifact，不進 git。一份約 3～4 MB，每天 commit 一次的話一年
+      # 就是 1 GB 的二進位檔，而且沒有人會回頭看三個月前那一份。
+      # 保留 30 天：過了就下載不到，報告上那顆按鈕旁邊寫著這件事。
+      - name: 上傳 Excel 報表
+        if: always() && hashFiles('output/*.xlsx') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: trend-filter-excel-${{ steps.screen.outputs.date || github.run_id }}
+          path: output/*.xlsx
+          retention-days: 30
+          compression-level: 9
+
+      # index.html 是下游唯一認得的名字：tw-six-metrics 的建站流程 clone 這個
+      # repo，把它複製成 site/trend-report.html。所以檔名固定，內容每天換。
+      - name: Commit 報告
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f index.html
+          if git diff --cached --quiet; then
+            echo "報告沒有變化，這次不 commit"
+            exit 0
+          fi
+          git commit -m "報告：${{ steps.screen.outputs.date }}（${{ steps.screen.outputs.count }} 檔通過）"
+          # 排程之間不會互相踩到（concurrency 擋住了），但人在 Actions 上手動
+          # 按的那一次可能落在別的 commit 之後，所以推之前先對齊。
+          git pull --rebase --autostash origin ${{ github.ref_name }}
+          git push origin HEAD:${{ github.ref_name }}
+
+      - name: 摘要
+        if: always()
+        run: |
+          {
+            echo "### 台股順勢交易篩選 ${{ steps.screen.outputs.date }}"
+            echo ""
+            echo "* 掃描：${{ steps.screen.outputs.scanned }} 檔"
+            echo "* 通過：**${{ steps.screen.outputs.count }}** 檔"
+            echo "* Excel 報表在本頁下方的 Artifacts 區（保留 30 天）"
+          } >> "$GITHUB_STEP_SUMMARY"

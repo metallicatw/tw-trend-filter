@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt pytest
+      - run: python -m pytest tests -q
+
+  # 單元測試證明公式對，這個 job 證明**整條路走得通**：Yahoo 還讓我們抓、
+  # ISIN 那張表還是那個格式、Excel 還存得起來、報告還畫得出來。
+  #
+  # 只掃 40 檔（約一分鐘）。抓不到資料時 40 檔可能一檔都沒通過篩選，那不是
+  # 失敗——所以下面只檢查「檔案有沒有生出來」，不檢查「有幾檔通過」。
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: 安裝中文字型
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk
+      - name: 掃 40 檔
+        run: |
+          python -m tw_trend_filter \
+            --output-dir output --limit 40 \
+            --link-base "https://metallicatw.github.io/tw-six-metrics/stock"
+      - name: 確認產出
+        run: |
+          ls -la output/
+          # Excel 一定要有。HTML 只有在真的篩出東西的時候才會有，所以
+          # 它不在的時候只是提醒一句，不是失敗。
+          test -n "$(ls output/*.xlsx 2>/dev/null)" || { echo "::error::沒有產生 Excel"; exit 1; }
+          if [ -z "$(ls output/*.html 2>/dev/null)" ]; then
+            echo "::notice::這 40 檔今天沒有標的通過篩選，所以沒有 HTML——這是正常的"
+          fi

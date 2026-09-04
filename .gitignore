@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# 帶時間戳的產出：Excel 進 Actions artifact，HTML 有 index.html 那一份就夠了。
+# 把它們也 commit 進來，一年後這個 repo 會有好幾 GB 沒有人會回頭看的檔案。
+output/

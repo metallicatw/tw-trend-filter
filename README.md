@@ -129,6 +129,16 @@ https://metallicatw.github.io/tw-six-metrics/trend.html
 取不到的時候（這個 repo 掛了、clone 失敗）tw-six-metrics 那邊少一個導覽項，
 不是多一個 404。
 
+### 關於 repo 大小
+
+`index.html` 每個交易日換一次，一份約 2～3 MB。壓縮後大約每年 150～200 MB
+進 git 歷史——GitHub 建議單一 repo 在 1 GB 以內，所以這樣跑個四、五年才需要
+處理，而下游是 `git clone --depth 1`，歷史多長都不影響它。
+
+真的長太大的時候，最省事的做法是把 `index.html` 改推到一個 orphan 分支上、
+每天 force-push 覆蓋（歷史永遠只有一個 commit），下游改成
+`git clone --depth 1 --branch report`。在那之前不值得為它增加一層機制。
+
 ---
 
 ## 專案結構

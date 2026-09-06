@@ -69,22 +69,36 @@ jobs:
           retention-days: 30
           compression-level: 9
 
-      # index.html 是下游唯一認得的名字：tw-six-metrics 的建站流程 clone 這個
-      # repo，把它複製成 site/trend-report.html。所以檔名固定，內容每天換。
-      - name: Commit 報告
+      # 報告推到 `report` 分支，**不進 main**。
+      #
+      # 原本是 commit 回 main，而那讓兩種完全不同的東西擠在同一條線上：程式碼
+      # 的修改（人寫的，要審、要合併）和每天一份 2.8 MB 的產出（機器寫的，
+      # 隔天就被下一份取代）。結果是每次改程式都會跟排程撞車，衝突的檔案永遠
+      # 是同一個 index.html，而那個衝突沒有「哪一邊對」——兩邊都是產生出來的。
+      # 三次之後就該承認這不是運氣問題。
+      #
+      # `report` 是一條**只有一個 commit** 的孤兒分支，每天整條重寫：
+      #
+      #   * main 上再也沒有 index.html，所以改程式不會再撞到排程。
+      #   * 歷史不累積。原本每天 2.8 MB 進 git，一年約 150～200 MB；現在永遠
+      #     只有最新那一份。（README 裡那段「真的長太大時該怎麼辦」就是這個。）
+      #   * 下游拿法幾乎不變：`git clone --depth 1 --branch report`。
+      #
+      # 用 orphan + force push 而不是一般 commit：一般 commit 的話歷史照樣會長，
+      # 只是長在別的分支上。
+      - name: 發布報告到 report 分支
         run: |
+          test -s index.html || { echo "::error::沒有產生 index.html"; exit 1; }
+          cp index.html /tmp/report.html
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan report
+          git rm -rq --cached .
+          cp /tmp/report.html index.html
           git add -f index.html
-          if git diff --cached --quiet; then
-            echo "報告沒有變化，這次不 commit"
-            exit 0
-          fi
-          git commit -m "報告：${{ steps.screen.outputs.date }}（${{ steps.screen.outputs.count }} 檔通過）"
-          # 排程之間不會互相踩到（concurrency 擋住了），但人在 Actions 上手動
-          # 按的那一次可能落在別的 commit 之後，所以推之前先對齊。
-          git pull --rebase --autostash origin ${{ github.ref_name }}
-          git push origin HEAD:${{ github.ref_name }}
+          git commit -q -m "報告：${{ steps.screen.outputs.date }}（${{ steps.screen.outputs.count }} 檔通過）"
+          # force：這條分支本來就是「只有最新那一份」，不是歷史。
+          git push -f origin report
 
       - name: 摘要
         if: always()

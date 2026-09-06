@@ -6,6 +6,14 @@ dist/
 .venv/
 venv/
 
-# 帶時間戳的產出：Excel 進 Actions artifact，HTML 有 index.html 那一份就夠了。
+# 帶時間戳的產出：Excel 進 Actions artifact。
 # 把它們也 commit 進來，一年後這個 repo 會有好幾 GB 沒有人會回頭看的檔案。
 output/
+
+# 每天產生的報告。它住在 `report` 分支上（見 .github/workflows/daily.yml），
+# 不在 main —— 程式碼和產出擠在同一條分支上，每次改程式都會跟排程搶同一個檔案，
+# 而那個衝突沒有「哪一邊對」，兩邊都是產生出來的。
+#
+# 本機跑 `python -m tw_trend_filter --index index.html` 仍然會在這裡留一份，
+# 那是給你自己開來看的，不該進版本控制。
+/index.html

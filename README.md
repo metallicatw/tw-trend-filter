@@ -56,7 +56,7 @@
 
 | Workflow | 何時 | 做什麼 |
 | --- | --- | --- |
-| `daily.yml` | 週一～五 台北 15:10 | 全市場掃描 → commit `index.html` → Excel 上傳 artifact |
+| `daily.yml` | 週一～五 台北 15:10 | 全市場掃描 → 發布 `index.html` 到 `report` 分支 → Excel 上傳 artifact |
 | `ci.yml` | 每次 push / PR | 單元測試 + 40 檔煙霧測試 |
 
 台股 13:30 收盤，Yahoo 的日線大約 14:30 之後才穩定，15:10 留了足夠的緩衝。
@@ -111,9 +111,9 @@ python -m tw_trend_filter --limit 50
 兩個 repo 各自獨立跑，靠一個檔名接起來：
 
 ```
-tw-trend-filter/index.html          ← 這裡每天產生
+tw-trend-filter（report 分支）/index.html   ← 這裡每天產生
         │
-        │  tw-six-metrics 建站時 git clone --depth 1 取走
+        │  tw-six-metrics 建站時 git clone --depth 1 --branch report 取走
         ▼
 tw-six-metrics/site/trend-report.html
         │
@@ -129,15 +129,21 @@ https://metallicatw.github.io/tw-six-metrics/trend.html
 取不到的時候（這個 repo 掛了、clone 失敗）tw-six-metrics 那邊少一個導覽項，
 不是多一個 404。
 
-### 關於 repo 大小
+### 為什麼報告住在 `report` 分支
 
-`index.html` 每個交易日換一次，一份約 2～3 MB。壓縮後大約每年 150～200 MB
-進 git 歷史——GitHub 建議單一 repo 在 1 GB 以內，所以這樣跑個四、五年才需要
-處理，而下游是 `git clone --depth 1`，歷史多長都不影響它。
+`main` 上沒有 `index.html`。每天那一份 2.8 MB 的報告發布在一條叫 `report` 的
+孤兒分支上，每天整條重寫（force push），所以那條分支永遠只有一個 commit。
 
-真的長太大的時候，最省事的做法是把 `index.html` 改推到一個 orphan 分支上、
-每天 force-push 覆蓋（歷史永遠只有一個 commit），下游改成
-`git clone --depth 1 --branch report`。在那之前不值得為它增加一層機制。
+兩個理由，第二個是真正逼出這個做法的：
+
+**歷史不累積。** 一份 2～3 MB、一年約 150～200 MB 進 git。放在只有一個 commit
+的分支上，永遠只有最新那一份。
+
+**程式碼和產出不搶同一個檔案。** 原本兩者都在 `main`：人改程式、排程改
+`index.html`，於是每次交付都跟排程撞車，衝突的永遠是同一個檔案——而那個衝突
+沒有「哪一邊對」，兩邊都是產生出來的。撞了三次之後就該承認這不是運氣問題。
+
+下游的拿法：`git clone --depth 1 --branch report`。
 
 ---
 

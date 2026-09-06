@@ -1528,10 +1528,19 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
                             font=dict(color=TEXT, size=12,
                                       family='Microsoft JhengHei, Arial'),
                             align='left', namelength=0),
-            legend=dict(orientation='h', x=0.5, xanchor='center', y=1.02,
+            # `yanchor='bottom'` 是這裡唯一重要的一個字。
+            #
+            # 沒寫的時候 plotly 用 'auto'，而 auto 對 y>2/3 的解讀是 'top'——
+            # 圖例的**上緣**釘在 y=1.02，整塊往**下**長，於是它蓋在 K 線圖最上面
+            # 那一段上。改成 'bottom' 就是下緣釘在那裡、往上長，離開繪圖區。
+            #
+            # 然後上留白要夠：圖例一行約 22px，加上 y=1.015 那 1.5% 的間隙，
+            # 46px 不夠，會被裁掉一半。
+            legend=dict(orientation='h', x=0.5, xanchor='center',
+                        y=1.015, yanchor='bottom',
                         bgcolor='rgba(22,27,34,0.9)', bordercolor=GRID,
                         borderwidth=1, font=dict(size=11)),
-            margin=dict(t=46, b=26, l=64, r=26),
+            margin=dict(t=72, b=26, l=64, r=26),
             height=760, dragmode='pan',
             autosize=True,
         )

@@ -50,12 +50,6 @@ jobs:
 
       - name: 全市場篩選
         id: screen
-        env:
-          # 報告上那顆 Excel 連結指向哪裡。設定了就是 Drive 那個資料夾，沒設定
-          # 就退回這一次執行的頁面（artifact 在那裡，30 天後過期）。
-          # 資料夾網址在**產生報告的當下**就知道，而某一天那個檔案的 id 要等
-          # 上傳完才知道——而報告是先產生、後上傳的。
-          GDRIVE_FOLDER_ID: ${{ vars.GDRIVE_FOLDER_ID }}
         run: |
           python -m tw_trend_filter \
             --output-dir output \
@@ -63,24 +57,50 @@ jobs:
             --link-base "https://metallicatw.github.io/tw-six-metrics/stock" \
             --limit "${{ github.event.inputs.limit || 0 }}"
 
-      # Excel 送去 Google Drive：不過期、不必登入 GitHub、每一天的都留著。
+      # Excel 發成一個 release，每個交易日一個。
       #
-      # 沒設定憑證就整步跳過（腳本自己判斷），所以 fork 出去的人不必先去申請
-      # 一組 Google 憑證才跑得動排程。
-      - name: 上傳 Excel 到 Google Drive
+      # 走過的兩條死路，寫在這裡免得有人再走一次：
+      #
+      # * **artifact**：30 天後下載不到，而且要登入 GitHub 才拿得到。
+      # * **Google Drive**：服務帳號沒有自己的儲存空間，它在「我的雲端硬碟」
+      #   底下建的檔案會算在自己的（零）配額上，回 403 storageQuotaExceeded。
+      #   官方解法是「共用雲端硬碟」——Google Workspace 的功能，個人 Gmail
+      #   開不出來。剩下 OAuth 委派，但那要一顆會被撤銷的 refresh token，
+      #   而排程沒有瀏覽器可以重新授權。
+      #
+      # Releases 三件事都給：不過期、不必登入就下載、歷史全留。而且不用任何
+      # 憑證——GITHUB_TOKEN 是 runner 自己就有的。
+      #
+      # 同一天重跑就覆蓋（`--clobber`），不是在同一個 release 底下堆出第二個
+      # 一模一樣的檔名。
+      - name: 發布 Excel 到 Releases
         if: hashFiles('output/*.xlsx') != ''
         env:
-          GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
-          GDRIVE_FOLDER_ID: ${{ vars.GDRIVE_FOLDER_ID }}
+          GH_TOKEN: ${{ github.token }}
+          DAY: ${{ steps.screen.outputs.date }}
+          COUNT: ${{ steps.screen.outputs.count }}
         run: |
-          pip install -q google-api-python-client google-auth
-          python scripts/upload_to_drive.py output/*.xlsx
+          set -euo pipefail
+          tag="excel-${DAY:-$(date -u +%F)}"
+          file=$(ls output/*.xlsx | head -1)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag 已經在，覆蓋附件"
+            gh release upload "$tag" "$file" --clobber
+          else
+            gh release create "$tag" "$file" \
+              --title "Excel 報表 ${DAY}" \
+              --notes "台股順勢交易篩選 ${DAY}：${COUNT} 檔通過。
+
+          這一份是當日的完整 Excel 報表（篩選總覽、指標明細、個股 K 線圖）。
+          每個交易日一份，不會過期。"
+          fi
+          echo "  $(basename "$file") → $tag"
 
       # artifact 留著當退路，不是重複。
       #
-      # Drive 那一步會因為憑證過期、配額、資料夾被移動而失敗，而它失敗的時候
-      # 那一天的 Excel 就只剩這裡有。artifact 不花錢也不進 git，留著的成本是零。
-      # 報告上那顆連結指的是 Drive（見上面 screen 那一步）。
+      # 發 release 那一步會因為權限、tag 撞名、GitHub 當機而失敗，而它失敗的
+      # 那一天 Excel 就只剩這裡有。artifact 不花錢也不進 git，留著的成本是零。
+      # 報告上那顆連結指的是 Releases 頁。
       - name: 上傳 Excel 報表（退路）
         if: always() && hashFiles('output/*.xlsx') != ''
         uses: actions/upload-artifact@v4

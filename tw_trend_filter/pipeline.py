@@ -2211,19 +2211,20 @@ document.addEventListener('DOMContentLoaded', function() { syncHdHeight(); showC
         # 佔的還是頁首最寬的那一段。手機上更沒有滑鼠也沒有滾輪。
         # Excel 版（每一檔一張 K 線圖）的連結。
         #
-        # 指向哪裡由呼叫端決定（見 `__main__._env_excel_url`）：設定了 Google
-        # Drive 就指那個資料夾——不過期、不必登入 GitHub、而且翻得到前幾天的。
-        # 沒設定就退回 Actions 的執行頁面，artifact 列在那一頁上。
+        # 指向哪裡由呼叫端決定（見 `__main__._env_excel_url`）：排程上是這個
+        # repo 的 Releases 頁——不過期、不必登入就下載得到、每天一個、歷史全留。
         #
-        # 「30 天內」那句只在**後者**才出現，因為那是 artifact 的保留期限，
-        # 不是 Drive 的。一句寫死的「30 天內」掛在一個永久連結旁邊，比不寫糟。
+        # 「30 天內」那句只在連到 **Actions 的執行頁面**時才出現，因為那是
+        # artifact 的保留期限。一句寫死的「30 天內」掛在一個永久連結旁邊，
+        # 比不寫糟：它會讓人以為那份檔案會消失，而它不會。
         ('<a class="dl" href="' + excel_url + '" target="_blank" rel="noopener" '
-         + ('title="Google Drive，每天一份，不會過期">'
-            '\u2b07\ufe0f Excel \u5831\u8868</a>'
-            if 'drive.google.com' in excel_url else
-            'title="\u8a72\u6b21\u57f7\u884c\u7684 Artifacts \u5340\uff0c'
+         + ('title="\u8a72\u6b21\u57f7\u884c\u7684 Artifacts \u5340\uff0c'
             '\u4fdd\u7559 30 \u5929">'
-            '\u2b07\ufe0f Excel \u5831\u8868\uff0830 \u5929\u5167\uff09</a>'))
+            '\u2b07\ufe0f Excel \u5831\u8868\uff0830 \u5929\u5167\uff09</a>'
+            if '/actions/runs/' in excel_url else
+            'title="\u6bcf\u500b\u4ea4\u6613\u65e5\u4e00\u4efd\uff0c'
+            '\u6700\u65b0\u7684\u5728\u6700\u4e0a\u9762">'
+            '\u2b07\ufe0f Excel \u5831\u8868</a>'))
         if excel_url else '',
         '</div>',
         '</div>',  # /#topbar

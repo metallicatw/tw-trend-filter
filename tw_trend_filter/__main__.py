@@ -9,47 +9,38 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from pathlib import Path
 
 from .pipeline import VERSION, run
 
 
 def _env_excel_url() -> str:
-    """Excel 報表的連結。優先用 Google Drive 那個資料夾。
+    """Excel 報表的連結：這個 repo 的 Releases 頁。
 
-    **Drive**（`GDRIVE_FOLDER_ID`）：排程每天把 xlsx 上傳到那個資料夾。連的是
-    資料夾而不是單一檔案，因為資料夾的網址在產生報告的**當下**就已經知道，而
-    某一天那個檔案的 id 要等上傳完才知道——報告是先產生、後上傳的。順帶一提，
-    連資料夾也讓讀者翻得到前幾天的。
+    為什麼是 Releases，不是 artifact、不是 Google Drive：
 
-    **退回 Actions 的執行頁面**：沒設定 Drive 的時候（例如 fork 出去的人），
-    artifact 就列在那一頁上。那份東西 30 天後會過期，所以報告上會多一句
-    「30 天內」——見 `pipeline.build_interactive_html`。
+    * **artifact** 30 天後就下載不到，而且要登入 GitHub 才拿得到。
+    * **Drive** 走不通。服務帳號沒有自己的儲存空間，所以它在「我的雲端硬碟」
+      底下建的檔案會算在它自己的（零）配額上——403 storageQuotaExceeded。
+      官方的解法是「共用雲端硬碟」，而那是 Google Workspace 的功能，個人的
+      Gmail 帳號開不出來。剩下的路是 OAuth 委派，但那要一顆會被 Google 撤銷的
+      refresh token，而且排程沒有瀏覽器可以重新授權。
+    * **Releases** 三件事都給：不過期、不必登入就下載得到、每天一個、歷史全留。
+      而且不用任何憑證——`GITHUB_TOKEN` 是 runner 自己就有的。
 
-    兩個都沒有就回空字串，報告上不會出現那顆按鈕。
+    連的是**列表頁**而不是某一個 release，因為列表頁的網址在**產生報告的當下**
+    就已經知道，而今天那個 release 要等上傳完才存在——報告是先產生、後上傳的。
+    列表頁最新的排在最上面，往下就是前幾天的。
+
+    （沒有用 `/releases/latest`：一個 release 都還沒有的時候它會 404，而那正是
+    第一次跑的時候。列表頁永遠不會。）
+
+    不在 Actions 底下就回空字串，報告上不會出現那顆按鈕。
     """
-    # 同一個正規化：`GDRIVE_FOLDER_ID` 很容易連著 `?usp=drive_link` 一起貼進來
-    # （Drive 的「複製連結」就是給那一串），而那樣組出來的連結會多一段參數。
-    # 上傳那支腳本用同一個函式，兩邊對同一個值的理解才會一致。
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-    try:
-        from upload_to_drive import folder_id  # noqa: PLC0415
-    except ImportError:                        # 打包安裝時沒有 scripts/
-        def folder_id(raw: str) -> str:
-            text = (raw or '').strip().strip('/')
-            if '/folders/' in text:
-                text = text.split('/folders/', 1)[1]
-            return text.split('?', 1)[0].split('#', 1)[0].strip().strip('/')
-
-    folder = folder_id(os.environ.get('GDRIVE_FOLDER_ID', ''))
-    if folder:
-        return f'https://drive.google.com/drive/folders/{folder}'
     server = os.environ.get('GITHUB_SERVER_URL', 'https://github.com')
-    repo   = os.environ.get('GITHUB_REPOSITORY', '')
-    run_id = os.environ.get('GITHUB_RUN_ID', '')
-    if not (repo and run_id):
-        return ''
-    return f'{server}/{repo}/actions/runs/{run_id}'
+    repo = os.environ.get('GITHUB_REPOSITORY', '')
+    if repo:
+        return f'{server}/{repo}/releases'
+    return ''
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -12,6 +12,9 @@
 import datetime
 import os
 import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
 
 import numpy as np
 import pandas as pd
@@ -131,48 +134,47 @@ def test_裁切真的讓檔案變小(tmp_path):
 
 def test_excel_連結有給才出現(tmp_path):
     assert 'Excel' not in _build(tmp_path, excel_url='')
-    html = _build(tmp_path, excel_url='https://example.org/runs/1')
-    assert 'https://example.org/runs/1' in html
-    # 30 天這件事要寫在連結旁邊，不能讓人點下去才知道過期了。
+    # 連到 Actions 的執行頁面時（沒有 release 可用的退路），30 天這件事要寫在
+    # 連結旁邊，不能讓人點下去才知道過期了。
+    html = _build(tmp_path, excel_url='https://github.com/a/b/actions/runs/1')
+    assert 'https://github.com/a/b/actions/runs/1' in html
     assert '30 天' in html
 
 
-def test_drive_的連結不寫_30_天(tmp_path):
-    """「30 天內」是 artifact 的保留期限，不是 Drive 的。
+def test_releases_的連結不寫_30_天(tmp_path):
+    """「30 天內」是 artifact 的保留期限，不是 release 的。
 
     一句寫死的「30 天內」掛在一個永久連結旁邊，比不寫糟——它會讓人以為那份
     檔案會消失，而它不會。
     """
-    html = _build(tmp_path, excel_url='https://drive.google.com/drive/folders/abc123')
-    assert 'https://drive.google.com/drive/folders/abc123' in html
+    html = _build(tmp_path, excel_url='https://github.com/a/b/releases')
+    assert 'https://github.com/a/b/releases' in html
     assert '30 天' not in html
     assert 'Excel 報表' in html
 
 
-def test_有_drive_資料夾就用它_沒有才退回執行頁面(monkeypatch=None):
-    """報告是先產生、後上傳的，所以連結指的是**資料夾**——資料夾的網址在產生
-    報告的當下就知道，某一天那個檔案的 id 要等上傳完才知道。"""
+def test_連結指的是_releases_列表頁(monkeypatch=None):
+    """報告是先產生、後上傳的。
+
+    列表頁的網址在產生報告的當下就知道，而今天那個 release 要等上傳完才存在。
+    也不能用 `/releases/latest`：一個 release 都還沒有的時候它會 404，而那正是
+    第一次跑的時候。
+    """
     import os
 
     from tw_trend_filter.__main__ import _env_excel_url
 
-    keys = ('GDRIVE_FOLDER_ID', 'GITHUB_SERVER_URL', 'GITHUB_REPOSITORY', 'GITHUB_RUN_ID')
+    keys = ('GITHUB_SERVER_URL', 'GITHUB_REPOSITORY', 'GITHUB_RUN_ID')
     saved = {k: os.environ.get(k) for k in keys}
     try:
         for k in keys:
             os.environ.pop(k, None)
-        # 兩個都沒有 → 沒有連結，報告上不會出現那顆按鈕
+        # 不在 Actions 底下 → 沒有連結，報告上不會出現那顆按鈕
         assert _env_excel_url() == ''
 
         os.environ['GITHUB_REPOSITORY'] = 'a/b'
-        os.environ['GITHUB_RUN_ID'] = '99'
-        assert _env_excel_url() == 'https://github.com/a/b/actions/runs/99'
-
-        # Drive 優先。用一個真實長度的 id——太短的字串會被當成填錯而擋下來
-        # （見 test_看不出_id_就明確報錯而不是拿去打_api）。
-        real = '1jb2s5M_SU9fbwM8pGjDZBVJWiERhha62'
-        os.environ['GDRIVE_FOLDER_ID'] = real
-        assert _env_excel_url() == f'https://drive.google.com/drive/folders/{real}'
+        assert _env_excel_url() == 'https://github.com/a/b/releases'
+        assert 'latest' not in _env_excel_url()
     finally:
         for k, v in saved.items():
             if v is None:
@@ -181,18 +183,30 @@ def test_有_drive_資料夾就用它_沒有才退回執行頁面(monkeypatch=No
                 os.environ[k] = v
 
 
-def test_沒有憑證就跳過上傳而不是失敗():
-    """fork 出去的人不必先去申請一組 Google 憑證才跑得動排程。"""
-    import subprocess
-    import sys
+def test_同一天重跑要覆蓋而不是堆第二個檔():
+    """排程一天只跑一次，但人會手動按 Run workflow。同一個 release 底下堆兩個
+    一模一樣的檔名，下載的人要自己猜哪個是新的。"""
+    ci = (ROOT / '.github/workflows/daily.yml').read_text('utf-8')
+    step = ci[ci.index('發布 Excel 到 Releases'):]
+    step = step[: step.index('artifact 留著當退路')]
+    assert '--clobber' in step, '同一天重跑會堆出第二個附件'
+    assert 'gh release view' in step, '沒有先判斷 release 在不在'
+    # 不用任何憑證——GITHUB_TOKEN 是 runner 自己就有的。
+    assert 'github.token' in step
+    assert 'GDRIVE' not in ci, 'Drive 的殘留沒清乾淨'
 
-    env = dict(os.environ) if False else {}
-    got = subprocess.run(
-        [sys.executable, 'scripts/upload_to_drive.py', 'whatever.xlsx'],
-        capture_output=True, text=True, env={'PATH': '/usr/bin:/bin'},
-    )
-    assert got.returncode == 0, got.stderr
-    assert '跳過上傳' in got.stdout
+
+def test_走過的死路要寫在原始碼裡():
+    """artifact 會過期、Drive 的服務帳號沒有配額——兩條都試過。
+
+    下一個看到「Excel 存哪」這個問題的人（包括三個月後的我）會想到同樣那兩個
+    答案，而失敗的原因都不是看一眼就知道的。
+    """
+    from tw_trend_filter import __main__ as m
+
+    doc = m._env_excel_url.__doc__
+    assert 'storageQuotaExceeded' in doc or '儲存空間' in doc
+    assert 'artifact' in doc
 
 
 def test_沒有任何標的時不產生檔案(tmp_path):
@@ -344,75 +358,3 @@ def test_手機上圖例只留帶數值的那幾項(tmp_path):
     assert "20MA|60MA|建議停損" in fn, "留下的不是帶數值的那三個"
     # 上留白要大於量出來的圖例底端（60px）。
     assert "t: 68" in fn
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# GDRIVE_FOLDER_ID 的正規化
-#
-# Drive 的「複製連結」給的是 `https://drive.google.com/drive/folders/<id>?usp=drive_link`，
-# 而設定欄位叫「FOLDER_ID」——於是最自然的動作是把網址最後一段連著
-# `?usp=drive_link` 一起貼進去。那樣拼出來的查詢是
-# `'<id>?usp=drive_link' in parents`，Drive 回 404「File not found」：一個看起來
-# 像權限問題、其實是多了 17 個字元的錯誤。實際發生過。
-# ─────────────────────────────────────────────────────────────────────────
-
-def _folder_id(raw):
-    import sys
-    from pathlib import Path as _P
-
-    sys.path.insert(0, str(_P(__file__).resolve().parents[1] / "scripts"))
-    from upload_to_drive import folder_id
-
-    return folder_id(raw)
-
-
-def test_資料夾_id_接受貼進來的三種寫法():
-    real = "1jb2s5M_SU9fbwM8pGjDZBVJWiERhha62"
-    # 這一個就是線上炸掉的那一串。
-    assert _folder_id(f"{real}?usp=drive_link") == real
-    assert _folder_id(f"https://drive.google.com/drive/folders/{real}?usp=drive_link") == real
-    assert _folder_id(f"https://drive.google.com/drive/folders/{real}") == real
-    assert _folder_id(real) == real
-    # 前後空白、結尾斜線
-    assert _folder_id(f"  {real}/  ") == real
-    # 沒設定就是沒設定
-    assert _folder_id("") == "" and _folder_id("   ") == ""
-
-
-def test_看不出_id_就明確報錯而不是拿去打_api():
-    # 亂填的東西不該被當成 id 送出去——那會換到一個 404，而 404 讀起來像權限問題。
-    assert _folder_id("我的資料夾") == ""
-    assert _folder_id("https://drive.google.com/drive/my-drive") == ""
-
-
-def test_報告連結也要正規化(tmp_path):
-    """網址多一段 `?usp=drive_link` 還是開得起來，但它會出現在每一份報告上。"""
-    import os
-
-    from tw_trend_filter.__main__ import _env_excel_url
-
-    saved = os.environ.get("GDRIVE_FOLDER_ID")
-    try:
-        os.environ["GDRIVE_FOLDER_ID"] = "1jb2s5M_SU9fbwM8pGjDZBVJWiERhha62?usp=drive_link"
-        assert _env_excel_url() == (
-            "https://drive.google.com/drive/folders/1jb2s5M_SU9fbwM8pGjDZBVJWiERhha62"
-        )
-    finally:
-        if saved is None:
-            os.environ.pop("GDRIVE_FOLDER_ID", None)
-        else:
-            os.environ["GDRIVE_FOLDER_ID"] = saved
-
-
-def test_id_填壞了要當場失敗不要靜靜跳過():
-    """「沒設定」和「設定錯了」是兩件事。前者跳過，後者要紅。"""
-    import subprocess
-    import sys
-
-    got = subprocess.run(
-        [sys.executable, "scripts/upload_to_drive.py", "x.xlsx"],
-        capture_output=True, text=True,
-        env={"PATH": "/usr/bin:/bin", "GDRIVE_FOLDER_ID": "我的資料夾"},
-    )
-    assert got.returncode == 1, got.stdout + got.stderr
-    assert "看不出資料夾 id" in got.stderr

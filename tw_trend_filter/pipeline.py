@@ -1354,11 +1354,25 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
     # CDN 版把整份報告從 12 MB 壓到 1 MB 出頭。子資源完整性（SRI）雜湊寫死，
     # 這樣就算 CDN 上那個檔案被換掉，瀏覽器也會拒絕執行而不是照跑。
     if plotly_cdn:
-        # cdnjs 而不是 cdn.plot.ly。同一份函式庫、同一個版本，差別在 cdnjs 是
-        # 通用的 CDN，內容安全政策（CSP）比較嚴的地方多半放行它——把這份報告
-        # 嵌到別的頁面裡的時候，那是「圖表出得來」和「一片空白」的差別。
-        pljs = ('<script src="https://cdnjs.cloudflare.com/ajax/libs/'
-                'plotly.js/2.35.2/plotly.min.js" charset="utf-8"></script>')
+        # cdnjs 而不是 cdn.plot.ly：同一份函式庫，但 cdnjs 是通用的 CDN，內容
+        # 安全政策（CSP）比較嚴的地方多半放行它——把這份報告嵌到別的頁面裡的
+        # 時候，那是「圖表出得來」和「一片空白」的差別。
+        #
+        # 版本是 **2.35.3**，不是 2.35.2。cdnjs 的 API 會把 2.35.2 列在版本
+        # 清單裡，但那一版**一個檔案都沒有**，所以那個網址回 404——而 404 的
+        # `<script>` 不會報錯，只會讓 `Plotly` 是 undefined，然後每一張圖都是
+        # 空白。這正是它上線過一次的原因。
+        #
+        # 所以下面那個 onerror 是必要的，不是保險：CDN 掛掉、版本被撤、公司
+        # 防火牆擋住 cdnjs——三件事的症狀都一樣，而且都不會有錯誤訊息。
+        pljs = (
+            '<script src="https://cdnjs.cloudflare.com/ajax/libs/'
+            'plotly.js/2.35.3/plotly.min.js" charset="utf-8" '
+            'onerror="this.onerror=null;'
+            "var s=document.createElement('script');"
+            "s.src='https://cdn.plot.ly/plotly-2.35.2.min.js';"
+            "s.charset='utf-8';document.head.appendChild(s);\"></script>"
+        )
     else:
         try:
             import plotly.offline as pyo
@@ -1367,7 +1381,7 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         except Exception as e:
             print(f'⚠️ plotly.js 內嵌失敗，改用 CDN：{e}')
             pljs = ('<script src="https://cdnjs.cloudflare.com/ajax/libs/'
-                    'plotly.js/2.35.2/plotly.min.js"></script>')
+                    'plotly.js/2.35.3/plotly.min.js"></script>')
 
     #: 一年抓 252 個交易日。裁太少會讓「2年」那顆按鈕按下去看到一片空白，
     #: 所以多留半年的緩衝。
@@ -1831,17 +1845,28 @@ const PLY_CFG = {
   }
 };
 
-/* 手機上圖例那七項會折成三行，一行約 22px——那是圖表高度的兩成。把字縮小、
-   間距收緊之後折成兩行，而字仍然讀得到。 */
+/* 手機上的圖例。
+   375px 寬的螢幕上，七項會折成四行、量出來 87px 高——而上留白只有 72px，
+   所以它壓在 K 線圖最上面那一段上。把字縮小沒有用（實測還是 87px：plotly
+   的每一列有最小高度），要減的是**項數**。
+
+   留下帶數值的三個（20MA／60MA／建議停損），其餘四個拿掉：K 棒長得就像 K 棒、
+   成交量在自己那一格、均量是量圖上唯一一條線、布林上下軌是圖上唯二的虛線。
+   它們在桌機上值得標，在手機上佔的位置比它們講的事情貴。
+
+   減成三項之後量出來 49px、底端在 60px，所以上留白給 68px 就一定不重疊。
+   這幾個數字是在 375×812 的實機版面上量的，不是估的。 */
 function tuneForNarrow(fig) {
   if (!NARROW) return fig;
   fig.layout = fig.layout || {};
-  fig.layout.legend = Object.assign({}, fig.layout.legend, {
-    font: {size: 9}, itemwidth: 30
+  (fig.data || []).forEach(function(t) {
+    if (t.showlegend && !/20MA|60MA|建議停損/.test(t.name || '')) {
+      t.showlegend = false;
+    }
   });
+  fig.layout.legend = Object.assign({}, fig.layout.legend, {font: {size: 10}});
   fig.layout.margin = Object.assign({}, fig.layout.margin,
-                                    {t: 64, l: 44, r: 10, b: 20});
-  (fig.layout.xaxis2 || {}).tickfont = {size: 9};
+                                    {t: 68, l: 46, r: 10, b: 20});
   fig.layout.font = Object.assign({}, fig.layout.font, {size: 10});
   return fig;
 }
@@ -2086,6 +2111,24 @@ function showChart(idx) {
   updateIB(idx);
 
   var wrap = document.getElementById('plot-' + idx);
+
+  /* plotly 沒載進來的時候要**說出來**。
+     這一段上線過一次：CDN 那個版本 404，`Plotly` 是 undefined，於是每一張圖
+     都是一塊空白——沒有錯誤訊息、沒有紅字，看起來就像「圖表還在載入」。
+     使用者回報的是「趨勢圖跑不出來」，而那句話沒辦法告訴任何人該修哪裡。 */
+  if (typeof Plotly === 'undefined') {
+    if (wrap) {
+      wrap.innerHTML =
+        '<p class="ld" style="color:#f85149">\u26a0 \u5716\u8868\u51fd\u5f0f\u5eab' +
+        '\u6c92\u6709\u8f09\u5165\uff08plotly.js\uff09\u3002' +
+        '<br><span style="color:#8b949e;font-size:13px">' +
+        '\u53ef\u80fd\u662f\u7db2\u8def\u3001CDN\u3001\u6216\u700f\u89bd\u5668' +
+        '\u64cb\u6389\u4e86\u5916\u90e8\u8173\u672c\u3002' +
+        '\u91cd\u65b0\u6574\u7406\u9801\u9762\u8a66\u8a66\u770b\u3002</span></p>';
+    }
+    return;
+  }
+
   if (!rendered[idx]) {
     rendered[idx] = true;
     var fig = getChartFig(idx);

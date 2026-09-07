@@ -96,7 +96,7 @@ def test_結尾斜線不會生出雙斜線(tmp_path):
 #: plotly.js 的原始碼裡本來就有 'cdn.plot.ly' 這串字（它預設的資源路徑），
 #: 所以判斷內嵌與否要看 <script src=>，不能看網域字串有沒有出現。
 CDN_TAG = ('<script src="https://cdnjs.cloudflare.com/ajax/libs/'
-           'plotly.js/2.35.2/plotly.min.js"')
+           'plotly.js/2.35.3/plotly.min.js"')
 
 
 def test_cdn_模式不內嵌_plotly(tmp_path):
@@ -206,3 +206,58 @@ def test_日期只解析一次(tmp_path):
     fn = html[html.index("function computeVisibleYRange"):]
     fn = fn[: fn.index("\n}")]
     assert "_twMs" in fn, "沒有把日期→毫秒的結果存起來"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# plotly 的載入
+#
+# 這一組存在的理由很具體：cdnjs 的版本清單裡有 2.35.2，但那一版**一個檔案都
+# 沒有**，所以 `<script src>` 回 404——而 404 的 script 不會報錯，只會讓
+# `Plotly` 變成 undefined，然後每一張圖都是一塊空白。它上線過一次。
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_cdn_版本要指到真的存在的檔案(tmp_path):
+    """版本號寫錯的症狀是「圖表一片空白」，沒有任何錯誤訊息。
+
+    這裡只驗**寫下來的是哪一版**——真的去打那個網址是下面那個測試的事，
+    因為它要網路。
+    """
+    html = _build(tmp_path, plotly_cdn=True)
+    assert "plotly.js/2.35.3/plotly.min.js" in html, (
+        "cdnjs 上 2.35.2 是空的（版本清單有、檔案沒有），只有 2.35.3 拿得到"
+    )
+
+
+def test_cdn_掛掉要退回另一個來源(tmp_path):
+    """CDN 掛掉、版本被撤、公司防火牆擋掉 cdnjs——三件事的症狀一模一樣，
+    而且都不會有錯誤訊息。所以退路不是保險，是必要的。"""
+    html = _build(tmp_path, plotly_cdn=True)
+    assert "onerror=" in html, "沒有退路"
+    assert "cdn.plot.ly" in html, "退路沒有指到另一個來源"
+    # 退路自己也失敗的話不要無限迴圈。
+    assert "this.onerror=null" in html
+
+
+def test_圖表函式庫沒載入要說出來(tmp_path):
+    """一塊空白看起來像「還在載入」。使用者回報的會是「圖跑不出來」，
+    而那句話沒辦法告訴任何人該修哪裡。"""
+    html = _build(tmp_path)
+    assert "typeof Plotly === 'undefined'" in html
+    seg = html[html.index("typeof Plotly === 'undefined'"):][:900]
+    assert "plotly.js" in seg, "訊息裡沒有說是哪個函式庫"
+
+
+def test_手機上圖例只留帶數值的那幾項(tmp_path):
+    """375px 寬的螢幕上，七項圖例會折成四行、87px 高，而上留白只有 72px——
+    它會壓在 K 線圖最上面那一段上。
+
+    縮字沒有用（實測還是 87px，plotly 每一列有最小高度），要減的是**項數**。
+    留下帶數值的三個，其餘四個在圖上本來就看得出是什麼。
+    """
+    html = _build(tmp_path)
+    fn = html[html.index("function tuneForNarrow"):]
+    fn = fn[: fn.index("\n}")]
+    assert "showlegend = false" in fn, "沒有減少圖例項數"
+    assert "20MA|60MA|建議停損" in fn, "留下的不是帶數值的那三個"
+    # 上留白要大於量出來的圖例底端（60px）。
+    assert "t: 68" in fn

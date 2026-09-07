@@ -19,6 +19,22 @@ jobs:
       - run: pip install -r requirements.txt pytest
       - run: python -m pytest tests -q
 
+      # 單元測試只能驗「寫下來的是哪一版」。這一步驗那個網址**真的拿得到檔案**
+      # ——而那正是漏掉的那一格：cdnjs 的版本清單裡有 2.35.2，但那一版一個檔案
+      # 都沒有，網址回 404，而 404 的 <script> 不會報錯，只會讓每一張圖變成
+      # 一塊空白。
+      - name: 確認 plotly 的 CDN 網址拿得到
+        run: |
+          url=$(grep -o 'https://cdnjs.cloudflare.com/ajax/libs/plotly.js/[0-9.]*/plotly.min.js' \
+                  tw_trend_filter/pipeline.py | head -1)
+          echo "檢查 $url"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -L "$url")
+          size=$(curl -sS -o /dev/null -w '%{size_download}' -L "$url")
+          echo "  HTTP $code，$size 位元組"
+          test "$code" = "200" || { echo "::error::plotly 的 CDN 網址回 $code"; exit 1; }
+          # 4 MB 出頭才是整份函式庫。404 頁面也可能是 200，但它只有幾百位元組。
+          test "$size" -gt 1000000 || { echo "::error::拿到的不是函式庫（只有 $size 位元組）"; exit 1; }
+
   # 單元測試證明公式對，這個 job 證明**整條路走得通**：Yahoo 還讓我們抓、
   # ISIN 那張表還是那個格式、Excel 還存得起來、報告還畫得出來。
   #

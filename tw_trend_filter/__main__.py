@@ -14,14 +14,22 @@ from .pipeline import VERSION, run
 
 
 def _env_excel_url() -> str:
-    """在 GitHub Actions 底下自動組出這一次執行的頁面網址。
+    """Excel 報表的連結。優先用 Google Drive 那個資料夾。
 
-    Excel 報表存成 artifact，而 artifact 的直接下載網址是簽過章、幾分鐘就過期的，
-    寫進報告等於寫進一個壞連結。執行頁面的網址則是永久的，artifact 就列在那一頁
-    上（保留 30 天，過期後那一頁還在，只是下載不到）。
+    **Drive**（`GDRIVE_FOLDER_ID`）：排程每天把 xlsx 上傳到那個資料夾。連的是
+    資料夾而不是單一檔案，因為資料夾的網址在產生報告的**當下**就已經知道，而
+    某一天那個檔案的 id 要等上傳完才知道——報告是先產生、後上傳的。順帶一提，
+    連資料夾也讓讀者翻得到前幾天的。
 
-    不在 Actions 底下就回空字串，報告上不會出現那顆按鈕。
+    **退回 Actions 的執行頁面**：沒設定 Drive 的時候（例如 fork 出去的人），
+    artifact 就列在那一頁上。那份東西 30 天後會過期，所以報告上會多一句
+    「30 天內」——見 `pipeline.build_interactive_html`。
+
+    兩個都沒有就回空字串，報告上不會出現那顆按鈕。
     """
+    folder = os.environ.get('GDRIVE_FOLDER_ID', '').strip()
+    if folder:
+        return f'https://drive.google.com/drive/folders/{folder}'
     server = os.environ.get('GITHUB_SERVER_URL', 'https://github.com')
     repo   = os.environ.get('GITHUB_REPOSITORY', '')
     run_id = os.environ.get('GITHUB_RUN_ID', '')

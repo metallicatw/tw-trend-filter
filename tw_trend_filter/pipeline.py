@@ -2209,15 +2209,21 @@ document.addEventListener('DOMContentLoaded', function() { syncHdHeight(); showC
         # 「滑鼠移入圖表 → 顯示指標｜左鍵拖曳｜滾輪縮放」那一行拿掉了。
         # 它教的是三件**試一次就知道**的事，而它每天出現在每一位讀者眼前，
         # 佔的還是頁首最寬的那一段。手機上更沒有滑鼠也沒有滾輪。
-        # Excel \u7248\uff08\u6bcf\u4e00\u6a94\u4e00\u5f35 K \u7dda\u5716\uff09\u5b58\u5728\u90a3\u4e00\u6b21\u6392\u7a0b\u7684 artifact \u88e1\u3002\u9023\u7d50\u6307\u5411\u90a3\u4e00\u6b21
-        # \u7684\u57f7\u884c\u9801\u9762\uff0c\u800c\u4e0d\u662f\u4e00\u500b\u76f4\u63a5\u4e0b\u8f09\u7684\u7db2\u5740\u2014\u2014GitHub \u7684 artifact \u7db2\u5740\u662f\u7c3d\u904e\u7ae0\u3001
-        # \u5e7e\u5206\u9418\u5c31\u904e\u671f\u7684\uff0c\u5beb\u6b7b\u5728\u5831\u544a\u88e1\u7b49\u65bc\u5beb\u6b7b\u4e00\u500b\u58de\u9023\u7d50\u3002
+        # Excel 版（每一檔一張 K 線圖）的連結。
         #
-        # artifact \u4fdd\u7559 30 \u5929\u3002\u904e\u4e86\u5c31\u4e0b\u8f09\u4e0d\u5230\uff0c\u9023\u7d50\u6703\u505c\u5728\u4e00\u500b\u300c\u5df2\u904e\u671f\u300d\u7684\u9801\u9762\u2014\u2014
-        # \u9019\u4ef6\u4e8b\u5beb\u5728\u9023\u7d50\u65c1\u908a\uff0c\u8b80\u8005\u4e0d\u5fc5\u9ede\u4e0b\u53bb\u624d\u77e5\u9053\u3002
+        # 指向哪裡由呼叫端決定（見 `__main__._env_excel_url`）：設定了 Google
+        # Drive 就指那個資料夾——不過期、不必登入 GitHub、而且翻得到前幾天的。
+        # 沒設定就退回 Actions 的執行頁面，artifact 列在那一頁上。
+        #
+        # 「30 天內」那句只在**後者**才出現，因為那是 artifact 的保留期限，
+        # 不是 Drive 的。一句寫死的「30 天內」掛在一個永久連結旁邊，比不寫糟。
         ('<a class="dl" href="' + excel_url + '" target="_blank" rel="noopener" '
-         'title="\u8a72\u6b21\u57f7\u884c\u7684 Artifacts \u5340\uff0c\u4fdd\u7559 30 \u5929">'
-         '&#x2B07;&#xFE0F; Excel \u5831\u8868\uff0830 \u5929\u5167\uff09</a>')
+         + ('title="Google Drive，每天一份，不會過期">'
+            '\u2b07\ufe0f Excel \u5831\u8868</a>'
+            if 'drive.google.com' in excel_url else
+            'title="\u8a72\u6b21\u57f7\u884c\u7684 Artifacts \u5340\uff0c'
+            '\u4fdd\u7559 30 \u5929">'
+            '\u2b07\ufe0f Excel \u5831\u8868\uff0830 \u5929\u5167\uff09</a>'))
         if excel_url else '',
         '</div>',
         '</div>',  # /#topbar

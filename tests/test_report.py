@@ -10,6 +10,7 @@
 """
 
 import datetime
+import os
 import re
 
 import numpy as np
@@ -134,6 +135,62 @@ def test_excel_連結有給才出現(tmp_path):
     assert 'https://example.org/runs/1' in html
     # 30 天這件事要寫在連結旁邊，不能讓人點下去才知道過期了。
     assert '30 天' in html
+
+
+def test_drive_的連結不寫_30_天(tmp_path):
+    """「30 天內」是 artifact 的保留期限，不是 Drive 的。
+
+    一句寫死的「30 天內」掛在一個永久連結旁邊，比不寫糟——它會讓人以為那份
+    檔案會消失，而它不會。
+    """
+    html = _build(tmp_path, excel_url='https://drive.google.com/drive/folders/abc123')
+    assert 'https://drive.google.com/drive/folders/abc123' in html
+    assert '30 天' not in html
+    assert 'Excel 報表' in html
+
+
+def test_有_drive_資料夾就用它_沒有才退回執行頁面(monkeypatch=None):
+    """報告是先產生、後上傳的，所以連結指的是**資料夾**——資料夾的網址在產生
+    報告的當下就知道，某一天那個檔案的 id 要等上傳完才知道。"""
+    import os
+
+    from tw_trend_filter.__main__ import _env_excel_url
+
+    keys = ('GDRIVE_FOLDER_ID', 'GITHUB_SERVER_URL', 'GITHUB_REPOSITORY', 'GITHUB_RUN_ID')
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        # 兩個都沒有 → 沒有連結，報告上不會出現那顆按鈕
+        assert _env_excel_url() == ''
+
+        os.environ['GITHUB_REPOSITORY'] = 'a/b'
+        os.environ['GITHUB_RUN_ID'] = '99'
+        assert _env_excel_url() == 'https://github.com/a/b/actions/runs/99'
+
+        # Drive 優先
+        os.environ['GDRIVE_FOLDER_ID'] = 'FOLDER'
+        assert _env_excel_url() == 'https://drive.google.com/drive/folders/FOLDER'
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_沒有憑證就跳過上傳而不是失敗():
+    """fork 出去的人不必先去申請一組 Google 憑證才跑得動排程。"""
+    import subprocess
+    import sys
+
+    env = dict(os.environ) if False else {}
+    got = subprocess.run(
+        [sys.executable, 'scripts/upload_to_drive.py', 'whatever.xlsx'],
+        capture_output=True, text=True, env={'PATH': '/usr/bin:/bin'},
+    )
+    assert got.returncode == 0, got.stderr
+    assert '跳過上傳' in got.stdout
 
 
 def test_沒有任何標的時不產生檔案(tmp_path):

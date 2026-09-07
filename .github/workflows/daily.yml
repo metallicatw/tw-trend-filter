@@ -50,6 +50,12 @@ jobs:
 
       - name: 全市場篩選
         id: screen
+        env:
+          # 報告上那顆 Excel 連結指向哪裡。設定了就是 Drive 那個資料夾，沒設定
+          # 就退回這一次執行的頁面（artifact 在那裡，30 天後過期）。
+          # 資料夾網址在**產生報告的當下**就知道，而某一天那個檔案的 id 要等
+          # 上傳完才知道——而報告是先產生、後上傳的。
+          GDRIVE_FOLDER_ID: ${{ vars.GDRIVE_FOLDER_ID }}
         run: |
           python -m tw_trend_filter \
             --output-dir output \
@@ -57,10 +63,25 @@ jobs:
             --link-base "https://metallicatw.github.io/tw-six-metrics/stock" \
             --limit "${{ github.event.inputs.limit || 0 }}"
 
-      # Excel 進 artifact，不進 git。一份約 3～4 MB，每天 commit 一次的話一年
-      # 就是 1 GB 的二進位檔，而且沒有人會回頭看三個月前那一份。
-      # 保留 30 天：過了就下載不到，報告上那顆按鈕旁邊寫著這件事。
-      - name: 上傳 Excel 報表
+      # Excel 送去 Google Drive：不過期、不必登入 GitHub、每一天的都留著。
+      #
+      # 沒設定憑證就整步跳過（腳本自己判斷），所以 fork 出去的人不必先去申請
+      # 一組 Google 憑證才跑得動排程。
+      - name: 上傳 Excel 到 Google Drive
+        if: hashFiles('output/*.xlsx') != ''
+        env:
+          GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
+          GDRIVE_FOLDER_ID: ${{ vars.GDRIVE_FOLDER_ID }}
+        run: |
+          pip install -q google-api-python-client google-auth
+          python scripts/upload_to_drive.py output/*.xlsx
+
+      # artifact 留著當退路，不是重複。
+      #
+      # Drive 那一步會因為憑證過期、配額、資料夾被移動而失敗，而它失敗的時候
+      # 那一天的 Excel 就只剩這裡有。artifact 不花錢也不進 git，留著的成本是零。
+      # 報告上那顆連結指的是 Drive（見上面 screen 那一步）。
+      - name: 上傳 Excel 報表（退路）
         if: always() && hashFiles('output/*.xlsx') != ''
         uses: actions/upload-artifact@v4
         with:

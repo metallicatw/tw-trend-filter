@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
 from .pipeline import VERSION, run
 
@@ -27,7 +28,20 @@ def _env_excel_url() -> str:
 
     兩個都沒有就回空字串，報告上不會出現那顆按鈕。
     """
-    folder = os.environ.get('GDRIVE_FOLDER_ID', '').strip()
+    # 同一個正規化：`GDRIVE_FOLDER_ID` 很容易連著 `?usp=drive_link` 一起貼進來
+    # （Drive 的「複製連結」就是給那一串），而那樣組出來的連結會多一段參數。
+    # 上傳那支腳本用同一個函式，兩邊對同一個值的理解才會一致。
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+    try:
+        from upload_to_drive import folder_id  # noqa: PLC0415
+    except ImportError:                        # 打包安裝時沒有 scripts/
+        def folder_id(raw: str) -> str:
+            text = (raw or '').strip().strip('/')
+            if '/folders/' in text:
+                text = text.split('/folders/', 1)[1]
+            return text.split('?', 1)[0].split('#', 1)[0].strip().strip('/')
+
+    folder = folder_id(os.environ.get('GDRIVE_FOLDER_ID', ''))
     if folder:
         return f'https://drive.google.com/drive/folders/{folder}'
     server = os.environ.get('GITHUB_SERVER_URL', 'https://github.com')

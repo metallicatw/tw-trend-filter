@@ -168,9 +168,11 @@ def test_有_drive_資料夾就用它_沒有才退回執行頁面(monkeypatch=No
         os.environ['GITHUB_RUN_ID'] = '99'
         assert _env_excel_url() == 'https://github.com/a/b/actions/runs/99'
 
-        # Drive 優先
-        os.environ['GDRIVE_FOLDER_ID'] = 'FOLDER'
-        assert _env_excel_url() == 'https://drive.google.com/drive/folders/FOLDER'
+        # Drive 優先。用一個真實長度的 id——太短的字串會被當成填錯而擋下來
+        # （見 test_看不出_id_就明確報錯而不是拿去打_api）。
+        real = '1jb2s5M_SU9fbwM8pGjDZBVJWiERhha62'
+        os.environ['GDRIVE_FOLDER_ID'] = real
+        assert _env_excel_url() == f'https://drive.google.com/drive/folders/{real}'
     finally:
         for k, v in saved.items():
             if v is None:
@@ -342,3 +344,75 @@ def test_手機上圖例只留帶數值的那幾項(tmp_path):
     assert "20MA|60MA|建議停損" in fn, "留下的不是帶數值的那三個"
     # 上留白要大於量出來的圖例底端（60px）。
     assert "t: 68" in fn
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# GDRIVE_FOLDER_ID 的正規化
+#
+# Drive 的「複製連結」給的是 `https://drive.google.com/drive/folders/<id>?usp=drive_link`，
+# 而設定欄位叫「FOLDER_ID」——於是最自然的動作是把網址最後一段連著
+# `?usp=drive_link` 一起貼進去。那樣拼出來的查詢是
+# `'<id>?usp=drive_link' in parents`，Drive 回 404「File not found」：一個看起來
+# 像權限問題、其實是多了 17 個字元的錯誤。實際發生過。
+# ─────────────────────────────────────────────────────────────────────────
+
+def _folder_id(raw):
+    import sys
+    from pathlib import Path as _P
+
+    sys.path.insert(0, str(_P(__file__).resolve().parents[1] / "scripts"))
+    from upload_to_drive import folder_id
+
+    return folder_id(raw)
+
+
+def test_資料夾_id_接受貼進來的三種寫法():
+    real = "1jb2s5M_SU9fbwM8pGjDZBVJWiERhha62"
+    # 這一個就是線上炸掉的那一串。
+    assert _folder_id(f"{real}?usp=drive_link") == real
+    assert _folder_id(f"https://drive.google.com/drive/folders/{real}?usp=drive_link") == real
+    assert _folder_id(f"https://drive.google.com/drive/folders/{real}") == real
+    assert _folder_id(real) == real
+    # 前後空白、結尾斜線
+    assert _folder_id(f"  {real}/  ") == real
+    # 沒設定就是沒設定
+    assert _folder_id("") == "" and _folder_id("   ") == ""
+
+
+def test_看不出_id_就明確報錯而不是拿去打_api():
+    # 亂填的東西不該被當成 id 送出去——那會換到一個 404，而 404 讀起來像權限問題。
+    assert _folder_id("我的資料夾") == ""
+    assert _folder_id("https://drive.google.com/drive/my-drive") == ""
+
+
+def test_報告連結也要正規化(tmp_path):
+    """網址多一段 `?usp=drive_link` 還是開得起來，但它會出現在每一份報告上。"""
+    import os
+
+    from tw_trend_filter.__main__ import _env_excel_url
+
+    saved = os.environ.get("GDRIVE_FOLDER_ID")
+    try:
+        os.environ["GDRIVE_FOLDER_ID"] = "1jb2s5M_SU9fbwM8pGjDZBVJWiERhha62?usp=drive_link"
+        assert _env_excel_url() == (
+            "https://drive.google.com/drive/folders/1jb2s5M_SU9fbwM8pGjDZBVJWiERhha62"
+        )
+    finally:
+        if saved is None:
+            os.environ.pop("GDRIVE_FOLDER_ID", None)
+        else:
+            os.environ["GDRIVE_FOLDER_ID"] = saved
+
+
+def test_id_填壞了要當場失敗不要靜靜跳過():
+    """「沒設定」和「設定錯了」是兩件事。前者跳過，後者要紅。"""
+    import subprocess
+    import sys
+
+    got = subprocess.run(
+        [sys.executable, "scripts/upload_to_drive.py", "x.xlsx"],
+        capture_output=True, text=True,
+        env={"PATH": "/usr/bin:/bin", "GDRIVE_FOLDER_ID": "我的資料夾"},
+    )
+    assert got.returncode == 1, got.stdout + got.stderr
+    assert "看不出資料夾 id" in got.stderr

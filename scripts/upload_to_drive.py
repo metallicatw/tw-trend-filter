@@ -24,8 +24,48 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
+
+#: 從使用者填的東西裡取出真正的資料夾 id。
+#:
+#: Drive 的「複製連結」給的是
+#: `https://drive.google.com/drive/folders/1AbC...xyz?usp=drive_link`，
+#: 而設定欄位叫「FOLDER_ID」——於是最自然的動作是把網址最後一段貼進去，
+#: 連著 `?usp=drive_link` 一起。
+#:
+#: 那樣拼出來的查詢是 `'1AbC...xyz?usp=drive_link' in parents`，Drive 回 404
+#: 「File not found」——一個看起來像權限問題、其實是多了 17 個字元的錯誤。
+#: 實際發生過。
+#:
+#: 所以這裡接受三種寫法：完整網址、id 加問號參數、乾淨的 id。
+_ID = re.compile(r"[A-Za-z0-9_-]{10,}")
+
+
+def folder_id(raw: str) -> str:
+    """`https://…/folders/ABC?usp=drive_link`、`ABC?usp=…`、`ABC` → `ABC`。"""
+    text = (raw or "").strip().strip("/")
+    if not text:
+        return ""
+    if "/folders/" in text:
+        text = text.split("/folders/", 1)[1]
+    # 問號之後是參數，井字號之後是錨點——兩個都不是 id 的一部分。
+    text = text.split("?", 1)[0].split("#", 1)[0].strip().strip("/")
+    m = _ID.fullmatch(text)
+    return text if m else ""
+
+
+def _sa_email(key: str) -> str:
+    """從金鑰 JSON 取出服務帳號的信箱，只為了把它印在錯誤訊息裡。
+
+    「分享給服務帳號」是最常漏的一步，而那個信箱藏在一份使用者多半沒有打開過的
+    JSON 裡——讓錯誤訊息自己把它講出來，比叫人去翻檔案快。
+    """
+    try:
+        return json.loads(key).get("client_email", "(讀不到)")
+    except Exception:  # noqa: BLE001
+        return "(金鑰不是有效的 JSON)"
 
 
 def main(argv: list[str]) -> int:
@@ -34,7 +74,17 @@ def main(argv: list[str]) -> int:
         return 2
 
     key = os.environ.get("GDRIVE_SA_KEY", "").strip()
-    folder = os.environ.get("GDRIVE_FOLDER_ID", "").strip()
+    raw_folder = os.environ.get("GDRIVE_FOLDER_ID", "")
+    folder = folder_id(raw_folder)
+    if raw_folder.strip() and not folder:
+        print(
+            f"::error::GDRIVE_FOLDER_ID 看不出資料夾 id：{raw_folder!r}\n"
+            "應該是資料夾網址 /folders/ 後面那一段。",
+            file=sys.stderr,
+        )
+        return 1
+    if folder and folder != raw_folder.strip():
+        print(f"  （GDRIVE_FOLDER_ID 去掉多餘的部分：{raw_folder.strip()!r} → {folder!r}）")
     if not key or not folder:
         # 沒設定就是沒設定，不是錯誤——這樣 fork 出去的人不必先去申請一組
         # Google 憑證才能跑排程。
@@ -61,12 +111,28 @@ def main(argv: list[str]) -> int:
         q = (
             f"name = '{path.name}' and '{folder}' in parents and trashed = false"
         )
-        found = (
-            drive.files()
-            .list(q=q, fields="files(id)", pageSize=1)
-            .execute()
-            .get("files", [])
-        )
+        try:
+            found = (
+                drive.files()
+                .list(q=q, fields="files(id)", pageSize=1)
+                .execute()
+                .get("files", [])
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Drive 對「不存在」和「你沒有權限看」回的是同一個 404。兩種原因
+            # 各有一句話能講清楚，而原始的 traceback 兩句都沒講。
+            if "404" in str(exc) or "notFound" in str(exc):
+                print(
+                    f"::error::Drive 找不到資料夾 {folder}。兩個可能：\n"
+                    "  1. id 不對——它是資料夾網址 /folders/ 後面那一段，"
+                    "不含 ?usp=drive_link\n"
+                    f"  2. 資料夾沒有分享給服務帳號（{_sa_email(key)}），"
+                    "權限要給編輯者\n"
+                    "     服務帳號看不到的資料夾，對它來說就是不存在。",
+                    file=sys.stderr,
+                )
+                return 1
+            raise
         media = MediaFileUpload(
             str(path),
             mimetype="application/vnd.openxmlformats-officedocument."

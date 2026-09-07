@@ -1354,8 +1354,11 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
     # CDN 版把整份報告從 12 MB 壓到 1 MB 出頭。子資源完整性（SRI）雜湊寫死，
     # 這樣就算 CDN 上那個檔案被換掉，瀏覽器也會拒絕執行而不是照跑。
     if plotly_cdn:
-        pljs = ('<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" '
-                'charset="utf-8"></script>')
+        # cdnjs 而不是 cdn.plot.ly。同一份函式庫、同一個版本，差別在 cdnjs 是
+        # 通用的 CDN，內容安全政策（CSP）比較嚴的地方多半放行它——把這份報告
+        # 嵌到別的頁面裡的時候，那是「圖表出得來」和「一片空白」的差別。
+        pljs = ('<script src="https://cdnjs.cloudflare.com/ajax/libs/'
+                'plotly.js/2.35.2/plotly.min.js" charset="utf-8"></script>')
     else:
         try:
             import plotly.offline as pyo
@@ -1363,7 +1366,8 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
             pljs = '<script>' + plotly_js_src + '</script>'
         except Exception as e:
             print(f'⚠️ plotly.js 內嵌失敗，改用 CDN：{e}')
-            pljs = '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>'
+            pljs = ('<script src="https://cdnjs.cloudflare.com/ajax/libs/'
+                    'plotly.js/2.35.2/plotly.min.js"></script>')
 
     #: 一年抓 252 個交易日。裁太少會讓「2年」那顆按鈕按下去看到一片空白，
     #: 所以多留半年的緩衝。
@@ -1455,12 +1459,21 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         ), row=1, col=1)
 
         # ⑤ 20MA
-        fig.add_trace(go.Scatter(x=dates, y=m20, mode='lines', name='20MA 月線',
+        #
+        # 圖例上帶著**目前的數值**。原本這三個數字（20MA／60MA／停損）在圖表
+        # 上方另外排一排徽章，而圖例就在它們正下方幾十個像素的地方——同一個
+        # 數字在同一個畫面上出現兩次，讀者要先確認那是不是同一件事。
+        #
+        # 併到圖例是因為圖例本來就帶著顏色：看到「20MA 月線 50.55」旁邊那條
+        # 橘線，就知道圖上那條橘線現在在 50.55。徽章沒有這個連結。
+        fig.add_trace(go.Scatter(x=dates, y=m20, mode='lines',
+            name='20MA 月線 {:.2f}'.format(res['ma20_last']),
             line=dict(color=MA20C, width=2.0),
             showlegend=True, hoverinfo='skip'), row=1, col=1)
 
         # ⑥ 60MA
-        fig.add_trace(go.Scatter(x=dates, y=m60, mode='lines', name='60MA 季線',
+        fig.add_trace(go.Scatter(x=dates, y=m60, mode='lines',
+            name='60MA 季線 {:.2f}'.format(res['ma60_last']),
             line=dict(color=MA60C, width=2.0, dash='dash'),
             showlegend=True, hoverinfo='skip'), row=1, col=1)
 
@@ -1635,9 +1648,14 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         '<span class="nb-name">{name}</span>'
         '<span class="nb-pct {pcls}">{sign}{pct:.2f}%</span>'
         '</div>'
+        # 產業從右邊圖表區那排徽章搬到這裡。它是這一檔**是什麼**，和代號、
+        # 名稱同一類；擺在右邊那排「20MA 幾塊、停損幾塊」中間，等於把一個
+        # 身分混進一串數字裡。
+        '<div class="nb-ind">{ind}</div>'
         '<div class="nb-tagrow"><span class="nb-tag">{trig}</span>{ext}</div>'
         '</div>'.format(
             i=i, code=s['code'], name=_esc(s['name']),
+            ind=_esc(s.get('ind') or '—'),
             close=s['close'], pct=abs(s['chg_pct']),
             sign='▲' if s['chg_pct'] > 0 else ('▼' if s['chg_pct'] < 0 else ''),
             pcls='up' if s['chg_pct'] > 0 else ('dn' if s['chg_pct'] < 0 else 'fl'),
@@ -1700,6 +1718,7 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         '.nb-pct.up{color:#3fb950}'
         '.nb-pct.dn{color:#f85149}'
         '.nb-pct.fl{color:#8b949e}'
+        '.nb-ind{font-size:11px;color:#79c0ff;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}'
         '.nb-tagrow{display:flex;align-items:center;gap:6px;margin-top:6px}'
         '.nb-tag{display:inline-block;padding:2px 8px;'
             'border-radius:11px;font-size:10.5px;background:rgba(240,194,127,.14);'
@@ -1752,29 +1771,80 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
             'font-family:inherit;font-size:11px;transition:background .12s}'
         '.rbtn:hover{background:#30363d;border-color:#58a6ff}'
         '.rbtn.rba{background:#1f6feb;border-color:#388bfd;color:#fff}'
-        # ── RWD：手機隱藏頂部標題列，改為單欄堆疊（保留頁面捲動）─
+        # ── 手機版 ──────────────────────────────────────────────
+        #
+        # 桌機是「左邊一欄清單、右邊一張大圖」。那個版面在 390px 寬的螢幕上
+        # 沒有「左右」可以分，所以第一版把清單壓成上面 220px 高的一塊捲動區
+        # ——結果是螢幕的四成給了一份要捲的清單，剩下六成給圖，而兩個都不好用。
+        #
+        # 改成「上面一條橫向的籌碼列、下面整片留給圖」：
+        #
+        #   * 清單變成一排可以左右滑的小卡，一次看得到三、四檔，橫向滑動在
+        #     手機上是最自然的手勢，而且它只佔一行。
+        #   * 圖拿到剩下的**整個**視窗高度，不是寫死的 520px——寫死的話在
+        #     小螢幕上超出一截、在大螢幕上又留一片空白。
+        #   * 頁首留著但壓扁。它上面有篩選日期和 Excel 的連結，第一版整個
+        #     `display:none` 等於手機上永遠拿不到那兩個東西。
         '@media(max-width:760px){'
-            'html,body{overflow:auto}'
-            '#hd{display:none}'
-            '#main{flex-direction:column;height:auto}'
-            '#sidebar{width:100%;flex:0 0 auto;max-height:220px;height:auto;'
-                'border-right:none;border-bottom:1px solid #30363d}'
-            '#chartcol{height:auto;overflow-y:visible}'
-            '.cw.act{height:auto}'
-            '.plot{height:520px}'
+            'html,body{overflow:hidden}'
+            ':root{--hd-h:auto}'
+            '#hd{flex-wrap:wrap;gap:6px;padding:8px 10px}'
+            '#hd h1{font-size:13px;white-space:normal}'
+            '#hd .meta{font-size:11px}'
+            '#hd a.dl{font-size:11px;padding:2px 8px}'
+            '#main{flex-direction:column;height:calc(100vh - var(--hd-h,86px))}'
+            # 側欄變成一條橫向滑動的籌碼列。
+            '#sidebar{width:100%;flex:0 0 auto;height:auto;max-height:none;'
+                'border-right:none;border-bottom:1px solid #30363d;'
+                'overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}'
+            '#sb-list{display:flex;gap:6px;padding:6px 8px;width:max-content}'
+            '.nb{flex:0 0 auto;width:132px;margin:0;padding:7px 9px}'
+            '.nb-code{font-size:14px}'
+            '.nb-close{font-size:13px}'
+            '.nb-bot{font-size:11px;margin-top:1px}'
+            # 觸發訊號和那顆「六大↗」在這個寬度塞不下，收起來——它們在圖表區
+            # 上方仍然看得到。產業留著，那是一行字。
+            '.nb-tagrow{display:none}'
+            '.nb-ind{font-size:10px;margin-top:2px}'
+            '#chartcol{flex:1 1 auto;height:auto;min-height:0;overflow-y:auto}'
+            '.cw.act{height:100%;padding:8px 10px 10px}'
+            '.plot{flex:1 1 auto;min-height:260px}'
+            '.badge{font-size:11.5px;padding:4px 10px}'
+            '.trig-line{font-size:12px;margin:2px 0 6px}'
+            '.rbtn{padding:6px 14px;font-size:12px}'   # 手指按得到
         '}'
     )
 
     js = r"""
 const INFO = INFO_JS_PLACEHOLDER;
 const rendered = {};
+/* 手機：390px 寬的螢幕上，那排工具列會吃掉圖表頂端一整條，而它上面每一顆
+   （框選縮放、自動縮放、存圖）在觸控上不是做不到就是有更自然的手勢。捏合縮放
+   和拖曳平移不需要它。 */
+const NARROW = window.matchMedia('(max-width:760px)').matches;
 const PLY_CFG = {
-  displayModeBar: true, displaylogo: false, scrollZoom: true,
+  displayModeBar: !NARROW, displaylogo: false, scrollZoom: true,
+  responsive: false,
   modeBarButtonsToRemove: ['lasso2d','select2d'],
   toImageButtonOptions: {
     format:'png', filename:'twstock_TS_PH', height:760, width:1400, scale:2
   }
 };
+
+/* 手機上圖例那七項會折成三行，一行約 22px——那是圖表高度的兩成。把字縮小、
+   間距收緊之後折成兩行，而字仍然讀得到。 */
+function tuneForNarrow(fig) {
+  if (!NARROW) return fig;
+  fig.layout = fig.layout || {};
+  fig.layout.legend = Object.assign({}, fig.layout.legend, {
+    font: {size: 9}, itemwidth: 30
+  });
+  fig.layout.margin = Object.assign({}, fig.layout.margin,
+                                    {t: 64, l: 44, r: 10, b: 20});
+  (fig.layout.xaxis2 || {}).tickfont = {size: 9};
+  fig.layout.font = Object.assign({}, fig.layout.font, {size: 10});
+  return fig;
+}
 
 /* ── 依實際 #hd 高度設定 CSS 變數，讓 #main 精準填滿剩餘視窗高度 ── */
 function syncHdHeight() {
@@ -1841,11 +1911,11 @@ function updateIB(i) {
   var s = INFO[i];
   var badges = document.getElementById('badges-' + i);
   if (badges && !badges.dataset.filled) {
+    /* 20MA／60MA／停損三個拿掉了——圖例上本來就有這三條線，而且圖例是跟著
+       線的顏色的。同一個數字在同一個畫面上出現兩次，讀者要先確認那是不是
+       同一件事，才能繼續往下看。
+       留下的是**圖上看不到**的：量比、布林寬、ATR。 */
     badges.innerHTML =
-      '<span class="badge ind">' + (s.ind||'\u2014') + '</span>' +
-      '<span class="badge gold">20MA ' + s.ma20.toFixed(2) + '</span>' +
-      '<span class="badge gold">60MA ' + s.ma60.toFixed(2) + '</span>' +
-      '<span class="badge stop">\u505c\u640d ' + s.stop.toFixed(2) + '</span>' +
       '<span class="badge">\u91cf\u6bd4 ' + s.vratio.toFixed(2) + 'x</span>' +
       '<span class="badge">\u5e03\u6797\u5bec ' + s.bw.toFixed(1) + '%</span>' +
       '<span class="badge gold">ATR ' + s.atr.toFixed(2) + '</span>' +
@@ -2004,7 +2074,14 @@ function attachAutoY(div) {
 
 /* ── 切換個股 ─────────────────────────────────────────────── */
 function showChart(idx) {
-  document.querySelectorAll('.nb').forEach(function(b,i){ b.classList.toggle('act', i===idx); });
+  document.querySelectorAll('.nb').forEach(function(b,i){
+    b.classList.toggle('act', i===idx);
+    /* 手機上清單是一條橫向滑動的列，選到的那一張可能在畫面外——換到它卻看不到
+       哪一張亮著，等於不知道自己在看哪一檔。 */
+    if (i === idx && b.scrollIntoView) {
+      b.scrollIntoView({block: 'nearest', inline: 'nearest'});
+    }
+  });
   document.querySelectorAll('.cw').forEach(function(el,i){ el.classList.toggle('act', i===idx); });
   updateIB(idx);
 
@@ -2020,6 +2097,7 @@ function showChart(idx) {
        尺寸也一起放進 layout 再 newPlot——畫出來就是最終的樣子，不必畫完
        再 relayout 一次。原本這一步要跑三次完整 relayout（尺寸、X 範圍、
        Y 範圍），而每一次都會把五百根 K 棒重畫一遍。 */
+    tuneForNarrow(fig);
     var w0 = wrap.clientWidth, h0 = wrap.clientHeight;
     if (w0 > 0 && h0 > 0) {
       fig.layout.width = w0; fig.layout.height = h0;
@@ -2067,9 +2145,9 @@ document.addEventListener('DOMContentLoaded', function() { syncHdHeight(); showC
         '<div class="meta">\u7be9\u9078\u65e5\u671f\uff1a' + ts_display +
         '&nbsp;|&nbsp;\u5171&nbsp;<b style="color:#3fb950">' + str(n) +
         '</b>&nbsp;\u6a94\u901a\u904e</div>',
-        '<div class="tip">&#x1F5B1;&#xFE0F; \u6ed1\u9f20\u79fb\u5165\u5716\u8868 \u2192 '
-        '\u5373\u6642\u986f\u793a\u6240\u6709\u6307\u6a19\uff08\u542b\u91cf\u5716\uff09'
-        '&nbsp;|&nbsp;\u5de6\u9375\u62d6\u66f3\u5e73\u79fb&nbsp;|&nbsp;\u6eda\u8f2a\u7e2e\u653e</div>',
+        # 「滑鼠移入圖表 → 顯示指標｜左鍵拖曳｜滾輪縮放」那一行拿掉了。
+        # 它教的是三件**試一次就知道**的事，而它每天出現在每一位讀者眼前，
+        # 佔的還是頁首最寬的那一段。手機上更沒有滑鼠也沒有滾輪。
         # Excel \u7248\uff08\u6bcf\u4e00\u6a94\u4e00\u5f35 K \u7dda\u5716\uff09\u5b58\u5728\u90a3\u4e00\u6b21\u6392\u7a0b\u7684 artifact \u88e1\u3002\u9023\u7d50\u6307\u5411\u90a3\u4e00\u6b21
         # \u7684\u57f7\u884c\u9801\u9762\uff0c\u800c\u4e0d\u662f\u4e00\u500b\u76f4\u63a5\u4e0b\u8f09\u7684\u7db2\u5740\u2014\u2014GitHub \u7684 artifact \u7db2\u5740\u662f\u7c3d\u904e\u7ae0\u3001
         # \u5e7e\u5206\u9418\u5c31\u904e\u671f\u7684\uff0c\u5beb\u6b7b\u5728\u5831\u544a\u88e1\u7b49\u65bc\u5beb\u6b7b\u4e00\u500b\u58de\u9023\u7d50\u3002

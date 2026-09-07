@@ -95,7 +95,8 @@ def test_結尾斜線不會生出雙斜線(tmp_path):
 
 #: plotly.js 的原始碼裡本來就有 'cdn.plot.ly' 這串字（它預設的資源路徑），
 #: 所以判斷內嵌與否要看 <script src=>，不能看網域字串有沒有出現。
-CDN_TAG = '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"'
+CDN_TAG = ('<script src="https://cdnjs.cloudflare.com/ajax/libs/'
+           'plotly.js/2.35.2/plotly.min.js"')
 
 
 def test_cdn_模式不內嵌_plotly(tmp_path):

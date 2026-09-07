@@ -219,13 +219,37 @@ def test_日期只解析一次(tmp_path):
 def test_cdn_版本要指到真的存在的檔案(tmp_path):
     """版本號寫錯的症狀是「圖表一片空白」，沒有任何錯誤訊息。
 
-    這裡只驗**寫下來的是哪一版**——真的去打那個網址是下面那個測試的事，
-    因為它要網路。
+    這裡只驗**寫下來的是哪一版**。真的去打那個網址是 CI 的事（要網路），
+    而那一步問的是同一個常數，不是拿 grep 去原始碼裡撈。
     """
+    from tw_trend_filter.pipeline import PLOTLY_CDN
+
     html = _build(tmp_path, plotly_cdn=True)
-    assert "plotly.js/2.35.3/plotly.min.js" in html, (
+    assert "plotly.js/2.35.3/plotly.min.js" in PLOTLY_CDN, (
         "cdnjs 上 2.35.2 是空的（版本清單有、檔案沒有），只有 2.35.3 拿得到"
     )
+    assert PLOTLY_CDN in html, "產出的 HTML 用的不是那個常數"
+
+
+def test_ci_那一步問的是程式在用的那個值():
+    """守門的檢查如果是靠**重新解析原始碼**拿到要檢查的東西，它就有自己的
+    一份 bug——而那份 bug 的症狀是「檢查通過」。
+
+    第一版是 `grep -o 'https://...'` 去 pipeline.py 裡撈網址，而網址在原始碼
+    裡是跨兩個字串常值寫的（`'.../libs/'` 接 `'plotly.js/...'`），所以 grep
+    一輩子都撈不到。它撈到空字串、curl 收到空字串、報
+    「Malformed input to a URL function」——那一次是當場紅的，算幸運；
+    如果 curl 對空字串回 0，這個檢查會永遠綠燈而且守著空氣。
+    """
+    from pathlib import Path as _P
+
+    ci = (_P(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text("utf-8")
+    assert "確認 plotly 的 CDN 網址拿得到" in ci, "那一步不見了"
+    assert "from tw_trend_filter.pipeline import" in ci, "又改回用 grep 撈原始碼了"
+    # 整份 workflow 裡都不該再有 grep 撈網址那一招。
+    assert "grep -o 'https://" not in ci
+    # 退路也要驗——它掛掉的時候沒有第三條路了。
+    assert "PLOTLY_CDN_FALLBACK" in ci
 
 
 def test_cdn_掛掉要退回另一個來源(tmp_path):

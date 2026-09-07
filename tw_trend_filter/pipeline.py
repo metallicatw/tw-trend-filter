@@ -48,6 +48,26 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 # 這裡用 curl_cffi 模擬 Chrome 連線來繞過此限制。
 _YF_SESSION = _cffi_requests.Session(impersonate='chrome')
 
+#: plotly.js 從哪裡載。
+#:
+#: 拆成具名常數的理由不是整潔，是**這一行要能被別人問到**：CI 有一步真的去打
+#: 這個網址，確認它拿得到檔案。那一步原本是拿 grep 去 pipeline.py 裡撈網址，
+#: 而網址在原始碼裡是跨兩個字串常值寫的（`'.../libs/'` 加 `'plotly.js/...'`），
+#: 所以 grep 一輩子都撈不到——它撈到空字串，curl 收到空字串就報
+#: 「Malformed input to a URL function」。一個驗不到東西的檢查比沒有檢查糟。
+#:
+#: 現在 CI 直接 `from tw_trend_filter.pipeline import PLOTLY_CDN`，問的和程式
+#: 用的是同一個值，中間沒有第二次解析。
+#:
+#: 版本是 2.35.3 而不是 2.35.2：cdnjs 的版本清單裡有 2.35.2，但那一版**一個
+#: 檔案都沒有**，網址回 404——而 404 的 `<script>` 不會報錯，只會讓 `Plotly`
+#: 變成 undefined，然後每一張圖都是空白。
+PLOTLY_CDN = "https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.35.3/plotly.min.js"
+
+#: 上面那個掛掉時的退路。CDN 掛掉、版本被撤、公司防火牆擋掉 cdnjs——三件事的
+#: 症狀一模一樣，而且都不會有錯誤訊息，所以退路是必要的，不是保險。
+PLOTLY_CDN_FALLBACK = "https://cdn.plot.ly/plotly-2.35.2.min.js"
+
 #: 這支程式版本號。出現在 Excel 抬頭、HTML 標題與 CLI 的 `--version`。
 VERSION = 'V3.1'
 
@@ -1366,11 +1386,10 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         # 所以下面那個 onerror 是必要的，不是保險：CDN 掛掉、版本被撤、公司
         # 防火牆擋住 cdnjs——三件事的症狀都一樣，而且都不會有錯誤訊息。
         pljs = (
-            '<script src="https://cdnjs.cloudflare.com/ajax/libs/'
-            'plotly.js/2.35.3/plotly.min.js" charset="utf-8" '
+            f'<script src="{PLOTLY_CDN}" charset="utf-8" '
             'onerror="this.onerror=null;'
             "var s=document.createElement('script');"
-            "s.src='https://cdn.plot.ly/plotly-2.35.2.min.js';"
+            f"s.src='{PLOTLY_CDN_FALLBACK}';"
             "s.charset='utf-8';document.head.appendChild(s);\"></script>"
         )
     else:
@@ -1380,8 +1399,7 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
             pljs = '<script>' + plotly_js_src + '</script>'
         except Exception as e:
             print(f'⚠️ plotly.js 內嵌失敗，改用 CDN：{e}')
-            pljs = ('<script src="https://cdnjs.cloudflare.com/ajax/libs/'
-                    'plotly.js/2.35.3/plotly.min.js"></script>')
+            pljs = f'<script src="{PLOTLY_CDN}"></script>'
 
     #: 一年抓 252 個交易日。裁太少會讓「2年」那顆按鈕按下去看到一片空白，
     #: 所以多留半年的緩衝。

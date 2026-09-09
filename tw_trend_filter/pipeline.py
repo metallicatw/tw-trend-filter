@@ -1674,11 +1674,11 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         '<div class="nb" id="btn-{i}" onclick="showChart({i})">'
         '<div class="nb-top">'
         '<span class="nb-code">{code}</span>'
-        '<span class="nb-close">{close:.2f}</span>'
+        '<span class="nb-close {pcls}">{close:.2f}</span>'
         '</div>'
         '<div class="nb-bot">'
         '<span class="nb-name">{name}</span>'
-        '<span class="nb-pct {pcls}">{sign}{pct:.2f}%</span>'
+        '<span class="nb-pct {pcls}">{sign}{chg:.2f} ({pct:.2f}%)</span>'
         '</div>'
         # 產業從右邊圖表區那排徽章搬到這裡。它是這一檔**是什麼**，和代號、
         # 名稱同一類；擺在右邊那排「20MA 幾塊、停損幾塊」中間，等於把一個
@@ -1688,8 +1688,9 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         '</div>'.format(
             i=i, code=s['code'], name=_esc(s['name']),
             ind=_esc(s.get('ind') or '—'),
-            close=s['close'], pct=abs(s['chg_pct']),
-            sign='▲' if s['chg_pct'] > 0 else ('▼' if s['chg_pct'] < 0 else ''),
+            close=s['close'], pct=abs(s['chg_pct']), chg=abs(s['chg']),
+            # 數字不帶正負號——方向由三角形表示，再加一個 +/- 是同一件事講兩次。
+            sign='▲ ' if s['chg_pct'] > 0 else ('▼ ' if s['chg_pct'] < 0 else ''),
             pcls='up' if s['chg_pct'] > 0 else ('dn' if s['chg_pct'] < 0 else 'fl'),
             ext=_sb_link(s),
             trig=_esc(s['trigger'])[:22] + ('…' if len(s['trigger']) > 22 else ''))
@@ -1744,11 +1745,15 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         '.nb-top{display:flex;justify-content:space-between;align-items:baseline}'
         '.nb-code{font-size:16px;font-weight:bold;color:#e6edf3}'
         '.nb-close{font-size:16px;font-weight:bold;color:#e6edf3}'
+        # 台股慣例：漲紅、跌綠。這裡原本是反過來的（美股慣例），對著台股報價
+        # 看會整個讀反——紅色在這個市場代表的是「今天賺了」。
+        '.nb-close.up{color:#f85149}'
+        '.nb-close.dn{color:#3fb950}'
         '.nb-bot{display:flex;justify-content:space-between;align-items:baseline;'
             'margin-top:2px;font-size:12px;color:#8b949e}'
         '.nb-pct{font-weight:bold}'
-        '.nb-pct.up{color:#3fb950}'
-        '.nb-pct.dn{color:#f85149}'
+        '.nb-pct.up{color:#f85149}'
+        '.nb-pct.dn{color:#3fb950}'
         '.nb-pct.fl{color:#8b949e}'
         '.nb-ind{font-size:11px;color:#79c0ff;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}'
         '.nb-tagrow{display:flex;align-items:center;gap:6px;margin-top:6px}'

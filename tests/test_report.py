@@ -358,3 +358,38 @@ def test_手機上圖例只留帶數值的那幾項(tmp_path):
     assert "20MA|60MA|建議停損" in fn, "留下的不是帶數值的那三個"
     # 上留白要大於量出來的圖例底端（60px）。
     assert "t: 68" in fn
+
+
+# ---------------------------------------------------------------------------
+# 缺值要畫成缺口，不是畫成零
+# ---------------------------------------------------------------------------
+
+def test_missing_bars_become_null_not_zero():
+    """`sf()` 把轉不出來的值變成 None，不是 0.0。
+
+    差別在畫面上很大：plotly 遇到 None 會斷線（那一根 K 棒不畫、均線留一個
+    缺口），遇到 0.0 會畫一根價格為零的 K 棒——也就是憑空發明一次跌到底的
+    崩盤，而且圖上看起來煞有其事。
+
+    這一版之前是回 0.0。而同一個函式產生的陣列，下游算 y 軸範圍的地方
+    (`win_hi` / `win_lo`) 本來就寫著 `if v is not None`——也就是那段程式一直
+    在等一個永遠不會出現的 None。
+    """
+    import json
+    import math as _math
+    import re
+
+    src = (Path(__file__).resolve().parents[1]
+           / "tw_trend_filter" / "pipeline.py").read_text(encoding="utf-8")
+    body = re.search(r"    def sf\(v, d=2\):.*?\n        return round\(f, d\)",
+                     src, re.S)
+    assert body, "找不到 sf()，它被改名或改寫了"
+    ns = {"_math": _math}
+    exec("def _w():\n" + body.group(0) + "\n    return sf\nsf = _w()", ns)  # noqa: S102
+    sf = ns["sf"]
+
+    assert sf(12.345) == 12.35
+    for bad in (float("nan"), float("inf"), float("-inf"), None, "", "abc"):
+        assert sf(bad) is None, f"{bad!r} 應該是 None，拿到 {sf(bad)!r}"
+    # 而且要序列化得出來（plotly 的 figure 是 JSON）
+    assert json.dumps([sf(1.0), sf(float("nan")), sf(2.0)]) == "[1.0, null, 2.0]"

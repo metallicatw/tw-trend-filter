@@ -1431,9 +1431,22 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
     VUP='#3fb950'; VDN='#f85149'; VMAC='#ffa657'
 
     def sf(v, d=2):
+        """數字轉成可以放進 JSON 的形式；轉不出來就回 None。
+
+        原本這裡回 0.0。差別在畫面上很大：plotly 遇到 None 會**斷線**（K 棒
+        那一根不畫、均線在那裡有個缺口），遇到 0.0 會**畫一根價格為零的 K 棒**
+        ——也就是憑空發明一次跌到底的崩盤，而且圖上看起來煞有其事。
+
+        缺一根 bar 是資料的事實，該長成一個缺口；把它畫成 0 是在說謊。
+        成交量那一組同理：沒有資料不等於「那天沒有人交易」。
+        """
         try:
-            f=float(v); return 0.0 if (_math.isnan(f) or _math.isinf(f)) else round(f,d)
-        except: return 0.0
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        if _math.isnan(f) or _math.isinf(f):
+            return None
+        return round(f, d)
 
     # ── 取 plotly.js 本體 ─────────────────────────────────────────
     # CDN 版把整份報告從 12 MB 壓到 1 MB 出頭。子資源完整性（SRI）雜湊寫死，

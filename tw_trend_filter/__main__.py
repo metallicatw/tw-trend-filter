@@ -98,14 +98,34 @@ def main(argv: list[str] | None = None) -> int:
         open_when_done=args.local,
     )
 
+    # 這一趟到底算不算數。
+    #
+    # 原本是無條件 `return 0`，於是 1,800 檔下載失敗跟 0 檔失敗都是綠燈，
+    # 而下一步是 `git push -f origin report`——一條只有一個 commit 的孤兒分支。
+    # 綠燈加 force push 等於「壞掉的那天會把好的那天蓋掉，而且沒有人會知道」。
+    #
+    # 門檻放在 90%：yfinance 偶爾漏個幾檔是常態，漏掉十分之一就不是了。
+    universe = result.get('universe') or result['scanned'] or 1
+    ok_ratio = result['scanned'] / universe
+    healthy  = ok_ratio >= 0.90 and result.get('errors', 0) <= universe * 0.10
+
     # 讓 workflow 的後續步驟拿得到「今天通過幾檔」，不必去 parse 上面那堆輸出。
     summary = os.environ.get('GITHUB_OUTPUT')
     if summary:
         with open(summary, 'a', encoding='utf-8') as fh:
             fh.write(f"count={result['count']}\n")
             fh.write(f"scanned={result['scanned']}\n")
+            fh.write(f"universe={universe}\n")
+            fh.write(f"errors={result.get('errors', 0)}\n")
+            fh.write(f"healthy={'yes' if healthy else 'no'}\n")
             fh.write(f"date={result['date']}\n")
             fh.write(f"xlsx={result['xlsx']}\n")
+
+    if not healthy:
+        print(f"::error::這一趟只跑完 {result['scanned']}/{universe} 檔"
+              f"（{ok_ratio:.0%}），例外 {result.get('errors', 0)} 檔。"
+              "報告仍然產出來了，但不應該拿它覆蓋昨天那份。")
+        return 2
     return 0
 
 

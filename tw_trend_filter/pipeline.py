@@ -170,7 +170,17 @@ COLORS = {
 # 2. 讀取全市場股票清單（ISIN 主來源 → OpenAPI 備援）
 # ===============================================================
 def load_tw_stock_universe():
+    """回傳 (tickers, code→name, code→產業別)。
+
+    **兩個市場都要拿到才算成功。** 原本只要 `all_rows` 非空就回傳，於是上櫃那
+    一次請求掛掉時，函式帶著半個市場回去，連下面的 OpenAPI 備援都碰不到——而
+    上層完全看不出差別：篩選照跑、報告照產、`git push -f` 照樣把昨天那份好的
+    覆蓋掉。孤兒分支只有一個 commit，覆蓋掉就沒了。
+
+    所以缺哪一個市場都要走備援；備援也缺，就 raise，讓上層決定要不要發布。
+    """
     all_rows    = []
+    got         = set()         # 這一輪真的拿到資料的市場（'.TW' / '.TWO'）
     isin_industry = {}          # code → 中文產業別（直接從 ISIN HTML 第 4 欄取得）
 
     # A. TWSE ISIN HTML（主來源）
@@ -190,7 +200,9 @@ def load_tw_stock_universe():
             mask = extracted['code'].notna()
             extracted = extracted[mask].copy()
             extracted['ticker'] = extracted['code'] + suffix
-            all_rows.append(extracted)
+            if len(extracted):
+                all_rows.append(extracted)
+                got.add(suffix)
 
             # 第 4 欄：產業別（中文，e.g. "電腦及週邊設備業"）
             if df.shape[1] > 4:
@@ -205,32 +217,51 @@ def load_tw_stock_universe():
         except Exception as e:
             print(f'⚠️ ISIN {suffix} 失敗：{e}')
 
-    if all_rows:
+    if got == {'.TW', '.TWO'}:
         all_df = pd.concat(all_rows, ignore_index=True).drop_duplicates('ticker')
         return all_df['ticker'].tolist(), all_df.set_index('code')['name'].to_dict(), isin_industry
 
     # B. TWSE OpenAPI（備援，無產業別）
-    print('🔄 改用 OpenAPI 備援...')
+    # 只補「ISIN 沒拿到的那個市場」。已經拿到的那一份帶著產業別，比備援好。
+    missing = {'.TW', '.TWO'} - got
+    print(f'🔄 ISIN 缺 {sorted(missing)}，改用 OpenAPI 備援...')
     rows = []
     for url, sfx in [
         ('https://openapi.twse.com.tw/v1/opendata/t187ap03_L', '.TW'),
         ('https://openapi.twse.com.tw/v1/opendata/t187ap03_O', '.TWO'),
     ]:
+        if sfx not in missing:
+            continue
         try:
             resp = requests.get(url, timeout=20)
             resp.raise_for_status()
+            n = 0
             for r in resp.json():
                 code = str(r.get('公司代號','')).strip()
                 name = str(r.get('公司簡稱','')).strip()
                 ind  = str(r.get('產業別', '')).strip()
                 if code.isdigit() and len(code) == 4:
                     rows.append({'code': code, 'name': name, 'ticker': code + sfx})
+                    n += 1
                     if ind and ind not in ('nan', 'NaN', 'None', ''):
                         isin_industry[code] = ind
+            if n:
+                got.add(sfx)
+            print(f'✅ OpenAPI {sfx}：{n} 檔')
         except Exception as e:
             print(f'⚠️ OpenAPI {sfx} 失敗：{e}')
-    all_df = pd.DataFrame(rows).drop_duplicates('ticker')
-    print(f'✅ OpenAPI：{len(all_df)} 檔')
+
+    if rows:
+        all_rows.append(pd.DataFrame(rows))
+    if got != {'.TW', '.TWO'}:
+        # 這裡 raise 而不是回半個市場：呼叫端沒有辦法從一個 list 看出它少了
+        # 一整個交易所，而發布流程會 force push 覆蓋昨天那份。
+        raise RuntimeError(
+            f'股票母體不完整：{sorted({".TW", ".TWO"} - got)} 兩個來源都沒拿到。'
+            '寧可這一趟不發布，也不要用半個市場覆蓋掉昨天的報告。'
+        )
+    all_df = pd.concat(all_rows, ignore_index=True).drop_duplicates('ticker')
+    print(f'✅ 母體合計：{len(all_df)} 檔（上市＋上櫃都到齊）')
     return all_df['ticker'].tolist(), all_df.set_index('code')['name'].to_dict(), isin_industry
 
 
@@ -643,6 +674,13 @@ def run(
     # ===============================================================
     # 3. 技術指標計算 → 移到模組層（見 compute_atr / compute_bollinger）
     # ===============================================================
+    # 篩選過程中吃掉的例外，按型別計數（見 screen_stock 末尾）。
+    import collections as _collections
+    import threading as _threading
+    SCREEN_ERRORS = _collections.Counter()
+    SCREEN_ERROR_SAMPLES: list[str] = []
+    _err_lock = _threading.Lock()
+
     def screen_stock(ticker):
         try:
             try:
@@ -729,7 +767,16 @@ def run(
                 '_boll_mid':     boll_ma.copy(),
                 '_boll_dn':      boll_dn.copy(),
             }
-        except Exception:
+        except Exception as e:
+            # 原本這裡是 `except Exception: return None`，沒有任何記錄。於是
+            # 「這檔沒過篩」跟「pandas 改了欄位名、yfinance 改了回傳格式、比值
+            # 除以零」長得一模一樣——畫面上只會看到「通過 0 檔」，沒有線索。
+            # 記下例外的型別，跑完一次印成一張表；同一種例外大量出現＝系統性
+            # 失敗，不是市場今天沒有標的。
+            with _err_lock:
+                SCREEN_ERRORS[type(e).__name__] += 1
+                if len(SCREEN_ERROR_SAMPLES) < 5:
+                    SCREEN_ERROR_SAMPLES.append(f'{ticker}: {type(e).__name__}: {e}')
             return None
 
     # ===============================================================
@@ -893,9 +940,21 @@ def run(
     with ThreadPoolExecutor(max_workers=workers) as executor:
         list(executor.map(_screen_and_collect, enumerate(TICKERS)))
 
-    RESULTS.sort(key=lambda x: x['vol_ratio'], reverse=True)
+    # 排序要有 tiebreaker。RESULTS 是 ThreadPool 的**完成順序**append 的，
+    # 所以量比相同的兩檔在兩次跑之間會換位置——同樣的資料產出不一樣的 HTML
+    # 與 Excel。加上代號當第二鍵，輸出就可重現。
+    RESULTS.sort(key=lambda x: (-x['vol_ratio'], x['code']))
+
+    errors = sum(SCREEN_ERRORS.values())
     print('='*60)
-    print(f'🎯 篩選完成！今日共 {len(RESULTS)} 檔標的通過')
+    print(f'🎯 篩選完成！今日共 {len(RESULTS)} 檔標的通過'
+          f'（實際掃描 {_scanned[0]}/{len(TICKERS)} 檔）')
+    if errors:
+        print(f'⚠️ 有 {errors} 檔在篩選過程中丟出例外（不等於沒過篩）：')
+        for name, n in SCREEN_ERRORS.most_common():
+            print(f'     {name:<28} {n:>5} 檔')
+        for s in SCREEN_ERROR_SAMPLES:
+            print(f'     例：{s}')
     print('='*60)
 
     # ===============================================================
@@ -1322,7 +1381,13 @@ def run(
     return {
         'results': RESULTS,
         'count': len(RESULTS),
-        'scanned': len(TICKERS),
+        # `scanned` 原本回 len(TICKERS)——那是母體大小，不是真的掃到幾檔。
+        # 1,800 檔下載失敗跟 0 檔失敗會印出一模一樣的摘要。現在分成三個數字：
+        # universe（母體）、scanned（真的跑完的）、errors（丟例外的）。
+        'universe': len(TICKERS),
+        'scanned': _scanned[0],
+        'errors': errors,
+        'error_kinds': dict(SCREEN_ERRORS),
         'date': today_str,
         'xlsx': OUTPUT_FILE,
         'html': html_path or '',

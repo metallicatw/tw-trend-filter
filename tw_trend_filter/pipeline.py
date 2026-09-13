@@ -1136,14 +1136,21 @@ def run(
         c.alignment = ALN_LC
         ws1.row_dimensions[11].height = 22
 
-        rules = [
+        # 名字不能叫 `rules`——那是這個函式的參數（:class:`Rules`）。
+        #
+        # 它以前叫 rules，而那時候沒有同名的參數，所以沒事。加上參數之後這一行
+        # 就把參數蓋掉了：從這裡到函式結尾，`rules` 都是一個 list of tuple，
+        # 於是最後 `'rules_changed': rules.changed()` 炸成
+        # 「AttributeError: 'list' object has no attribute 'changed'」——而且是在
+        # 整趟跑完、Excel 都存好之後才炸，log 上看起來一切正常。
+        exit_rules = [
             ('進場時機', '訊號觸發後次一交易日，開盤直接以市價單敲進（切勿掛低價等待）。'),
             ('初始停損', f'停損 = 最新收盤價 − {rules.atr_stop:g} × ATR(14)，'
                           '進場後立即設定並固定不放寬。'),
             ('動態移停', '每日收盤後，可將停損單往上調整至當日最新 20MA 附近。'),
             ('終極出場', '當收盤價正式跌破當日 20MA 時，考慮全數出場鎖定波段獲利。'),
         ]
-        for i, (lbl, desc) in enumerate(rules, start=12):
+        for i, (lbl, desc) in enumerate(exit_rules, start=12):
             ws1.row_dimensions[i].height = 22
             c_l = ws1.cell(i, 2, lbl)
             c_l.font      = mkfont('Calibri', 10, True, '6E2F00')

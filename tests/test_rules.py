@@ -374,3 +374,92 @@ def test_真的壞掉還是要壞掉():
             main(['--output-dir', '/tmp/never', '--no-excel'])
     finally:
         pl.load_tw_stock_universe = orig
+
+
+# ── Excel 那條路 ────────────────────────────────────────────────────────
+#
+# 上面每一條 `_run_with` 都傳 `make_excel=False`——為了快。代價是**整個 Excel
+# 路徑一次都沒被跑過**，而 `describe()` 存在的唯一理由就是它要印進 Excel 的第一
+# 分頁。十四條測試守著一個從來沒有被執行的承諾。
+#
+# 漏掉的東西當場就咬人了：`run()` 裡面有一個區域變數也叫 `rules`（進出場策略
+# 那張表），它把參數蓋掉，於是函式結尾的 `rules.changed()` 炸成「'list' object
+# has no attribute 'changed'」。**整趟跑完、Excel 都存好之後才炸**，log 上一路
+# 綠到最後一行，只有結束碼是 1。CI 紅了兩次才找到。
+
+def _xlsx_strategy_rows(path):
+    """Excel 第一分頁上那四行「四部曲篩選機制說明」：``[(標籤, 說明), ...]``。"""
+    from openpyxl import load_workbook
+
+    ws = load_workbook(path).worksheets[0]
+    return [(ws.cell(i, 2).value, ws.cell(i, 3).value) for i in range(6, 10)]
+
+
+def _run_making_excel(rules, tmp_path):
+    """跑一次**有產 Excel** 的完整流程，回傳 ``(result, xlsx 路徑)``。
+
+    資料故意用一檔怎麼樣都過不了篩的（股價 5 元，卡在 ① 流動性）：這樣不會去畫
+    個股 K 線圖，Excel 幾秒就好，而第一分頁那四行說明照樣會寫出來——它跟通過
+    幾檔無關。
+    """
+    import pandas as pd
+
+    import tw_trend_filter.pipeline as pl
+
+    idx = pd.bdate_range('2025-01-01', periods=150)
+    df = pd.DataFrame(
+        {'Open': [5.0] * 150, 'High': [5.05] * 150, 'Low': [4.95] * 150,
+         'Close': [5.0] * 150, 'Volume': [600_000] * 150},
+        index=idx,
+    )
+    orig_u, orig_d = pl.load_tw_stock_universe, pl.yf.download
+    try:
+        pl.load_tw_stock_universe = lambda *a, **k: (
+            ['1111.TW'], {'1111': '測試股'}, {'1111': '測試業'}
+        )
+        pl.yf.download = lambda *a, **k: df.copy()
+        out = pl.run(str(tmp_path), workers=1, rules=rules)
+    finally:
+        pl.load_tw_stock_universe, pl.yf.download = orig_u, orig_d
+    return out, out['xlsx']
+
+
+def test_跑完整趟_含_Excel_不會在最後一刻炸掉(tmp_path):
+    """`run()` 要回得了那個 dict。
+
+    這條看起來什麼都沒驗，但它是這一整段存在的理由：區域變數蓋掉參數的那個 bug
+    ，log 上一路正常到最後一行，只有結束碼是 1。而所有用 `make_excel=False` 的
+    測試都碰不到它——Excel 那一段裡才有那個同名的區域變數。
+    """
+    out, xlsx = _run_making_excel(DEFAULT_RULES, tmp_path)
+    assert xlsx and out['count'] == 0
+    assert out['rules'] is DEFAULT_RULES, 'rules 被路上某個同名變數蓋掉了'
+    assert out['rules_changed'] == {}
+
+
+def test_Excel_第一分頁印的是這一趟真的用的門檻(tmp_path):
+    """`describe()` 存在的唯一理由，就是這四行要跟著門檻走。
+
+    前面那條 `test_改了門檻說明就跟著改` 驗的是 `describe()` 自己；這一條驗的是
+    它**真的被寫進檔案裡**。中間那一段（誰呼叫它、寫到哪一格）以前沒有任何東西
+    在守。
+    """
+    _, xlsx = _run_making_excel(DEFAULT_RULES, tmp_path / 'a')
+    assert _xlsx_strategy_rows(xlsx) == list(DEFAULT_RULES.describe())
+
+    custom = Rules(vol_ratio=1.1, squeeze=0.15, atr_stop=2.0)
+    _, xlsx2 = _run_making_excel(custom, tmp_path / 'b')
+    rows = dict(_xlsx_strategy_rows(xlsx2))
+    assert '× 1.1' in rows['④ 強勢突破＋爆量']
+    assert '≤ 15%' in rows['③ 關鍵發動時機']
+
+
+def test_停損倍數也真的寫進_Excel_的進出場策略(tmp_path):
+    """那一行和算出來的停損價是同一個倍數，不是兩份寫死的文字。"""
+    from openpyxl import load_workbook
+
+    _, xlsx = _run_making_excel(Rules(atr_stop=2.0), tmp_path)
+    ws = load_workbook(xlsx).worksheets[0]
+    entry = {ws.cell(i, 2).value: ws.cell(i, 3).value for i in range(12, 16)}
+    assert '2 × ATR(14)' in entry['初始停損'], entry['初始停損']
+    assert '3 × ATR' not in entry['初始停損']

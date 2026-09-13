@@ -21,7 +21,7 @@ from __future__ import annotations
 import warnings
 warnings.filterwarnings('ignore')
 
-import os, sys, datetime, platform, tempfile, subprocess as _sp
+import os, sys, json, datetime, platform, tempfile, subprocess as _sp
 from dataclasses import dataclass, fields
 from html import escape
 from io import StringIO
@@ -156,6 +156,83 @@ class Rules:
 
 
 DEFAULT_RULES = Rules()
+
+#: 快照裡每一檔存最近幾天的布林頻寬。
+#:
+#: 這個數字同時是〔回看天數〕在網頁上的上限——③ 問的是「過去 N 天裡有沒有壓縮」，
+#: 而網頁只拿得到存下來的這幾天。存更多天就能調更大，代價是每檔每天多約 7 個
+#: 位元組（1,900 檔約 13 KB）。20 是預設值的兩倍，夠試。
+SNAPSHOT_DAYS = 20
+
+#: 快照一列的欄位順序。網頁那邊照**位置**讀，所以順序就是介面的一部分：
+#: 動了它而沒有同步改 JS，畫面上會出現「用成交金額去比股價」這種錯，而且不會
+#: 有任何錯誤訊息。`test_快照的欄位順序是介面的一部分` 釘住它。
+SNAPSHOT_COLUMNS: tuple[str, ...] = (
+    'code', 'name', 'industry',
+    'close', 'vol20', 'amt20',        # ① 流動性
+    'ma20', 'ma60',                   # ② 趨勢
+    'cross_ago', 'bw',                # ③ 發動：幾天前交叉、最近 N 天的頻寬
+    'boll_up', 'donchian', 'vol_ratio',   # ④ 突破＋爆量
+    'atr14',                          # 停損
+)
+
+
+def snapshot_row(snap: dict) -> list:
+    """把一檔的快照壓成一列，順序照 `SNAPSHOT_COLUMNS`。"""
+    return [snap[k] for k in SNAPSHOT_COLUMNS]
+
+
+def passes(snap: dict, rules: Rules) -> tuple[bool, list[str]]:
+    """這一檔在這一組門檻下過不過，以及觸發了哪幾個訊號。
+
+    ## 為什麼這個函式要存在
+
+    四部曲的每一個可調門檻，最後都只是拿一個數字去比大小——所以「換一組門檻會
+    篩出哪幾檔」不需要重算任何指標，只需要這一份快照。這個函式就是那份判定，
+    而網頁上那一份 JS 是它的逐行翻譯：同一組輸入必須得到同一個答案。
+
+    `tests/test_snapshot.py` 拿真的資料兩邊對過。兩份實作是刻意的重複——瀏覽器
+    裡跑不了 Python，而唯一的替代方案是把判定搬去伺服器，那就回到「按一下等
+    三十分鐘」。重複的代價由測試扛著。
+    """
+    if snap['close'] <= rules.min_price:
+        return False, []
+    if snap['vol20'] <= rules.min_vol20 or snap['amt20'] <= rules.min_amount:
+        return False, []
+    if snap['close'] <= snap['ma60'] or snap['ma20'] <= snap['ma60']:
+        return False, []
+
+    # ③ 「過去 N 天內」——回看天數不能超過快照存了幾天。
+    #
+    # 下界那個 max(…, 0) 不是防呆：`bw[-look:]` 在 look 為負的時候**不會出錯**，
+    # 它會安靜地換一個意思——`bw[-(-5):]` 是 `bw[5:]`，看的是最舊的那幾天。
+    # 網頁上那個輸入框攔不住有人打負數，所以兩邊都先夾住。
+    look = min(max(int(rules.lookback), 0), SNAPSHOT_DAYS)
+    ago = snap['cross_ago']
+    golden = 0 < ago <= look
+    window = snap['bw'][-look:] if look else []
+    squeeze = any(v <= rules.squeeze for v in window)
+    if not (golden or squeeze):
+        return False, []
+
+    up, don = snap['boll_up'], snap['donchian']
+    brk_boll = snap['close'] > up
+    brk_don = don is not None and snap['close'] > don
+    if not (brk_boll or brk_don):
+        return False, []
+    if snap['vol_ratio'] < rules.vol_ratio:
+        return False, []
+
+    triggers = []
+    if golden:
+        triggers.append('黃金交叉')
+    if squeeze:
+        triggers.append('布林壓縮')
+    if brk_boll:
+        triggers.append('突破布林上軌')
+    if brk_don:
+        triggers.append('突破20日高點')
+    return True, triggers
 
 
 # ===============================================================
@@ -773,6 +850,9 @@ def run(
     SCREEN_ERRORS = _collections.Counter()
     SCREEN_ERROR_SAMPLES: list[str] = []
     _err_lock = _threading.Lock()
+    # 每一檔的指標快照（**包含今天沒過篩的**）。網頁上的即時重篩讀這一份。
+    SNAPSHOTS: list[dict] = []
+    _snap_lock = _threading.Lock()
 
     def screen_stock(ticker):
         try:
@@ -796,46 +876,64 @@ def run(
             df.index = pd.to_datetime(df.index).tz_localize(None)
             close, volume = df['Close'], df['Volume']
 
+            # 指標**全部算完**，才拿門檻去判。
+            #
+            # 以前是邊算邊擋：① 過不了就 return，不必算布林。那省下來的是幾個
+            # pandas rolling，而真正貴的（yfinance 下載）早就付掉了。
+            #
+            # 改成全部算完，是因為網頁上要能即時換一組門檻重篩——而那需要**每一
+            # 檔**的指標值，包括今天沒過的那些。沒有它們，放寬門檻就找不回任何
+            # 東西，只能重跑一次三十分鐘的排程。
+            code = ticker.split('.')[0]
             price = float(close.iloc[-1])
             vol20 = float(volume.rolling(20).mean().iloc[-1])
             amt20 = float((close*volume).rolling(20).mean().iloc[-1])
-            if (price <= rules.min_price or vol20 <= rules.min_vol20
-                    or amt20 <= rules.min_amount):
-                return None
-
             ma20 = close.rolling(20).mean()
             ma60 = close.rolling(60).mean()
-            if price <= float(ma60.iloc[-1]) or float(ma20.iloc[-1]) <= float(ma60.iloc[-1]):
+            boll_ma, boll_up, boll_dn, bw = compute_bollinger(close)
+            donchian = close.rolling(20).max().shift(1)
+            atr_val = float(compute_atr(df).iloc[-1])
+            vol_ratio = float(volume.iloc[-1]) / vol20 if vol20 else 0.0
+
+            # 最近一次黃金交叉是幾天前（1 = 昨天收盤那一根），找不到就 -1。
+            # 存「幾天前」而不是「有沒有」，是因為回看天數是可調的：存布林值就
+            # 回答得了任何一個回看天數，存一個布林值只回答得了當初那一個。
+            cross_ago = -1
+            for i in range(1, min(SNAPSHOT_DAYS, len(ma20) - 1) + 1):
+                if (float(ma20.iloc[-i]) > float(ma60.iloc[-i])
+                        and float(ma20.iloc[-i - 1]) <= float(ma60.iloc[-i - 1])):
+                    cross_ago = i
+                    break
+
+            don_last = (None if pd.isna(donchian.iloc[-1])
+                        else round(float(donchian.iloc[-1]), 2))
+            snap = {
+                'code': code, 'name': NAME_MAP.get(code, code),
+                'industry': lookup_industry(code, ISIN_INDUSTRY),
+                'close': round(price, 2),
+                'vol20': round(vol20),
+                'amt20': round(amt20),
+                'ma20': round(float(ma20.iloc[-1]), 2),
+                'ma60': round(float(ma60.iloc[-1]), 2),
+                'cross_ago': cross_ago,
+                'bw': [round(float(v), 4) if not pd.isna(v) else 9.0
+                       for v in bw.iloc[-SNAPSHOT_DAYS:]],
+                'boll_up': round(float(boll_up.iloc[-1]), 2),
+                'donchian': don_last,
+                'vol_ratio': round(vol_ratio, 2),
+                'atr14': round(atr_val, 2),
+            }
+            with _snap_lock:
+                SNAPSHOTS.append(snap)
+
+            ok, trigger_parts = passes(snap, rules)
+            if not ok:
                 return None
 
-            boll_ma, boll_up, boll_dn, bw = compute_bollinger(close)
-            lookback = min(rules.lookback, len(ma20)-1)
-            golden_cross = any(
-                float(ma20.iloc[-i]) > float(ma60.iloc[-i]) and
-                float(ma20.iloc[-i-1]) <= float(ma60.iloc[-i-1])
-                for i in range(1, lookback+1)
-            )
-            squeeze = bool((bw.iloc[-lookback:] <= rules.squeeze).any())
-            if not (golden_cross or squeeze): return None
-
-            donchian     = close.rolling(20).max().shift(1)
-            brk_boll     = price > float(boll_up.iloc[-1])
-            brk_donchian = (not pd.isna(donchian.iloc[-1])) and (price > float(donchian.iloc[-1]))
-            if not (brk_boll or brk_donchian): return None
-
-            vol_ratio = float(volume.iloc[-1]) / vol20
-            if vol_ratio < rules.vol_ratio: return None
-
-            atr_val   = float(compute_atr(df).iloc[-1])
+            golden_cross = '黃金交叉' in trigger_parts
+            squeeze = '布林壓縮' in trigger_parts
             stop_loss = round(price - rules.atr_stop * atr_val, 2)
 
-            trigger_parts = []
-            if golden_cross:   trigger_parts.append('黃金交叉')
-            if squeeze:        trigger_parts.append('布林壓縮')
-            if brk_boll:       trigger_parts.append('突破布林上軌')
-            if brk_donchian:   trigger_parts.append('突破20日高點')
-
-            code = ticker.split('.')[0]
             return {
                 'ticker': ticker, 'code': code, 'name': NAME_MAP.get(code, code),
                 'industry': lookup_industry(code, ISIN_INDUSTRY),
@@ -1453,6 +1551,7 @@ def run(
         RESULTS, today_str, output_dir, now,
         link_base=link_base, plotly_cdn=plotly_cdn,
         chart_years=chart_years, excel_url=excel_url, rules=rules,
+        snapshots=sorted(SNAPSHOTS, key=lambda x: x['code']),
     )
 
     # 排程要的是一個固定的檔名（`index.html`），因為下游——tw-six-metrics 的建站
@@ -1508,6 +1607,9 @@ def run(
         # 和「今天有人把量比調到 3 倍」在畫面上長得一樣。
         'rules': rules,
         'rules_changed': rules.changed(),
+        # 每一檔的指標快照，**包含今天沒過篩的**。網頁上的即時重篩靠它。
+        # 依代號排序：同樣的資料要產出同樣的檔案，不然每天的 diff 都是亂的。
+        'snapshots': sorted(SNAPSHOTS, key=lambda x: x['code']),
     }
 
 
@@ -1517,15 +1619,51 @@ def run(
 # ===============================================================
 # 互動式個股技術線圖 v4 ─ script[type=application/json] 懶載入
 # ===============================================================
-def _rules_block(rules):
-    """頁首那一塊〔篩選條件〕：四部曲 ＋ 停損，收在一個 `<details>` 裡。
+#: 網頁上可以調的門檻：欄位名、標籤、單位、步進、上限。
+#:
+#: 上限不是裝飾：`lookback` 超過 `SNAPSHOT_DAYS` 的話，快照裡根本沒有那幾天的
+#: 頻寬可以看——輸入框擋住，比讓它靜靜地算出一個偏少的答案好。
+LIVE_FIELDS: tuple[tuple[str, str, str, str, str], ...] = (
+    ('min_price',  '股價下限',   '元',    '1',    ''),
+    ('min_vol20',  '20日均量',   '張',    '100',  ''),
+    ('min_amount', '20日均額',   '百萬',  '10',   ''),
+    ('lookback',   '回看天數',   '日',    '1',    str(SNAPSHOT_DAYS)),  # 下界 0，見 passes()
+    ('squeeze',    '壓縮門檻',   '',      '0.01', ''),
+    ('vol_ratio',  '量比下限',   '倍',    '0.1',  ''),
+    ('atr_stop',   '停損倍數',   '×ATR',  '0.5',  ''),
+)
 
-    內容全部從 `Rules.describe()` 來，和 Excel 第一分頁是同一份字串。兩邊各寫
-    一份的話，改了門檻就會出現「網頁說 1.2、Excel 說 1.1」——而那種不一致沒有
-    任何症狀，只會讓兩份文件互相打臉。
 
-    `rules` 給 None（舊的呼叫端）就整塊不出現，不要自己補一組預設值上去：
-    印一組**可能不是這一趟用的**門檻，比不印更糟。
+def _rules_block(rules, snapshots=None, drawn=None, link_base=''):
+    """頁首那一塊〔篩選條件〕——而且門檻是**可以當場改的**。
+
+    `drawn` 是「這一頁上哪幾檔真的有圖」：``{代號: 側欄第幾張}``。它決定清單上
+    的名字是跳到圖（有圖）還是連去〔六大財務指標評等〕個股頁（沒圖）——所以它
+    必須來自 `stock_infos` 的實際順序，不是 `results` 的順序：資料不足的那幾檔
+    會在畫圖的迴圈裡被跳過，兩份的索引從那一檔起就錯開了。
+
+    ## 為什麼這裡做得到即時，而不是按一下等三十分鐘
+
+    四部曲的每一個可調門檻，最後都只是拿一個數字去比大小。所以「換一組門檻會
+    篩出哪幾檔」不需要重算任何指標——只需要每一檔在最後一根 K 棒上的那十幾個
+    數字。那一份快照（含今天沒過篩的每一檔）就嵌在這一頁裡，1,900 檔壓縮後約
+    150 KB，而這份報告本來就有一兩 MB。
+
+    所以按下去是零等待，也**不需要任何憑證**——沒有東西要去伺服器上跑。
+
+    ## 兩個誠實的限制，寫在畫面上
+
+    * K 線圖只有排程當天篩出來的那幾檔有。放寬門檻多出來的股票，清單上有、圖
+      沒有——那幾檔連到〔六大財務指標評等〕的個股頁。要每一檔都有圖，等於把
+      1,900 檔兩年的 K 棒全嵌進來，那是好幾百 MB。
+    * 「即時」是篩選零等待，不是盤中即時報價。資料還是每個交易日一份。
+
+    ## 判定寫了兩次
+
+    Python 那一份是 `passes()`，JS 這一份是它的逐行翻譯。瀏覽器裡跑不了 Python，
+    而唯一的替代方案是把判定搬去伺服器——那就回到「按一下等三十分鐘」。重複的
+    代價由 `tests/test_snapshot.py` 扛著：同一份快照、同一組門檻，兩邊的答案必須
+    逐檔相同。
     """
     if rules is None:
         return ''
@@ -1533,19 +1671,193 @@ def _rules_block(rules):
         f'<li><b>{escape(label)}</b><span>{escape(text)}</span></li>'
         for label, text in rules.describe()
     )
-    return (
+    block = (
         '<details id="rules"><summary>篩選條件</summary>'
         f'<ol>{items}</ol>'
         '<p class="stop">停損：進場後設在 <b>'
         f'收盤 − {rules.atr_stop:g} × ATR(14)</b>，'
         '固定不放寬；收盤跌破 20MA 考慮出場。</p>'
-        '</details>'
     )
+    if not snapshots:
+        return block + '</details>'
+
+    fields = ''.join(
+        f'<label><span>{escape(label)}</span>'
+        f'<input id="f_{key}" type="number" min="0" step="{step}"'
+        + (f' max="{cap}"' if cap else '')
+        + f' value="{_live_default(rules, key):g}">'
+        f'<em>{escape(unit)}</em></label>'
+        for key, label, unit, step, cap in LIVE_FIELDS
+    )
+    rows = json.dumps([snapshot_row(x) for x in snapshots],
+                      ensure_ascii=False, separators=(',', ':'))
+    # 先算好再進 f-string：f-string 的替換欄位裡寫 `{{}}` 不是「一個空 dict」，
+    # 是「一個裝著空 dict 的 set」——而那會在執行的時候才炸。
+    drawn_js = json.dumps(dict(drawn or {}), ensure_ascii=False, sort_keys=True)
+    link_js = json.dumps((link_base or '').rstrip('/'))
+    return block + f"""
+      <div id="live">
+        <div class="live-head">
+          <b>自己調門檻</b>
+          <span class="live-note">就在這一頁重算，不用等——資料是 {escape(_snap_note(snapshots))}。</span>
+        </div>
+        <div class="live-fields">{fields}</div>
+        <div class="live-bar">
+          <button type="button" onclick="tfReset()">回到預設</button>
+          <span id="live-count"></span>
+        </div>
+        <p class="live-limit">
+          「不用等」指的是<b>篩選</b>不用等，不是盤中即時報價——快照每個交易日一份。
+          標著〔無圖〕的是今天沒過預設篩選、這一頁上沒有畫它的 K 線圖的股票；
+          要它們的圖和 Excel，得用新門檻重跑一次。
+        </p>
+        <div class="live-wrap"><table id="live-table"><thead><tr>
+          <th>代號</th><th>名稱</th><th>產業</th><th class="n">收盤</th>
+          <th class="n">量比</th><th class="n">停損</th><th>觸發</th>
+        </tr></thead><tbody></tbody></table></div>
+      </div>
+      </details>
+      <script type="application/json" id="tf-snap">{rows}</script>
+      <script>
+      // 這一段是 `pipeline.passes()` 的逐行翻譯。改了一邊要改另一邊，
+      // 而 tests/test_snapshot.py 會在兩邊不一致的時候紅。
+      const TF_DAYS = {SNAPSHOT_DAYS};
+      const TF_KEYS = {json.dumps(list(LIVE_FIELDS and [f[0] for f in LIVE_FIELDS]))};
+      const TF_DEFAULT = {json.dumps({f[0]: _live_default(rules, f[0]) for f in LIVE_FIELDS})};
+      // 有圖的那幾檔：代號 → 側欄第幾張。放寬門檻多出來的股票不在裡面。
+      const TF_DRAWN = {drawn_js};
+      const TF_LINK = {link_js};
+      let TF_ROWS = [];
+
+      function tfRules() {{
+        const r = {{}};
+        for (const k of TF_KEYS) {{
+          const el = document.getElementById('f_' + k);
+          const v = parseFloat(el && el.value);
+          r[k] = isFinite(v) ? v : TF_DEFAULT[k];
+        }}
+        r.min_amount *= 1e6;          // 畫面上是百萬，判定用元
+        return r;
+      }}
+
+      // 回傳 null 代表沒過；過了就回觸發訊號。和 passes() 同一個順序、
+      // 同一組比較符號——`<=` 和 `<` 在邊界上是不同的答案。
+      function tfPass(row, r) {{
+        const [ , , , close, vol20, amt20, ma20, ma60,
+                crossAgo, bw, up, don, volRatio ] = row;
+        if (close <= r.min_price) return null;
+        if (vol20 <= r.min_vol20 || amt20 <= r.min_amount) return null;
+        if (close <= ma60 || ma20 <= ma60) return null;
+        // 夾住上下界、再取整——和 passes() 那一行的 min(max(int(…),0),DAYS) 同義。
+        const look = Math.min(Math.max(Math.floor(r.lookback), 0), TF_DAYS);
+        const golden = crossAgo > 0 && crossAgo <= look;
+        let squeeze = false;
+        for (const v of bw.slice(bw.length - look)) {{ if (v <= r.squeeze) {{ squeeze = true; break; }} }}
+        if (!golden && !squeeze) return null;
+        const brkBoll = close > up;
+        const brkDon  = don !== null && close > don;
+        if (!brkBoll && !brkDon) return null;
+        if (volRatio < r.vol_ratio) return null;
+        const t = [];
+        if (golden) t.push('黃金交叉');
+        if (squeeze) t.push('布林壓縮');
+        if (brkBoll) t.push('突破布林上軌');
+        if (brkDon) t.push('突破20日高點');
+        return t;
+      }}
+
+      function tfApply() {{
+        const r = tfRules();
+        const hits = [];
+        for (const row of TF_ROWS) {{
+          const t = tfPass(row, r);
+          if (t) hits.push([row, t]);
+        }}
+        hits.sort((a, b) => b[0][12] - a[0][12] || (a[0][0] < b[0][0] ? -1 : 1));
+        const n = document.getElementById('live-count');
+        n.textContent = hits.length + ' 檔符合';
+        n.className = hits.length ? 'hit' : 'miss';
+        const body = document.getElementById('live-table').querySelector('tbody');
+        // 只畫前 200 列：再多就不是拿來讀的了，而 DOM 會開始卡。
+        body.innerHTML = hits.slice(0, 200).map(([row, t]) => {{
+          const stop = (row[3] - r.atr_stop * row[13]).toFixed(2);
+          // 三種情況，刻意長得不一樣：有圖（跳過去）、沒圖但有個股頁（開新分頁，
+          // 標成「無圖」）、兩者皆無（純文字）。把沒圖的也畫成一個會跳的連結，
+          // 是讓人點一下之後什麼都沒發生。
+          let name;
+          if (Object.prototype.hasOwnProperty.call(TF_DRAWN, row[0])) {{
+            name = '<a href="#" onclick="return tfJump(\\'' + row[0] + '\\')">' + row[1] + '</a>';
+          }} else if (TF_LINK) {{
+            name = '<a class="ext" target="_blank" rel="noopener" href="' + TF_LINK +
+                   '/' + row[0] + '.html" title="今天沒過篩，這一頁上沒有它的圖">' +
+                   row[1] + '<span class="nochart">無圖</span></a>';
+          }} else {{
+            name = row[1] + '<span class="nochart">無圖</span>';
+          }}
+          return '<tr><td class="c">' + row[0] + '</td><td>' + name +
+                 '</td><td class="i">' + row[2] + '</td><td class="n">' + row[3].toFixed(2) +
+                 '</td><td class="n">' + row[12].toFixed(2) + '</td><td class="n">' + stop +
+                 '</td><td class="t">' + t.join('｜') + '</td></tr>';
+        }}).join('') + (hits.length > 200
+          ? '<tr><td colspan="7" class="more">還有 ' + (hits.length - 200) +
+            ' 檔沒列出來——把門檻收緊一點。</td></tr>' : '');
+      }}
+
+      function tfReset() {{
+        for (const k of TF_KEYS) {{
+          const el = document.getElementById('f_' + k);
+          if (el) el.value = TF_DEFAULT[k];
+        }}
+        tfApply();
+      }}
+
+      // 點名字跳到它的圖：側欄那張卡片的 id 是 btn-<第幾張>，而 TF_DRAWN 存的
+      // 就是那個序號。直接呼叫 showChart() 也行，但按卡片會順便把它標成 .act，
+      // 那是讀者回到側欄時找得到自己在哪的唯一線索。
+      function tfJump(code) {{
+        const i = TF_DRAWN[code];
+        if (i === undefined) return false;
+        const btn = document.getElementById('btn-' + i);
+        if (!btn) return false;
+        btn.click();
+        btn.scrollIntoView({{block: 'nearest'}});
+        return false;
+      }}
+
+      // 這一塊展開／收合會把頁首撐高或縮回，而 #main 的高度是用頁首實際高度
+      // 算出來的（--hd-h）。不同步的話，展開之後圖表區會被擠到視窗外面。
+      function tfSync() {{
+        if (typeof syncHdHeight === 'function') syncHdHeight();
+        if (typeof fitPlotSize === 'function') fitPlotSize(document.querySelector('.cw.act .plot'));
+      }}
+
+      document.addEventListener('DOMContentLoaded', function () {{
+        try {{ TF_ROWS = JSON.parse(document.getElementById('tf-snap').textContent); }}
+        catch (e) {{ TF_ROWS = []; }}
+        for (const k of TF_KEYS) {{
+          const el = document.getElementById('f_' + k);
+          if (el) el.addEventListener('input', tfApply);
+        }}
+        const det = document.getElementById('rules');
+        if (det) det.addEventListener('toggle', tfSync);
+        tfApply();
+      }});
+      </script>"""
+
+
+def _live_default(rules, key):
+    """畫面上那一格的預設值。成交金額換成百萬——讓人打 50000000 是在請他數零。"""
+    v = getattr(rules, key)
+    return v / 1e6 if key == 'min_amount' else v
+
+
+def _snap_note(snapshots):
+    return f'{len(snapshots):,} 檔的當日指標'
 
 
 def build_interactive_html(results, today_str, output_dir, now=None, *,
                            link_base='', plotly_cdn=True, chart_years=2.0,
-                           excel_url='', rules=None):
+                           excel_url='', rules=None, snapshots=None):
     """產生互動線圖那一份 HTML，回傳檔案路徑。
 
     和本機版的三個差別，全都是因為這一份要放上網、給手機開：
@@ -1946,7 +2258,11 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         # ── 主體：左側清單 + 右側圖表，左右分欄、各自獨立捲動 ───
         'html,body{height:100%;overflow:hidden}'
         ':root{--hd-h:46px}'
+        # max-height 是**保險絲**，不是排版：〔自己調門檻〕展開之後頁首會長高，
+        # 而 #main 的高度是 100vh 減掉頁首。沒有上限的話，一個夠長的頁首會把
+        # #main 算成負數——圖表區直接消失，而且捲不回來。
         '#topbar{position:sticky;top:0;z-index:30;background:#0d1117;'
+            'max-height:66vh;overflow-y:auto;'
             'box-shadow:0 2px 8px rgba(0,0,0,0.35)}'
         '#main{display:flex;align-items:stretch;'
             'height:calc(100vh - var(--hd-h, 46px))}'
@@ -2011,6 +2327,54 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         '#rules b{color:#e6edf3;font-weight:600;white-space:nowrap}'
         '#rules .stop{margin:8px 0 0;color:#8b949e}'
         '#rules .stop b{color:#ff7b72}'
+        # ── 〔自己調門檻〕：就在〔篩選條件〕底下 ───────────────
+        #
+        # 整塊在 #topbar 裡，而 #topbar 是 sticky、#main 的高度是用它的實際高度
+        # 算出來的。所以清單**一定**要有自己的 max-height 和捲軸：沒有的話，
+        # 放寬門檻篩出四百檔就會把頁首撐到比視窗還高，圖表區整個被擠出去。
+        '#live{margin-top:10px;padding-top:8px;border-top:1px solid #21262d}'
+        '#live .live-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}'
+        '#live .live-head b{color:#e6edf3;font-size:12.5px}'
+        '#live .live-note{color:#6e7681;font-size:11px}'
+        '#live .live-fields{display:flex;flex-wrap:wrap;gap:6px 10px;margin-top:6px}'
+        '#live label{display:inline-flex;align-items:center;gap:4px;'
+            'font-size:11px;color:#8b949e}'
+        '#live input{width:74px;background:#0d1117;color:#e6edf3;'
+            'border:1px solid #30363d;border-radius:5px;padding:2px 5px;'
+            'font-family:inherit;font-size:11.5px}'
+        '#live input:focus{outline:none;border-color:#58a6ff}'
+        '#live em{font-style:normal;color:#6e7681;font-size:10.5px}'
+        '#live .live-bar{display:flex;align-items:center;gap:10px;margin-top:6px}'
+        '#live .live-bar button{background:#21262d;color:#c9d1d9;'
+            'border:1px solid #30363d;border-radius:5px;padding:3px 10px;'
+            'font-family:inherit;font-size:11.5px;cursor:pointer}'
+        '#live .live-bar button:hover{background:#30363d;border-color:#8b949e}'
+        '#live #live-count{font-size:11.5px;font-weight:600}'
+        # 兩個誠實的限制寫在畫面上，不是只寫在原始碼的註解裡。
+        '#live .live-limit{margin:6px 0 0;color:#6e7681;font-size:10.5px;'
+            'line-height:1.6;max-width:74em}'
+        '#live .live-limit b{color:#8b949e;font-weight:600}'
+        '#live #live-count.hit{color:#7ee787}'
+        '#live #live-count.miss{color:#8b949e}'
+        '#live .live-wrap{max-height:26vh;overflow:auto;margin-top:6px;'
+            'border:1px solid #21262d;border-radius:6px}'
+        '#live table{border-collapse:collapse;width:100%;font-size:11.5px}'
+        '#live th{position:sticky;top:0;background:#161b22;color:#8b949e;'
+            'text-align:left;font-weight:600;padding:4px 8px;'
+            'border-bottom:1px solid #30363d;white-space:nowrap}'
+        '#live td{padding:3px 8px;border-bottom:1px solid #161b22;color:#c9d1d9}'
+        '#live tr:hover td{background:#161b22}'
+        '#live td.c{color:#e6edf3;font-weight:600}'
+        '#live td.i{color:#79c0ff}'
+        '#live th.n,#live td.n{text-align:right;font-variant-numeric:tabular-nums}'
+        '#live td.t{color:#f0c27f}'
+        '#live td.more{color:#6e7681;text-align:center;padding:6px}'
+        '#live a{color:#58a6ff;text-decoration:none}'
+        '#live a:hover{text-decoration:underline}'
+        # 「無圖」不是錯誤，是這一頁的邊界：門檻放寬多出來的股票，排程當天沒有
+        # 畫它的圖。做成一顆很淡的標籤，看得見但不搶眼。
+        '#live .nochart{margin-left:5px;padding:0 5px;border-radius:9px;'
+            'font-size:9.5px;color:#6e7681;border:1px solid #30363d}'
         '#hd a.dl{color:#7ee787;text-decoration:none;font-size:12px;'
             'border:1px solid rgba(126,231,135,.32);border-radius:12px;'
             'padding:3px 10px;white-space:nowrap}'
@@ -2452,7 +2816,12 @@ document.addEventListener('DOMContentLoaded', function() { syncHdHeight(); showC
         '</b>&nbsp;\u6a94\u901a\u904e</div>',
         # 〔篩選條件〕就在這一行底下。以前它只寫在 Excel 的第一分頁，而多數人
         # 只看這一頁——等於「這份名單是怎麼篩出來的」對他們來說不存在。
-        _rules_block(rules),
+        # `drawn` 取自 stock_infos 而不是 results：畫圖的迴圈會跳過資料不足的那
+        # 幾檔，而側欄卡片的 id 是照 stock_infos 編的。用 results 的索引，點到的
+        # 會是隔壁那一檔。
+        _rules_block(rules, snapshots=snapshots,
+                     drawn={s['code']: i for i, s in enumerate(stock_infos)},
+                     link_base=link_base),
         # 「滑鼠移入圖表 → 顯示指標｜左鍵拖曳｜滾輪縮放」那一行拿掉了。
         # 它教的是三件**試一次就知道**的事，而它每天出現在每一位讀者眼前，
         # 佔的還是頁首最寬的那一段。手機上更沒有滑鼠也沒有滾輪。

@@ -1,0 +1,392 @@
+"""同一組門檻、同一份快照，Python 和瀏覽器必須篩出同一份名單。
+
+## 為什麼會有兩份實作
+
+四部曲的每一個可調門檻，最後都只是拿一個數字去比大小。所以「換一組門檻會篩出
+哪幾檔」不需要重算任何指標——只要每一檔在最後一根 K 棒上的那十幾個數字。那份
+快照嵌在報告網頁裡，判定就在瀏覽器裡跑完：零等待、不必登入、不用叫任何 workflow。
+
+代價是判定寫了兩次：`pipeline.passes()` 是 Python 那一份，報告網頁上的 `tfPass()`
+是它的逐行翻譯。瀏覽器裡跑不了 Python，而唯一的替代方案是把判定搬回伺服器——
+那就回到「按一下等三十分鐘」。所以重複是刻意的，而代價由這一支扛著。
+
+## 這一支真的在跑那份 JS
+
+不是拿 regex 去比對兩邊長得像不像——那種檢查會在「兩邊都寫了 `<=`，但其中一邊
+比的是另一個欄位」的時候綠燈。這裡是把報告裡那一段 `<script>` 原封不動餵給
+node 執行，讓它對同一批列跑出答案，再和 Python 的答案逐檔對。
+
+## 邊界是重點，不是附加
+
+翻譯最容易翻錯的不是邏輯，是 `<=` 和 `<`：`close <= min_price` 和
+`close < min_price` 在「剛好等於」的那一檔上是相反的答案，而隨機測資幾乎永遠
+不會剛好落在那一點上。所以測資分兩批：一批刻意讓每一個門檻剛好踩在等號上，
+一批是固定亂數種子的一千列。
+"""
+
+import json
+import os
+import random
+import shutil
+import subprocess
+import tempfile
+
+import pytest
+
+from tw_trend_filter.pipeline import (
+    DEFAULT_RULES,
+    LIVE_FIELDS,
+    SNAPSHOT_COLUMNS,
+    SNAPSHOT_DAYS,
+    Rules,
+    _rules_block,
+    passes,
+    snapshot_row,
+)
+
+# ── 把報告裡那段 JS 挖出來丟給 node ────────────────────────────────
+
+# 這一段要排在挖出來的 JS **前面**：那段 JS 在最外層就會呼叫
+# document.addEventListener，沒有先擺好 stub 的話，連載入都到不了 tfPass。
+PRELUDE = """
+// 判定本身（tfPass）是純函式，碰不到 DOM；這裡只要讓載入不爆掉。
+globalThis.document = {
+  getElementById: function () { return null; },
+  querySelector: function () { return null; },
+  addEventListener: function () {},
+};
+"""
+
+# 刻意繞過 `tfPass(row, payload.rules)` 這條捷徑，改成把數字塞進假的輸入框、
+# 再讓 `tfRules()` 自己去讀。理由是**單位換算也在 tfRules 裡**：畫面上的成交
+# 金額是「百萬」，判定用的是「元」。直接餵 rules 的話，那一次乘以一百萬永遠
+# 不會被執行到——而這一支第一次跑就是被這件事抓到的。
+DRIVER = """
+const payload = JSON.parse(require('fs').readFileSync(process.argv[2], 'utf8'));
+document.getElementById = function (id) {
+  const k = id.replace(/^f_/, '');
+  return Object.prototype.hasOwnProperty.call(payload.rules, k)
+    ? {value: String(payload.rules[k])} : null;
+};
+const r = tfRules();
+const out = payload.rows.map(function (row) { return tfPass(row, r); });
+console.log(JSON.stringify(out));
+"""
+
+
+def _page_js():
+    """報告網頁上那一段 `<script>`（不含裝快照的那個 application/json）。"""
+    html = _rules_block(DEFAULT_RULES, snapshots=[_snap()])
+    # 最後一個 <script> … </script> 就是判定那一段；前面那個是
+    # <script type="application/json">，開頭的標籤不一樣，所以 rsplit 不會切錯。
+    head, _, tail = html.rpartition('<script>')
+    assert head, '報告裡找不到判定那一段 <script>'
+    js, _, _ = tail.partition('</script>')
+    assert 'function tfPass' in js, '挖出來的那一段裡沒有 tfPass'
+    return js
+
+
+def _js_verdicts(rows, rules):
+    """讓 node 跑那段 JS，回傳每一列的觸發訊號（沒過是 None）。"""
+    node = shutil.which('node')
+    if node is None:
+        # CI 上一定有 node（ubuntu runner 內建），所以在 CI 缺席就是紅字，
+        # 不是跳過——一條永遠跳過的守門和沒有守門一樣。
+        if os.environ.get('CI'):
+            pytest.fail('CI 上找不到 node，這一支守不住兩邊的一致性')
+        pytest.skip('本機沒有 node；這一支會在 CI 上跑')
+
+    payload = {
+        'rows': [snapshot_row(s) for s in rows],
+        # JS 那一邊拿到的是畫面上的數字：成交金額的單位是百萬。
+        'rules': {k: (getattr(rules, k) / 1e6 if k == 'min_amount'
+                      else getattr(rules, k))
+                  for k, *_ in LIVE_FIELDS},
+    }
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, 'check.js')
+        arg = os.path.join(d, 'payload.json')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write(PRELUDE + '\n' + _page_js() + '\n' + DRIVER)
+        with open(arg, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False)
+        r = subprocess.run([node, src, arg], capture_output=True, text=True)
+    assert r.returncode == 0, f'node 跑不起來：{r.stderr}'
+    return json.loads(r.stdout)
+
+
+def _py_verdicts(rows, rules):
+    out = []
+    for s in rows:
+        ok, triggers = passes(s, rules)
+        out.append(triggers if ok else None)
+    return out
+
+
+# ── 測資 ──────────────────────────────────────────────────────────
+
+def _snap(close=100.0, **kw):
+    """一檔剛好**通過**預設門檻的快照。每一項都離門檻一步，方便往回推。
+
+    價格那幾項（兩條均線、布林上軌、20 日高點）刻意寫成 `close` 的比例，不是
+    寫死的數字。第一版寫死了，於是「股價剛好等於下限」那一列是 close=10 對上
+    ma60=90——它確實沒過，但**不是因為股價**，而是因為它早在 60MA 那一關就被
+    擋掉了。把 `<=` 改成 `<` 那一列照樣沒過，測試照樣綠。
+
+    守在等號上的測資，其他每一項都必須留在安全距離內，那一格才真的在被驗。
+    """
+    s = {
+        'code': '2330', 'name': '台積電', 'industry': '半導體',
+        'close': close, 'vol20': 5000.0, 'amt20': 5e8,
+        'ma20': close * 0.95, 'ma60': close * 0.90,
+        'cross_ago': 3,
+        'bw': [0.30] * (SNAPSHOT_DAYS - 1) + [0.05],
+        'boll_up': close * 0.98, 'donchian': close * 0.99,
+        'vol_ratio': 1.5, 'atr14': close * 0.02,
+    }
+    s.update(kw)
+    assert set(s) == set(SNAPSHOT_COLUMNS), '快照欄位和 SNAPSHOT_COLUMNS 對不上'
+    return s
+
+
+def _boundary_rows():
+    """每一個門檻剛好踩在等號上，各來一列。
+
+    `passes()` 在這幾項用的是 `<=`（**等於就是沒過**），所以這幾列的正確答案
+    是「沒過」——而把 `<=` 翻成 `<` 的話，它們會全部變成「過」。
+    """
+    r = DEFAULT_RULES
+    rows = [
+        _snap(),                                   # 基準：過
+        _snap(close=r.min_price),                  # 股價剛好等於下限 → 沒過
+        _snap(vol20=r.min_vol20),                  # 均量剛好等於 → 沒過
+        _snap(amt20=r.min_amount),                 # 均額剛好等於 → 沒過
+        _snap(ma60=100.0),                         # 收盤剛好等於 60MA → 沒過
+        _snap(ma20=90.0, ma60=90.0),               # 20MA 剛好等於 60MA → 沒過
+        _snap(boll_up=100.0, donchian=None),       # 突破要 `>`，等於不算
+        _snap(vol_ratio=r.vol_ratio),              # 量比剛好等於下限 → **過**（這一項是 `<`）
+        # 黃金交叉的窗口：lookback=10，第 10 天算在內、第 11 天不算。
+        _snap(cross_ago=10, bw=[0.30] * SNAPSHOT_DAYS),
+        _snap(cross_ago=11, bw=[0.30] * SNAPSHOT_DAYS),
+        _snap(cross_ago=0, bw=[0.30] * SNAPSHOT_DAYS),    # 0 代表沒交叉過
+        # 布林壓縮：`<=`，剛好等於門檻算壓縮。
+        _snap(cross_ago=0, bw=[0.30] * (SNAPSHOT_DAYS - 1) + [r.squeeze]),
+        # 壓縮發生在窗口**外面**（第 11 天），不算。
+        _snap(cross_ago=0,
+              bw=[0.30] * 9 + [r.squeeze] + [0.30] * (SNAPSHOT_DAYS - 10)),
+        # 20 日高點剛好等於收盤：突破要 `>`，等於不算。布林上軌同時推到收盤
+        # 上面，不然這一列會被布林那一邊救起來，而那等於沒有驗到 20 日高點。
+        _snap(donchian=100.0, boll_up=101.0),
+        # donchian 是 None（上市未滿 20 天）：只能靠布林軌突破。
+        _snap(donchian=None),                      # 過（布林軌在收盤底下）
+        _snap(donchian=None, boll_up=101.0),       # 沒過（兩個突破都不成立）
+        # 兩個訊號同時觸發、兩個突破同時成立——訊號的**順序**也要一樣。
+        _snap(cross_ago=2, bw=[0.05] * SNAPSHOT_DAYS,
+              boll_up=98.0, donchian=98.5),
+    ]
+    for i, s in enumerate(rows):
+        s['code'] = f'{1000 + i}'
+    return rows
+
+
+def _random_rows(n=1000, seed=20260913):
+    """固定種子的亂數列。邊界那幾列守的是等號，這一批守的是「有沒有哪一格接錯」。"""
+    rnd = random.Random(seed)
+    rows = []
+    for i in range(n):
+        close = round(rnd.uniform(5, 300), 2)
+        rows.append(_snap(
+            code=f'{9000 + i}',
+            close=close,
+            vol20=round(rnd.uniform(100, 20000), 1),
+            amt20=round(rnd.uniform(1e6, 2e9), 1),
+            ma20=round(close * rnd.uniform(0.85, 1.15), 2),
+            ma60=round(close * rnd.uniform(0.85, 1.15), 2),
+            cross_ago=rnd.choice([0, 1, 5, 9, 10, 11, 25]),
+            bw=[round(rnd.uniform(0.02, 0.5), 4) for _ in range(SNAPSHOT_DAYS)],
+            boll_up=round(close * rnd.uniform(0.9, 1.1), 2),
+            donchian=(None if rnd.random() < 0.1
+                      else round(close * rnd.uniform(0.9, 1.1), 2)),
+            vol_ratio=round(rnd.uniform(0.5, 4.0), 3),
+            atr14=round(rnd.uniform(0.1, 15), 3),
+        ))
+    return rows
+
+
+# 讀者真的會打進去的幾組，加上兩組故意打壞的。
+RULE_SETS = {
+    '預設': DEFAULT_RULES,
+    '放寬': Rules(min_price=5, min_vol20=200, min_amount=1e7,
+                  lookback=20, squeeze=0.3, vol_ratio=0.8, atr_stop=2),
+    '收緊': Rules(min_price=50, min_vol20=5000, min_amount=1e9,
+                  lookback=3, squeeze=0.05, vol_ratio=2.5, atr_stop=4),
+    '回看天數超過快照存的天數': Rules(lookback=SNAPSHOT_DAYS + 30),
+    '回看天數打成負數': Rules(lookback=-5),
+    '回看天數打成零': Rules(lookback=0),
+}
+
+
+@pytest.mark.parametrize('name', list(RULE_SETS))
+def test_同一份快照兩邊篩出同一份名單(name):
+    rules = RULE_SETS[name]
+    rows = _boundary_rows() + _random_rows()
+    py, js = _py_verdicts(rows, rules), _js_verdicts(rows, rules)
+
+    assert len(py) == len(js)
+    bad = [(rows[i]['code'], py[i], js[i])
+           for i in range(len(py)) if py[i] != js[i]]
+    assert not bad, (
+        f'門檻〔{name}〕下有 {len(bad)} 檔兩邊答案不一樣（前五檔）：'
+        + '；'.join(f'{c}：Python={p!r} JS={j!r}' for c, p, j in bad[:5])
+    )
+
+
+def test_這批測資真的有過有不過():
+    """守門的守門。
+
+    如果測資全部沒過，上面那一支會綠——而它什麼都沒驗到。這一支在
+    `_boundary_rows` 被改壞（例如基準那一列自己就不過）的時候會紅。
+    """
+    v = _py_verdicts(_boundary_rows() + _random_rows(), DEFAULT_RULES)
+    hit = [x for x in v if x]
+    assert len(hit) >= 20, f'只有 {len(hit)} 列通過，測資偏了'
+    assert len(hit) < len(v), '每一列都通過，門檻沒有在擋任何東西'
+
+
+@pytest.mark.parametrize('what,at,just_over', [
+    # 欄位            剛好踩在門檻上             推過去一點點
+    ('股價下限',   {'close': 10.0},           {'close': 10.01}),
+    ('20日均量',   {'vol20': 1000.0},         {'vol20': 1000.1}),
+    ('20日均額',   {'amt20': 5e7},            {'amt20': 5e7 + 1}),
+    # 60MA 推到收盤附近的時候，20MA 要跟著推上去——不然擋住它的會是下一關。
+    ('收盤對60MA', {'ma60': 100.0, 'ma20': 100.5},
+                   {'ma60': 99.99, 'ma20': 100.5}),
+    ('20MA對60MA', {'ma20': 90.0, 'ma60': 90.0},
+                   {'ma20': 90.01, 'ma60': 90.0}),
+    ('突破布林上軌', {'boll_up': 100.0, 'donchian': None},
+                     {'boll_up': 99.99, 'donchian': None}),
+])
+def test_每一列邊界測資真的卡在它要守的那一關(what, at, just_over):
+    """守門的守門，第二層。
+
+    這一支存在的理由是它抓到過一次真的：第一版的 `_snap` 把均線寫死成 90／95，
+    於是「股價剛好等於下限」那一列是 close=10 對上 ma60=90——它沒過，但是被
+    60MA 那一關擋掉的。把判定裡的 `<=` 改成 `<`，那一列照樣沒過，跨語言那一支
+    照樣全綠。一列在錯的關卡上被擋掉的邊界測資，等於沒有那一列。
+    """
+    stuck, _ = passes(_snap(**at), DEFAULT_RULES)
+    assert not stuck, f'〔{what}〕剛好踩在門檻上，應該沒過'
+    loose, _ = passes(_snap(**just_over), DEFAULT_RULES)
+    assert loose, f'〔{what}〕只推過門檻一點點就該過——它現在卡在別的關卡上'
+
+
+def test_量比那一項是小於不是小於等於():
+    """這一項和其他六項相反，而它最容易被「順手統一」成 `<=`。
+
+    `passes()` 寫的是 `vol_ratio < rules.vol_ratio`：量比**剛好等於**門檻算過。
+    原因是門檻預設 1.2 是「比平常多兩成」，而「剛好多兩成」本來就該算數。
+    """
+    ok, _ = passes(_snap(vol_ratio=DEFAULT_RULES.vol_ratio), DEFAULT_RULES)
+    assert ok
+    ok, _ = passes(_snap(vol_ratio=DEFAULT_RULES.vol_ratio - 0.001), DEFAULT_RULES)
+    assert not ok
+
+
+def test_網頁上的預設值就是這一次真的跑的那組門檻():
+    """輸入框裡那幾個數字要是報告自己跑的那組，不是寫死的 DEFAULT_RULES。
+
+    不然一份用 `--vol-ratio 1.1` 跑出來的報告，打開來輸入框寫 1.2，而清單是
+    1.1 篩的——畫面和內容安靜地不一致，正是這個專案踩過的那一類錯。
+    """
+    r = Rules(min_price=33, min_amount=1.23e8, vol_ratio=1.05)
+    html = _rules_block(r, snapshots=[_snap()])
+    assert 'id="f_min_price" type="number" min="0" step="1" value="33"' in html
+    assert 'value="123"' in html          # 成交金額換算成百萬
+    assert 'id="f_vol_ratio"' in html and 'value="1.05"' in html
+
+
+def test_沒有快照就不畫那一塊():
+    """沒有快照的時候（例如舊版的呼叫端），頁面上不該出現一個按了沒反應的表單。"""
+    html = _rules_block(DEFAULT_RULES)
+    assert '篩選條件' in html
+    assert 'id="live"' not in html
+    assert 'tfPass' not in html
+
+
+def test_有圖的那幾檔點名字跳到圖沒圖的連去個股頁():
+    """`TF_DRAWN` 空的話，清單上每一個名字都會變成純文字——而那是它壞掉時的樣子。"""
+    html = _rules_block(DEFAULT_RULES, snapshots=[_snap()],
+                        drawn={'2330': 0, '2317': 1},
+                        link_base='https://example.invalid/six/')
+    assert '"2317": 1' in html or '"2317":1' in html
+    assert 'const TF_LINK = "https://example.invalid/six"' in html
+    assert 'function tfJump' in html
+    assert "document.getElementById('btn-' + i)" in html
+
+
+# ── 快照真的到得了那一頁 ──────────────────────────────────────────
+#
+# 上面每一支都在驗 `_rules_block()` 本身。但這一整條路上最容易斷的不是它，
+# 是**呼叫端忘了把 snapshots 傳下去**——那時候頁面照樣產得出來、照樣沒有錯誤，
+# 只是〔自己調門檻〕整塊不見了。這一支從 `build_interactive_html` 這一端進去。
+
+def _fake_result(code='2330', name='台積電'):
+    import numpy as np
+    import pandas as pd
+
+    from tw_trend_filter.pipeline import compute_bollinger
+
+    idx = pd.bdate_range('2022-01-03', periods=300)
+    close = pd.Series(np.linspace(100.0, 200.0, 300), index=idx)
+    df = pd.DataFrame({
+        'Open': close * 0.99, 'High': close * 1.02, 'Low': close * 0.98,
+        'Close': close,
+        'Volume': pd.Series(np.full(300, 5e6), index=idx),
+    }, index=idx)
+    bmid, bup, bdn, _ = compute_bollinger(close)
+    return {
+        'ticker': f'{code}.TW', 'code': code, 'name': name,
+        'industry': '半導體業',
+        'close': 200.0, 'ma20_last': 195.0, 'ma60_last': 180.0,
+        'boll_up_last': 205.0, 'boll_mid_last': 195.0, 'boll_dn_last': 185.0,
+        'boll_bw_pct': 10.2, 'vol_today': 6e6, 'vol20_avg': 5e6,
+        'vol_ratio': 1.35, 'amt_M': 900.0, 'atr14': 4.2, 'stop_loss': 187.4,
+        'golden_cross': True, 'squeeze': False, 'trigger': '黃金交叉',
+        '_df': df, '_ma20': close.rolling(20).mean(),
+        '_ma60': close.rolling(60).mean(),
+        '_boll_up': bup, '_boll_mid': bmid, '_boll_dn': bdn,
+    }
+
+
+def _page(tmp_path, **kw):
+    import datetime
+
+    from tw_trend_filter.pipeline import build_interactive_html
+
+    p = build_interactive_html(
+        [_fake_result()], '2026-09-13', str(tmp_path),
+        datetime.datetime(2026, 9, 13, 15, 30), rules=DEFAULT_RULES, **kw)
+    assert p, 'build_interactive_html 回傳 None'
+    return open(p, encoding='utf-8').read()
+
+
+def test_快照傳得到報告頁上(tmp_path):
+    html = _page(tmp_path, snapshots=[_snap(code='2330'), _snap(code='6505')])
+    assert 'id="live"' in html
+    assert 'id="tf-snap"' in html
+    assert 'function tfPass' in html
+    assert '#live .live-wrap{max-height' in html, '清單沒有高度上限，會把頁首撐爆'
+
+
+def test_沒傳快照的時候那一塊整個不出現(tmp_path):
+    html = _page(tmp_path)
+    assert '篩選條件' in html
+    assert 'id="live"' not in html
+
+
+def test_有圖的那幾檔在_TF_DRAWN_裡而且序號對得上側欄(tmp_path):
+    """序號錯一位的症狀是「點 A 跳到 B」，而它不會報錯。"""
+    html = _page(tmp_path, snapshots=[_snap(code='2330'), _snap(code='6505')])
+    assert '"2330": 0' in html or '"2330":0' in html
+    assert '6505' not in html.split('const TF_DRAWN =')[1].split(';')[0]
+    assert 'id="btn-0"' in html

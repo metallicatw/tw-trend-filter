@@ -10,7 +10,7 @@ import argparse
 import os
 import sys
 
-from .pipeline import DEFAULT_RULES, VERSION, Rules, run
+from .pipeline import DEFAULT_RULES, VERSION, Rules, UniverseIncomplete, run
 
 
 def _env_excel_url() -> str:
@@ -41,6 +41,26 @@ def _env_excel_url() -> str:
     if repo:
         return f'{server}/{repo}/releases'
     return ''
+
+
+def _run(args, rules):
+    """把旗標翻譯成 `pipeline.run` 的參數。獨立出來只是為了讓上面那個
+    try/except 框住的範圍剛好是「跑這一趟」，不是整個 main。"""
+    return run(
+        args.output_dir,
+        limit=args.limit,
+        workers=args.workers,
+        period=args.period,
+        make_excel=not args.no_excel,
+        excel_charts=not args.no_excel_charts,
+        link_base=args.link_base,
+        plotly_cdn=not args.offline_plotly,
+        chart_years=args.chart_years,
+        excel_url=args.excel_url or _env_excel_url(),
+        index_copy=args.index,
+        open_when_done=args.local,
+        rules=rules,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -125,22 +145,14 @@ def main(argv: list[str] | None = None) -> int:
         args.chart_years = 5.0
         args.offline_plotly = True
 
-    result = run(
-        args.output_dir,
-        limit=args.limit,
-        workers=args.workers,
-        period=args.period,
-        make_excel=not args.no_excel,
-        excel_charts=not args.no_excel_charts,
-        link_base=args.link_base,
-        plotly_cdn=not args.offline_plotly,
-        chart_years=args.chart_years,
-        excel_url=args.excel_url or _env_excel_url(),
-        index_copy=args.index,
-        open_when_done=args.local,
-        rules=rules,
-    )
-
+    try:
+        result = _run(args, rules)
+    except UniverseIncomplete as exc:
+        # 上游今天不給資料，不是這支程式壞了。歸到 2 是為了讓「CI 紅了」還能
+        # 代表「程式壞了」——理由寫在 pipeline.UniverseIncomplete 的 docstring。
+        print(f'::warning::{exc}')
+        print('這一趟沒有產出，也沒有覆蓋任何東西。結束碼 2。')
+        return 2
     # 這一趟到底算不算數。
     #
     # 原本是無條件 `return 0`，於是 1,800 檔下載失敗跟 0 檔失敗都是綠燈，

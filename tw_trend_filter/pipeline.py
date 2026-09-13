@@ -73,6 +73,21 @@ PLOTLY_CDN_FALLBACK = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 VERSION = 'V3.1'
 
 
+class UniverseIncomplete(RuntimeError):
+    """兩個交易所的清單只拿到一半（或一個都沒有）。
+
+    自己一個型別，是為了讓呼叫端分得出「**上游今天不給資料**」和「**程式壞了**」
+    ——這兩件事以前長得一模一樣：一個 traceback、exit 1、CI 一片紅。
+
+    這個 repo 已經有一套講這件事的約定（`__main__` 的結束碼：0 算數／2 跑完了但
+    不可信／其他是真的壞了），只是母體抓不到的時候繞過了它。繞過的代價是「CI 紅
+    了」不再代表任何事——而一個永遠可能因為交易所心情不好而變紅的守門，遲早會
+    被當成雜訊忽略掉，那時候真的壞掉的那一次也會一起被忽略。
+
+    所以它歸到 2：跟「只掃完六成」同一類，意思都是「這一趟不要拿去覆蓋昨天那份」。
+    """
+
+
 @dataclass(frozen=True)
 class Rules:
     """四部曲的**門檻**。預設值就是原本寫死在 `screen_stock` 裡的那幾個數字。
@@ -326,7 +341,7 @@ def load_tw_stock_universe():
     if got != {'.TW', '.TWO'}:
         # 這裡 raise 而不是回半個市場：呼叫端沒有辦法從一個 list 看出它少了
         # 一整個交易所，而發布流程會 force push 覆蓋昨天那份。
-        raise RuntimeError(
+        raise UniverseIncomplete(
             f'股票母體不完整：{sorted({".TW", ".TWO"} - got)} 兩個來源都沒拿到。'
             '寧可這一趟不發布，也不要用半個市場覆蓋掉昨天的報告。'
         )

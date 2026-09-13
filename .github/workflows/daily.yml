@@ -106,9 +106,15 @@ jobs:
         run: |
           set +e
           # 用陣列組旗標，不是把字串串起來再交給 shell 重新切一次。
-          # 輸入是使用者打的，而 `$FLAGS` 沒有引號的話 `1.2; rm -rf /` 會被當成
-          # 兩個指令執行——上面那段「輸入走 env 不直接內插」防的是 `${{ }}`
-          # 在 shell 之前展開，這裡防的是展開之後再被 shell 切一次。
+          # 輸入是使用者打的，而 $FLAGS 沒有引號的話 `1.2; rm -rf /` 會被當成
+          # 兩個指令執行——上面那段「輸入走 env 不直接內插」防的是樣板在 shell
+          # 之前就展開，這裡防的是展開之後再被 shell 切一次。
+          #
+          # ⚠️ 這幾行裡不可以出現 GitHub 的表達式樣板（兩層大括號那個），
+          #    **即使寫在 `#` 後面**。Actions 是把整個 run 區塊當文字掃過去找
+          #    樣板的，它不認得 shell 的註解——上一版這裡有一組空的樣板，整個
+          #    workflow 就以「Invalid workflow file: An expression was expected」
+          #    被擋掉，而錯誤指的行號是 `run:` 那一行，不是註解那一行。
           flags=()
           [ -n "$MIN_PRICE" ]    && flags+=(--min-price    "$MIN_PRICE")
           [ -n "$MIN_AMOUNT_M" ] && flags+=(--min-amount-m "$MIN_AMOUNT_M")

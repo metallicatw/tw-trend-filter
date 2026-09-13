@@ -16,7 +16,14 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install -r requirements.txt pytest
+      # PyYAML 只有測試用得到（`test_workflow_的_run_區塊裡不可以有空的表達式
+      # 樣板` 要解析 workflow），所以裝在這裡而不是 requirements.txt——那個檔案
+      # 列的是跑起來真的需要的東西，每一條都有一個具體的理由寫在旁邊。
+      #
+      # 明著裝而不是靠它剛好是某個相依的相依：那種依賴哪天上游換掉就消失，而
+      # 消失的方式是一條守門的測試安靜地不見（import 失敗會紅，但如果改成
+      # importorskip 就會安靜地跳過——永遠跳過的守門和永遠紅的一樣沒用）。
+      - run: pip install -r requirements.txt pytest PyYAML
       - run: python -m pytest tests -q
 
       # 單元測試只能驗「寫下來的是哪一版」。這一步驗那個網址**真的拿得到
@@ -63,12 +70,34 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq fonts-noto-cjk
+      # 結束碼 2 ＝「這一趟不算數」：母體只拿到半個市場、或掃完的比例太低。
+      # 那兩件事都是**上游今天不給資料**，不是這支程式壞了，而 CI 要回答的問題
+      # 只有後者。
+      #
+      # 這一段以前沒有：母體抓不到會直接 traceback、exit 1，於是交易所心情不好
+      # 的那幾天 CI 就是紅的。一個會因為別人的網站而變紅的守門，遲早會被當成
+      # 雜訊——那時候真的壞掉的那一次也會一起被忽略。
+      #
+      # 留一個 ::warning:: 而不是安靜帶過：連續幾天都出現的話，那就不是心情問題。
       - name: 掃 40 檔
+        id: smoke
         run: |
+          set +e
           python -m tw_trend_filter \
             --output-dir output --limit 40 \
             --link-base "https://metallicatw.github.io/tw-six-metrics/stock"
+          code=$?
+          set -e
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 2 ]; then
+            echo "::warning::上游資料不完整，這一趟不算數（結束碼 2）。整條路能不能走通這次沒有驗到。"
+            exit 0
+          fi
+          exit "$code"
+      # 上一步以結束碼 2 收場的話，本來就不會有產出——那時候來檢查產出等於把
+      # 一個已經解釋過的情況再報一次失敗。
       - name: 確認產出
+        if: steps.smoke.outputs.code == '0'
         run: |
           ls -la output/
           # Excel 一定要有。HTML 只有在真的篩出東西的時候才會有，所以

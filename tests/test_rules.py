@@ -84,10 +84,19 @@ def test_命令列的預設值是從_Rules_拿的_不是另外寫一份():
     `--help` 印出來的那幾個數字必須等於 `Rules` 的欄位值。這條測試跑的是真的
     argparse，所以它驗的是使用者真的會看到的那份文字。
     """
+    import os
+    import re
+
+    # COLUMNS 釘住：argparse 照終端機寬度折行，而 CI 的寬度不等於本機的。
+    # 折到一半的「預設 1,0\n00」會讓這條測試因為排版而紅，而排版不是它要守的東西。
+    env = dict(os.environ, COLUMNS='100')
     out = subprocess.run(
         [sys.executable, '-m', 'tw_trend_filter', '--help'],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=True, env=env,
     ).stdout
+    # 再把所有連續空白（含換行）壓成一個空格，這樣就算哪天 argparse 換了折行
+    # 規則也還是比得到。
+    out = re.sub(r'\s+', ' ', out)
     assert '四部曲門檻' in out
     for flag, shown in (
         ('--min-price', '預設 10'),
@@ -279,3 +288,89 @@ def test_停損倍數改了_停損價就跟著改(tmp_path):
     assert abs(three['stop_loss'] - (three['close'] - 3 * atr)) < 0.02
     assert abs(one['stop_loss'] - (one['close'] - 1 * atr)) < 0.02
     assert one['stop_loss'] > three['stop_loss'], '倍數變小，停損該往上移'
+
+
+def test_workflow_的_run_區塊裡不可以有空的表達式樣板():
+    """GitHub 把整個 `run` 區塊當文字掃過去找表達式樣板，**不認得 shell 註解**。
+
+    所以一行寫在 `#` 後面、用來解釋樣板長什麼樣的註解，會被當成真的樣板去求值。
+    空的那一組讓整個 workflow 以「Invalid workflow file: An expression was
+    expected」被擋掉——而錯誤指的行號是 `run:` 那一行，不是註解那一行，所以現場
+    看起來像是整段 shell 有問題。
+
+    **YAML 的註解不算**：那是 YAML 解析器在 Actions 看到之前就丟掉的，所以
+    `# 這裡寫一組空樣板` 寫在 YAML 註解裡完全沒事。這個差別正是當初診斷卡住的
+    地方，所以這條測試是解析過 YAML 之後才掃字串值的——用 grep 掃原始檔的話，
+    它會對著一行無害的註解喊失敗，而那種假警報遲早會被關掉。
+    """
+    import pathlib
+    import re
+
+    import yaml
+
+    root = pathlib.Path(__file__).resolve().parents[1] / '.github/workflows'
+    files = sorted(root.glob('*.yml'))
+    assert files, '找不到任何 workflow'
+
+    def walk(node, where):
+        if isinstance(node, str):
+            for m in re.finditer(r'\$\{\{(.*?)\}\}', node, re.S):
+                assert m.group(1).strip(), f'{where} 有一組空的表達式樣板'
+        elif isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, f'{where}.{k}')
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                walk(v, f'{where}[{i}]')
+
+    for path in files:
+        walk(yaml.safe_load(path.read_text('utf-8')), path.name)
+
+
+def test_母體抓不到是結束碼_2_不是_traceback():
+    """「上游今天不給資料」和「程式壞了」不可以長得一樣。
+
+    以前 `load_tw_stock_universe` 抓不到就 raise RuntimeError，一路冒出 main、
+    traceback、exit 1。於是交易所心情不好的那幾天 CI 就是紅的——而一個會因為
+    別人的網站而變紅的守門，遲早會被當成雜訊，那時候真的壞掉的那一次也會一起
+    被忽略。
+
+    這個 repo 本來就有一套講這件事的約定（0 算數／2 跑完了但不可信／其他是真的
+    壞了），只是母體那條路繞過了它。
+    """
+    import tw_trend_filter.pipeline as pl
+    from tw_trend_filter.__main__ import main
+
+    assert issubclass(pl.UniverseIncomplete, RuntimeError), (
+        '要是 RuntimeError 的子類——舊的 except 還接得住它'
+    )
+    orig = pl.load_tw_stock_universe
+    try:
+        def boom(*a, **k):
+            raise pl.UniverseIncomplete('兩個來源都沒拿到')
+        pl.load_tw_stock_universe = boom
+        assert main(['--output-dir', '/tmp/never', '--no-excel']) == 2
+    finally:
+        pl.load_tw_stock_universe = orig
+
+
+def test_真的壞掉還是要壞掉():
+    """把母體那條路歸到 2，不可以順手把別的例外也吞掉。
+
+    吞掉的話，CI 從「會因為別人而紅」變成「永遠不紅」——後者更糟：前者是雜訊，
+    後者是一個什麼都不守的守門。
+    """
+    import pytest
+
+    import tw_trend_filter.pipeline as pl
+    from tw_trend_filter.__main__ import main
+
+    orig = pl.load_tw_stock_universe
+    try:
+        def boom(*a, **k):
+            raise ValueError('這是程式壞了')
+        pl.load_tw_stock_universe = boom
+        with pytest.raises(ValueError):
+            main(['--output-dir', '/tmp/never', '--no-excel'])
+    finally:
+        pl.load_tw_stock_universe = orig

@@ -463,3 +463,59 @@ def test_停損倍數也真的寫進_Excel_的進出場策略(tmp_path):
     entry = {ws.cell(i, 2).value: ws.cell(i, 3).value for i in range(12, 16)}
     assert '2 × ATR(14)' in entry['初始停損'], entry['初始停損']
     assert '3 × ATR' not in entry['初始停損']
+
+
+def _report_html(rules, tmp_path):
+    """跑一趟真的（合成資料、一檔通過、不產 Excel），回傳報告網頁的內容。
+
+    不直接叫 `build_interactive_html([], ...)`：沒有任何一檔通過的時候它根本不產
+    檔案（回 None），那是設計好的行為——沒有標的就沒有線圖可看。
+    """
+    import tw_trend_filter.pipeline as pl
+
+    df = _synthetic()
+    orig_u, orig_d = pl.load_tw_stock_universe, pl.yf.download
+    try:
+        pl.load_tw_stock_universe = lambda *a, **k: (
+            ['1111.TW'], {'1111': '測試股'}, {'1111': '測試業'}
+        )
+        pl.yf.download = lambda *a, **k: df.copy()
+        out = pl.run(str(tmp_path), make_excel=False, workers=1, rules=rules)
+    finally:
+        pl.load_tw_stock_universe, pl.yf.download = orig_u, orig_d
+    assert out['html'], '這一趟應該有標的通過，才畫得出報告'
+    return open(out['html'], encoding='utf-8').read()
+
+
+def test_報告網頁上看得到篩選條件(tmp_path):
+    """「列出篩選判斷邏輯」指的是**這一頁**，不是 Excel 的第一分頁。
+
+    多數人只看報告網頁，而那一頁以前一個字都沒提篩選條件——等於「這份名單是
+    怎麼篩出來的」對讀者來說不存在。上一版把四行說明接上 `describe()`，但只接到
+    Excel，所以從網頁看過去什麼都沒變。
+
+    內容和 Excel 是同一份字串（都來自 `describe()`）。各寫一份的話，改了門檻就會
+    出現「網頁說 1.2、Excel 說 1.1」，而那種不一致沒有任何症狀。
+    """
+    text = _report_html(DEFAULT_RULES, tmp_path)
+    assert 'id="rules"' in text and '篩選條件' in text
+    for label, _ in DEFAULT_RULES.describe():
+        assert label in text, f'少了 {label}'
+    assert '布林頻寬壓縮 ≤ 12%' in text
+    assert '20 日均量 × 1.2' in text
+    assert '3 × ATR(14)' in text
+
+
+def test_網頁上的門檻跟著這一趟走(tmp_path):
+    """改過門檻的那一趟，網頁上印的要是改過的那一組。"""
+    text = _report_html(Rules(vol_ratio=1.1, atr_stop=2.0), tmp_path)
+    assert '× 1.1' in text and '2 × ATR(14)' in text
+    assert '× 1.2' not in text
+
+
+def test_沒給門檻就整塊不出現():
+    """印一組**可能不是這一趟用的**門檻，比不印更糟。"""
+    import tw_trend_filter.pipeline as pl
+
+    assert pl._rules_block(None) == ''
+    assert 'id="rules"' in pl._rules_block(DEFAULT_RULES)

@@ -23,6 +23,7 @@ warnings.filterwarnings('ignore')
 
 import os, sys, datetime, platform, tempfile, subprocess as _sp
 from dataclasses import dataclass, fields
+from html import escape
 from io import StringIO
 
 import requests
@@ -1451,7 +1452,7 @@ def run(
     html_path = build_interactive_html(
         RESULTS, today_str, output_dir, now,
         link_base=link_base, plotly_cdn=plotly_cdn,
-        chart_years=chart_years, excel_url=excel_url,
+        chart_years=chart_years, excel_url=excel_url, rules=rules,
     )
 
     # 排程要的是一個固定的檔名（`index.html`），因為下游——tw-six-metrics 的建站
@@ -1516,9 +1517,35 @@ def run(
 # ===============================================================
 # 互動式個股技術線圖 v4 ─ script[type=application/json] 懶載入
 # ===============================================================
+def _rules_block(rules):
+    """頁首那一塊〔篩選條件〕：四部曲 ＋ 停損，收在一個 `<details>` 裡。
+
+    內容全部從 `Rules.describe()` 來，和 Excel 第一分頁是同一份字串。兩邊各寫
+    一份的話，改了門檻就會出現「網頁說 1.2、Excel 說 1.1」——而那種不一致沒有
+    任何症狀，只會讓兩份文件互相打臉。
+
+    `rules` 給 None（舊的呼叫端）就整塊不出現，不要自己補一組預設值上去：
+    印一組**可能不是這一趟用的**門檻，比不印更糟。
+    """
+    if rules is None:
+        return ''
+    items = ''.join(
+        f'<li><b>{escape(label)}</b><span>{escape(text)}</span></li>'
+        for label, text in rules.describe()
+    )
+    return (
+        '<details id="rules"><summary>篩選條件</summary>'
+        f'<ol>{items}</ol>'
+        '<p class="stop">停損：進場後設在 <b>'
+        f'收盤 − {rules.atr_stop:g} × ATR(14)</b>，'
+        '固定不放寬；收盤跌破 20MA 考慮出場。</p>'
+        '</details>'
+    )
+
+
 def build_interactive_html(results, today_str, output_dir, now=None, *,
                            link_base='', plotly_cdn=True, chart_years=2.0,
-                           excel_url=''):
+                           excel_url='', rules=None):
     """產生互動線圖那一份 HTML，回傳檔案路徑。
 
     和本機版的三個差別，全都是因為這一份要放上網、給手機開：
@@ -1965,6 +1992,25 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
             'color:#79c0ff;border-color:rgba(88,166,255,.42)}'
         'a.badge.link:hover{background:rgba(88,166,255,.30);border-color:#58a6ff}'
         # 頂端那條 Excel 下載連結。
+        # 〔篩選條件〕：預設收起來，按一下展開。
+        #
+        # 這四行以前只寫在 Excel 的第一分頁裡，而多數人只看這一頁——等於「這份
+        # 名單是怎麼篩出來的」對他們來說不存在。攤開來放又會把頁首撐成一大塊，
+        # 而它是每天回來看的人早就知道的東西。所以收起來，但**在頁面上**。
+        '#rules{font-size:12px;color:#8b949e;margin-top:4px}'
+        '#rules>summary{cursor:pointer;list-style:none;color:#58a6ff;'
+        'display:inline-flex;align-items:center;gap:4px;padding:2px 0}'
+        '#rules>summary::-webkit-details-marker{display:none}'
+        '#rules>summary::before{content:"\\25B8";display:inline-block;'
+        'transition:transform .15s}'
+        '#rules[open]>summary::before{transform:rotate(90deg)}'
+        '#rules ol{margin:6px 0 0;padding-left:0;list-style:none;'
+        'display:grid;gap:4px}'
+        '#rules li{display:grid;grid-template-columns:auto 1fr;gap:8px;'
+        'align-items:baseline;line-height:1.55}'
+        '#rules b{color:#e6edf3;font-weight:600;white-space:nowrap}'
+        '#rules .stop{margin:8px 0 0;color:#8b949e}'
+        '#rules .stop b{color:#ff7b72}'
         '#hd a.dl{color:#7ee787;text-decoration:none;font-size:12px;'
             'border:1px solid rgba(126,231,135,.32);border-radius:12px;'
             'padding:3px 10px;white-space:nowrap}'
@@ -2404,6 +2450,9 @@ document.addEventListener('DOMContentLoaded', function() { syncHdHeight(); showC
         '<div class="meta">\u7be9\u9078\u65e5\u671f\uff1a' + ts_display +
         '&nbsp;|&nbsp;\u5171&nbsp;<b style="color:#3fb950">' + str(n) +
         '</b>&nbsp;\u6a94\u901a\u904e</div>',
+        # 〔篩選條件〕就在這一行底下。以前它只寫在 Excel 的第一分頁，而多數人
+        # 只看這一頁——等於「這份名單是怎麼篩出來的」對他們來說不存在。
+        _rules_block(rules),
         # 「滑鼠移入圖表 → 顯示指標｜左鍵拖曳｜滾輪縮放」那一行拿掉了。
         # 它教的是三件**試一次就知道**的事，而它每天出現在每一位讀者眼前，
         # 佔的還是頁首最寬的那一段。手機上更沒有滑鼠也沒有滾輪。

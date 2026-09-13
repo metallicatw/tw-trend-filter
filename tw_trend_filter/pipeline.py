@@ -22,6 +22,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 import os, sys, datetime, platform, tempfile, subprocess as _sp
+from dataclasses import dataclass, fields
 from io import StringIO
 
 import requests
@@ -70,6 +71,75 @@ PLOTLY_CDN_FALLBACK = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 
 #: 這支程式版本號。出現在 Excel 抬頭、HTML 標題與 CLI 的 `--version`。
 VERSION = 'V3.1'
+
+
+@dataclass(frozen=True)
+class Rules:
+    """四部曲的**門檻**。預設值就是原本寫死在 `screen_stock` 裡的那幾個數字。
+
+    ## 為什麼是門檻可調、窗口不可調
+
+    `run()` 的說明原本寫著「篩選規則本身沒有參數——那是這支程式的定義，不是
+    設定」。那句話對了一半，而錯的那一半有代價：想知道「量比放寬到 1.1 會多出
+    幾檔」，唯一的辦法是改原始碼、跑一次、再改回來——而改回來這一步只要漏掉
+    一次，之後每天的報告都是用一組沒有人記得改過的門檻跑出來的。
+
+    可調的是**門檻**：股價下限、量能下限、成交額下限、壓縮的百分比、回看幾天、
+    量比倍數、停損幾倍 ATR。這幾個數字換一組，答案會多幾檔少幾檔，但報告講的
+    還是同一件事。
+
+    不可調的是**窗口長度**：20MA、60MA、布林 20 日、Donchian 20 日、ATR 14 日。
+    它們不是門檻，是這份報告的**定義**——Excel 的欄名寫著「20MA」「60MA」，
+    K 線圖的圖例寫著「20MA 月線」「60MA 季線」，進出場策略寫著「跌破 20MA 就
+    出場」。把窗口做成參數而不同步改掉那二十幾處字串，產出的就是一份**說謊的
+    報告**：標題寫 20MA，畫的是別的東西。要改窗口就改程式，並且一起改那些字串。
+
+    ## 報告會說出它自己是用哪一組門檻跑的
+
+    `describe()` 產生 Excel 第一分頁那四行說明，而它是從**這個物件**算出來的，
+    不是另外寫死一份。門檻改了、說明沒改，是這件事最容易出的錯，而它的症狀是
+    報告安靜地和自己不一致。
+    """
+
+    #: ① 基礎流動性防禦
+    min_price: float = 10.0          # 股價下限（元）
+    min_vol20: float = 1000.0        # 20 日均量下限（張）
+    min_amount: float = 50_000_000.0 # 20 日均成交金額下限（元）
+    #: ③ 關鍵發動時機
+    lookback: int = 10               # 往回看幾個交易日找黃金交叉／壓縮
+    squeeze: float = 0.12            # 布林頻寬 ≤ 這個比例算壓縮
+    #: ④ 強勢突破＋爆量
+    vol_ratio: float = 1.2           # 當日量 ÷ 20 日均量的下限
+    #: 停損
+    atr_stop: float = 3.0            # 停損 = 收盤 − 這個倍數 × ATR(14)
+
+    def describe(self) -> tuple[tuple[str, str], ...]:
+        """Excel 第一分頁那四行「四部曲篩選機制說明」，照實際生效的門檻寫。"""
+        return (
+            ('① 基礎流動性防禦',
+             f'股價 > {self.min_price:g} 元 ｜ 20日均量 > {self.min_vol20:,.0f} 張 ｜ '
+             f'日均成交金額 > {self.min_amount / 1e4:,.0f} 萬元'),
+            ('② 趨勢多頭確認',
+             '收盤站穩季線(60MA)之上，且月線(20MA) > 季線(60MA)'),
+            ('③ 關鍵發動時機',
+             f'過去 {self.lookback} 日內：月季線黃金交叉 或 '
+             f'布林頻寬壓縮 ≤ {self.squeeze * 100:g}%'),
+            ('④ 強勢突破＋爆量',
+             f'收盤突破布林上軌 或 創 20 日新高，且當日量 ≥ 20 日均量 × '
+             f'{self.vol_ratio:g}'),
+        )
+
+    def changed(self) -> dict[str, tuple[float, float]]:
+        """和預設值不一樣的那幾項：``{欄位: (預設, 現在)}``。空的代表照預設跑。"""
+        base = Rules()
+        return {
+            f.name: (getattr(base, f.name), getattr(self, f.name))
+            for f in fields(self)
+            if getattr(base, f.name) != getattr(self, f.name)
+        }
+
+
+DEFAULT_RULES = Rules()
 
 
 # ===============================================================
@@ -645,13 +715,20 @@ def run(
     excel_url: str = '',
     index_copy: str = '',
     open_when_done: bool = False,
+    rules: Rules = DEFAULT_RULES,
 ) -> dict:
     """跑完一次全市場篩選，回傳 ``{'results', 'xlsx', 'html', 'index'}``。
 
-    參數只有三種：**跑多少**（``limit`` / ``workers`` / ``period``）、**產出什麼**
+    參數有四種：**跑多少**（``limit`` / ``workers`` / ``period``）、**產出什麼**
     （``make_excel`` / ``excel_charts`` / ``index_copy``）、**報告長什麼樣**
-    （``link_base`` / ``plotly_cdn`` / ``chart_years`` / ``excel_url``）。篩選規則
-    本身沒有參數——那是這支程式的定義，不是設定。
+    （``link_base`` / ``plotly_cdn`` / ``chart_years`` / ``excel_url``），以及
+    **門檻**（``rules``）。
+
+    最後那一種以前不存在。這裡原本寫的是「篩選規則本身沒有參數——那是這支程式
+    的定義，不是設定」，而那句話對了一半：窗口長度確實是定義（見 :class:`Rules`
+    的說明），門檻不是。門檻不能調的代價是，想知道「量比放寬到 1.1 會多出幾檔」
+    只能改原始碼跑一次再改回來——而改回來這一步漏掉一次，之後每天的報告都是用
+    一組沒有人記得改過的門檻跑出來的。
 
     ``period='2y'`` 而不是本機版的 ``'5y'``：所有指標裡窗口最長的是 60MA 加上
     Donchian 的 20 日位移，八十幾個交易日。兩年和五年算出來的最後一列一模一樣，
@@ -706,7 +783,9 @@ def run(
             price = float(close.iloc[-1])
             vol20 = float(volume.rolling(20).mean().iloc[-1])
             amt20 = float((close*volume).rolling(20).mean().iloc[-1])
-            if price <= 10 or vol20 <= 1000 or amt20 <= 50_000_000: return None
+            if (price <= rules.min_price or vol20 <= rules.min_vol20
+                    or amt20 <= rules.min_amount):
+                return None
 
             ma20 = close.rolling(20).mean()
             ma60 = close.rolling(60).mean()
@@ -714,13 +793,13 @@ def run(
                 return None
 
             boll_ma, boll_up, boll_dn, bw = compute_bollinger(close)
-            lookback = min(10, len(ma20)-1)
+            lookback = min(rules.lookback, len(ma20)-1)
             golden_cross = any(
                 float(ma20.iloc[-i]) > float(ma60.iloc[-i]) and
                 float(ma20.iloc[-i-1]) <= float(ma60.iloc[-i-1])
                 for i in range(1, lookback+1)
             )
-            squeeze = bool((bw.iloc[-lookback:] <= 0.12).any())
+            squeeze = bool((bw.iloc[-lookback:] <= rules.squeeze).any())
             if not (golden_cross or squeeze): return None
 
             donchian     = close.rolling(20).max().shift(1)
@@ -729,10 +808,10 @@ def run(
             if not (brk_boll or brk_donchian): return None
 
             vol_ratio = float(volume.iloc[-1]) / vol20
-            if vol_ratio < 1.2: return None
+            if vol_ratio < rules.vol_ratio: return None
 
             atr_val   = float(compute_atr(df).iloc[-1])
-            stop_loss = round(price - 3*atr_val, 2)
+            stop_loss = round(price - rules.atr_stop * atr_val, 2)
 
             trigger_parts = []
             if golden_cross:   trigger_parts.append('黃金交叉')
@@ -916,6 +995,17 @@ def run(
     print(f'📊 [2/3] 台股順勢交易系統 {VERSION} ── 嚴格四部曲篩選')
     print('='*60)
     print(f'掃描股票池：{len(TICKERS)} 檔  ｜  日期：{today_str}  ｜  歷史長度：{period}')
+    # 門檻印出來，而且改過的那幾項要看得出來是改過的。
+    #
+    # 一份報告最危險的狀態不是門檻錯，是「沒有人知道它是用哪一組門檻跑的」。
+    # 排程每天照預設跑，log 上就是一行「門檻：預設」；手動試一組新的，log 上
+    # 會逐項寫出「從什麼改成什麼」。
+    changed = rules.changed()
+    if changed:
+        bits = ', '.join(f'{k} {a:g}→{b:g}' for k, (a, b) in changed.items())
+        print(f'⚠️ 門檻：非預設（{bits}）')
+    else:
+        print('門檻：預設')
     print('-'*60)
 
     from concurrent.futures import ThreadPoolExecutor
@@ -1004,12 +1094,9 @@ def run(
         c.alignment = ALN_LC
         ws1.row_dimensions[5].height = 22
 
-        strat = [
-            ('① 基礎流動性防禦', '股價 > 10 元 ｜ 20日均量 > 1,000 張 ｜ 日均成交金額 > 5,000 萬元'),
-            ('② 趨勢多頭確認',   '收盤站穩季線(60MA)之上，且月線(20MA) > 季線(60MA)'),
-            ('③ 關鍵發動時機',   '過去 10 日內：月季線黃金交叉 或 布林頻寬壓縮 ≤ 12%'),
-            ('④ 強勢突破＋爆量', '收盤突破布林上軌 或 創 20 日新高，且當日量 ≥ 20 日均量 × 1.2'),
-        ]
+        # 這四行是從 `rules` 算出來的，不是另外寫死一份。門檻改了而說明沒改，
+        # 症狀是報告安靜地和自己不一致——而那比一個錯的數字更難發現。
+        strat = list(rules.describe())
         for i, (lbl, desc) in enumerate(strat, start=6):
             ws1.row_dimensions[i].height = 22
             c_l = ws1.cell(i, 2, lbl)
@@ -1036,7 +1123,8 @@ def run(
 
         rules = [
             ('進場時機', '訊號觸發後次一交易日，開盤直接以市價單敲進（切勿掛低價等待）。'),
-            ('初始停損', '停損 = 最新收盤價 − 3 × ATR(14)，進場後立即設定並固定不放寬。'),
+            ('初始停損', f'停損 = 最新收盤價 − {rules.atr_stop:g} × ATR(14)，'
+                          '進場後立即設定並固定不放寬。'),
             ('動態移停', '每日收盤後，可將停損單往上調整至當日最新 20MA 附近。'),
             ('終極出場', '當收盤價正式跌破當日 20MA 時，考慮全數出場鎖定波段獲利。'),
         ]
@@ -1392,6 +1480,11 @@ def run(
         'xlsx': OUTPUT_FILE,
         'html': html_path or '',
         'index': index_path,
+        # 這一趟用的是哪一組門檻。呼叫端（__main__）把「有沒有動過」寫進
+        # GITHUB_OUTPUT，讓 workflow 的摘要說得出來——不然「今天只有 3 檔通過」
+        # 和「今天有人把量比調到 3 倍」在畫面上長得一樣。
+        'rules': rules,
+        'rules_changed': rules.changed(),
     }
 
 

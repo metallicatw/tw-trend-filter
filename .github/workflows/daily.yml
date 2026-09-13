@@ -13,6 +13,42 @@ on:
         description: "只掃前 N 檔（留空 = 全市場）。用來快速驗證整條路走不走得通。"
         required: false
         default: ""
+      # ── 四部曲的門檻 ────────────────────────────────────────────────
+      #
+      # 留空就照程式裡的預設跑，所以**排程永遠是預設值**——這幾個輸入只在手動
+      # 觸發時有東西。這一點是刻意的：想試一組新門檻就按一次，不要讓它變成一個
+      # 藏在 workflow 裡、每天生效而沒有人記得的設定。
+      #
+      # 每一個的預設寫在 `tw_trend_filter.pipeline.Rules`，**這裡不重複寫**。
+      # 兩個地方各寫一份的話，改了一邊就會出現「說明寫 A、實際跑 B」，而那沒有
+      # 任何症狀（tw-six-metrics 的 yearly_limit 就是這樣多排了四個晚上）。
+      #
+      # 可調的是門檻，不是窗口長度（20MA／60MA／布林 20／Donchian 20／ATR 14）
+      # ——那些是這份報告的定義，Excel 欄名與 K 線圖圖例上到處都是。
+      min_price:
+        description: "① 股價下限，元（留空 = 10）"
+        required: false
+        default: ""
+      min_amount_m:
+        description: "① 20日均成交額下限，百萬元（留空 = 50）"
+        required: false
+        default: ""
+      lookback:
+        description: "③ 往回看幾個交易日找黃金交叉／壓縮（留空 = 10）"
+        required: false
+        default: ""
+      squeeze:
+        description: "③ 布林頻寬壓縮門檻，比例（留空 = 0.12，也就是 12%）"
+        required: false
+        default: ""
+      vol_ratio:
+        description: "④ 當日量 ÷ 20日均量的下限（留空 = 1.2）"
+        required: false
+        default: ""
+      atr_stop:
+        description: "停損 = 收盤 − 這個倍數 × ATR(14)（留空 = 3）"
+        required: false
+        default: ""
 
 # 同一時間只跑一個。手動觸發撞上排程的話，後來的那個等前一個做完——兩個一起跑
 # 會有兩份 index.html 搶著 commit，其中一個必然失敗。
@@ -58,13 +94,34 @@ jobs:
         id: screen
         env:
           LIMIT: ${{ github.event.inputs.limit || 0 }}
+          # 門檻一律走 env、一律可能是空字串，由下面的 shell 決定要不要加旗標。
+          # 空的就不加，讓 argparse 用 Rules 的預設——這樣「預設值」只有一個
+          # 地方寫，而那個地方是程式。
+          MIN_PRICE:    ${{ github.event.inputs.min_price }}
+          MIN_AMOUNT_M: ${{ github.event.inputs.min_amount_m }}
+          LOOKBACK:     ${{ github.event.inputs.lookback }}
+          SQUEEZE:      ${{ github.event.inputs.squeeze }}
+          VOL_RATIO:    ${{ github.event.inputs.vol_ratio }}
+          ATR_STOP:     ${{ github.event.inputs.atr_stop }}
         run: |
           set +e
+          # 用陣列組旗標，不是把字串串起來再交給 shell 重新切一次。
+          # 輸入是使用者打的，而 `$FLAGS` 沒有引號的話 `1.2; rm -rf /` 會被當成
+          # 兩個指令執行——上面那段「輸入走 env 不直接內插」防的是 `${{ }}`
+          # 在 shell 之前展開，這裡防的是展開之後再被 shell 切一次。
+          flags=()
+          [ -n "$MIN_PRICE" ]    && flags+=(--min-price    "$MIN_PRICE")
+          [ -n "$MIN_AMOUNT_M" ] && flags+=(--min-amount-m "$MIN_AMOUNT_M")
+          [ -n "$LOOKBACK" ]     && flags+=(--lookback     "$LOOKBACK")
+          [ -n "$SQUEEZE" ]      && flags+=(--squeeze      "$SQUEEZE")
+          [ -n "$VOL_RATIO" ]    && flags+=(--vol-ratio    "$VOL_RATIO")
+          [ -n "$ATR_STOP" ]     && flags+=(--atr-stop     "$ATR_STOP")
           python -m tw_trend_filter \
             --output-dir output \
             --index index.html \
             --link-base "https://metallicatw.github.io/tw-six-metrics/stock" \
-            --limit "$LIMIT"
+            --limit "$LIMIT" \
+            "${flags[@]}"
           code=$?
           set -e
           if [ "$code" -eq 2 ]; then
@@ -170,5 +227,7 @@ jobs:
             echo ""
             echo "* 掃描：${{ steps.screen.outputs.scanned }} 檔"
             echo "* 通過：**${{ steps.screen.outputs.count }}** 檔"
+            # 「今天只有 3 檔通過」和「今天有人把量比調到 3 倍」不該長得一樣。
+            echo "* 門檻：${{ steps.screen.outputs.rules || 'default' }}"
             echo "* Excel 報表在本頁下方的 Artifacts 區（保留 30 天）"
           } >> "$GITHUB_STEP_SUMMARY"

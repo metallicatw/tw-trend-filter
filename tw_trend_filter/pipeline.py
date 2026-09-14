@@ -1846,7 +1846,11 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base=''):
         const code = row[C.code], chg = row[C.chg], pct = row[C.chg_pct];
         const cls = chg > 0 ? 'up' : (chg < 0 ? 'dn' : 'fl');
         const sign = chg > 0 ? '▲ ' : (chg < 0 ? '▼ ' : '');
-        const drawn = Object.prototype.hasOwnProperty.call(TF_DRAWN, code);
+        // 「這一檔點下去有沒有圖」現在有兩個來源：數列嵌在這一頁上（TF_DRAWN
+        // ——排程當天過篩的那幾檔），或者這份報告附了圖表資料（TF_DATA），那
+        // 全市場每一檔都抓得到。後者才是常態，所以只看 TF_DRAWN 的話，放寬門檻
+        // 多出來的股票每一張卡片都會被標成「沒有圖」——而它們其實點得開。
+        const drawn = Object.prototype.hasOwnProperty.call(TF_DRAWN, code) || !!TF_DATA;
         const ext = TF_LINK
           ? '<a class="nb-ext" href="' + TF_LINK + '/' + code + '.html" target="_blank"' +
             ' rel="noopener" title="看這一檔的六大財務指標評等"' +
@@ -1912,20 +1916,20 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base=''):
 
       // 點一張卡片。
       //
-      // 今天過篩的那幾檔，圖已經嵌在這一頁上（TF_DRAWN），切過去就是。
-      // 其他每一檔各有一個自己的 <代號>.json，點下去才抓——所以放寬門檻多出來
-      // 的股票也看得到完整的 K 線圖，而這一頁不必背著 1,900 檔的 K 棒。
+      // 每一檔走的都是同一條路。今天過篩的那幾檔的數列已經嵌在這一頁上（
+      // tf-series），其他每一檔各有一個自己的 <代號>.json，點下去才抓——所以
+      // 放寬門檻多出來的股票也看得到一樣完整的 K 線圖，而這一頁不必背著
+      // 1,900 檔的 K 棒。
+      //
+      // 以前這裡分兩條：嵌過的叫 showChart() 去切一格早就畫好的圖，其他的叫
+      // tfFetchChart() 畫在另一格。那兩格長得不一樣——後者沒有徽章、沒有觸發
+      // 條件、沒有時間範圍按鈕、滑鼠移上去也沒有十字線。同一份報告裡，同一張圖
+      // 兩種待遇，而哪一種取決於「排程當天它有沒有過篩」，和讀者無關。
       function tfOpen(code) {{
         TF_CUR = code;
         const i = TF_HITS.findIndex(function (h) {{ return h[0][C.code] === code; }});
         tfMark(i);
         if (code === null) {{ tfNoChart(null); return false; }}
-        const at = TF_DRAWN[code];
-        if (at !== undefined) {{
-          tfHideNote();
-          if (typeof showChart === 'function') showChart(at);
-          return false;
-        }}
         tfFetchChart(code);
         return false;
       }}
@@ -1934,34 +1938,48 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base=''):
       //
       // 同一檔只抓一次（TF_CACHE）。抓的時候先說「載入中」——15 KB 在手機上
       // 也要一下子，而一片空白看起來像壞掉。
+      // 抓回來的是**數列**，不是一整張圖。
+      //
+      // 以前每一檔在 Pages 上是一份完整的 plotly 圖 JSON（約 240 KB）：日期那
+      // 六百多個字串被十一條 trace 各存了一份，customdata 又把每條數列原封不動
+      // 再存一次，然後同一套兩百行的樣式每一檔都帶一份。現在檔案裡只有數列，
+      // 樣式由頁面上那份共用的樣板提供（tfSeriesFig）——59 KB，gzip 之後 11.5 KB。
+      //
+      // 對讀者是點一檔股票下載 39 KB 變 11.5 KB；對排程是每天往 Pages 推的
+      // 那包從四百多 MB 變一百 MB。而且圖和頁面內嵌那幾張走的是同一條組裝路徑，
+      // 不可能長得不一樣。
       async function tfFetchChart(code) {{
-        if (!TF_DATA) {{ tfNoChart(code); return; }}
-        const host = document.getElementById('tf-plot');
-        tfShowPane(code, '載入 ' + code + ' 的走勢圖…');
-        let fig = TF_CACHE[code];
-        if (!fig) {{
-          try {{
-            const r = await fetch(TF_DATA + '/' + code + '.json', {{cache: 'force-cache'}});
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            fig = await r.json();
-            TF_CACHE[code] = fig;
-          }} catch (e) {{
-            // 換過股票了就不要把錯誤蓋在新的那一張上面。
-            if (TF_CUR === code) tfNoChart(code, e.message);
-            return;
+        // 今天過篩的那幾檔的數列本來就在頁面上——那些不必跑一趟網路。
+        let s = (typeof tfSeriesOf === 'function') ? tfSeriesOf(code) : null;
+        if (!s) {{
+          if (!TF_DATA) {{ tfNoChart(code); return; }}
+          tfShowPane(code, '載入 ' + code + ' 的走勢圖…');
+          s = TF_CACHE[code];
+          if (!s) {{
+            try {{
+              const r = await fetch(TF_DATA + '/' + code + '.json', {{cache: 'force-cache'}});
+              if (!r.ok) throw new Error('HTTP ' + r.status);
+              s = await r.json();
+              if (!s || !s.d || !s.d.length) throw new Error('這一檔的資料是空的');
+              TF_CACHE[code] = s;
+            }} catch (e) {{
+              // 換過股票了就不要把錯誤蓋在新的那一張上面。
+              if (TF_CUR === code) tfNoChart(code, e.message);
+              return;
+            }}
           }}
         }}
         if (TF_CUR !== code) return;      // 抓回來的時候使用者已經點了別檔
-        if (typeof Plotly === 'undefined') {{ tfNoChart(code, 'plotly.js 沒有載入'); return; }}
+        if (typeof tfDraw !== 'function') {{ tfNoChart(code, '圖表程式沒有載入'); return; }}
         tfShowPane(code, '');
-        try {{
-          Plotly.newPlot(host, fig.data, fig.layout,
-                         {{responsive: true, displayModeBar: false}});
-        }} catch (e) {{ tfNoChart(code, e.message); }}
+        tfDraw(code, s);
       }}
 
-      // 那一格是給「抓回來的圖」用的，和嵌進頁面的那幾張（.cw）分開——
-      // 共用的話，畫上去就會把原本那一檔的圖洗掉，切回去要重畫。
+      // 把圖表區露出來，順便把標題換成這一檔。
+      //
+      // 這一格是**唯一**的圖表區（見 build_interactive_html 裡 `chart_divs`
+      // 那一段）：徽章、觸發條件、時間範圍按鈕、貫穿上下圖的十字線都在它身上，
+      // 所以每一檔都拿得到同一套。
       function tfShowPane(code, msg) {{
         const col = document.getElementById('chartcol');
         const pane = document.getElementById('tf-pane');
@@ -2062,6 +2080,352 @@ def _snap_note(snapshots):
     return f'{len(snapshots):,} 檔的當日指標'
 
 
+def _script_json(el_id, payload):
+    """把一份資料包成 ``<script type="application/json">``。
+
+    ``</`` 一定要轉義：JSON 裡只要出現 `</script>` 這六個字（例如某檔股票的名字
+    裡有，或者 hovertemplate 的 HTML 片段裡有），瀏覽器的 HTML 剖析器會在那裡把
+    script 關掉——而剩下的 JSON 就變成畫面上的一坨文字。`<\\/` 在 JSON 裡和 `</`
+    是同一個字串，在 HTML 剖析器眼裡不是。
+    """
+    import json as _json
+
+    body = _json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+    return ('<script type="application/json" id="' + el_id + '">'
+            + body.replace('</', '<\\/') + '</script>')
+
+
+#: 一檔股票壓給前端畫圖用的那份資料，欄位順序就是這裡。
+#:
+#: 這一份取代了原本每一檔一整包 plotly 圖 JSON（約 240 KB）。差別在哪：
+#:
+#: * 圖 JSON 裡日期那 634 個字串被十一條 trace 各存了一份，customdata 又把每一
+#:   條數列原封不動再存一次——同一批數字在同一個檔案裡出現十幾遍。
+#: * 這一份每條數列只出現一次，日期只出現一次，customdata 由瀏覽器現組。
+#:
+#: 量出來 240 KB → 59 KB（gzip 39 KB → 11.5 KB）。全市場 1,900 檔的話，是每天
+#: 往 Pages 推 400 MB 還是 100 MB 的差別；對讀者則是點一檔股票下載 39 KB 還是
+#: 11.5 KB。
+#:
+#: **指標不在前端算。** 20MA／60MA／布林／均量全部照舊由 Python 在**完整**歷史
+#: 上算完才裁（見 screen_stock），裁完的頭幾根仍然帶著視窗以前的資料——前端重算
+#: 的話那一段會變成一截 NaN，而且瀏覽器要再實作一次 pandas 的 rolling std
+#: （ddof=1，不是母體標準差）。省下來的那 28 KB 不值得換一份會悄悄長得不一樣的
+#: 數字。
+SERIES_ARRAYS = ('o', 'h', 'l', 'c', 'm20', 'm60', 'bu', 'bm', 'bd',
+                 'vl', 'vm', 'vr')
+
+
+def _chart_series(res, keep_rows, sf):
+    """把一檔股票壓成「畫那張圖需要的最小一份資料」。
+
+    ``sf`` 是 build_interactive_html 裡那個「轉不出數字就回 None」的轉換器——
+    傳進來而不是在這裡再寫一次，因為 None 與 0.0 的差別（缺一根 K 棒 vs 憑空
+    發明一次崩盤）只該有一個地方決定。
+    """
+    df = res['_df'].copy()
+    # 指標是在完整歷史上算完的（見 screen_stock），這裡才裁——先裁再算會讓最前面
+    # 60 根 K 棒的 60MA 變成 NaN，圖上就是一截斷掉的線。
+    if keep_rows and len(df) > keep_rows:
+        df = df.iloc[-keep_rows:]
+    ma20 = res['_ma20'].reindex(df.index).ffill().bfill()
+    ma60 = res['_ma60'].reindex(df.index).ffill().bfill()
+    bup = res['_boll_up'].reindex(df.index).ffill().bfill()
+    bmid = res['_boll_mid'].reindex(df.index).ffill().bfill()
+    bdn = res['_boll_dn'].reindex(df.index).ffill().bfill()
+    vol = (df['Volume'] / 1000).round(0)
+    vmean = vol.rolling(20).mean().ffill().bfill()
+    vratio = (vol / vmean).round(2)
+
+    def arr(series, d=2):
+        return [sf(v, d) for v in series]
+
+    return {
+        'code': res['code'],
+        'name': res.get('name', ''),
+        'd': df.index.strftime('%Y-%m-%d').tolist(),
+        'o': arr(df['Open']), 'h': arr(df['High']),
+        'l': arr(df['Low']), 'c': arr(df['Close']),
+        'm20': arr(ma20), 'm60': arr(ma60),
+        'bu': arr(bup), 'bm': arr(bmid), 'bd': arr(bdn),
+        'vl': arr(vol, 0), 'vm': arr(vmean, 0), 'vr': arr(vratio),
+        'stop': sf(res['stop_loss']),
+        'ma20_last': sf(res['ma20_last']),
+        'ma60_last': sf(res['ma60_last']),
+    }
+
+
+def _chart_figure(s):
+    """從 :func:`_chart_series` 的輸出組出那張 plotly 圖。
+
+    ## 為什麼這支函式要單獨存在
+
+    它是這張圖**樣式的唯一出處**——軌道顏色、停損線的虛線樣式、兩條隱形的
+    hover 軌、圖例的 ``yanchor``、上下兩張子圖的高度比、Y 軸視窗……兩百行。
+
+    前端不重寫這兩百行。它拿的是這支函式**用一份空資料**跑出來的結果（見
+    :func:`chart_template`），也就是一張「什麼都畫好了、只是沒有數字」的圖，
+    然後把數列填進去。所以樣式改這裡一個地方，兩種圖（頁面內嵌的、點下去才抓
+    的）一起改，不可能分岔。
+
+    而「填進去」這件事對不對，由 tests/test_chart_js.py 直接比對：同一份
+    series，Python 走這支、JS 走 tfSeriesFig()，兩邊的 trace 逐一相等。
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    BG = '#0d1117'; AXES = '#161b22'; GRID = '#30363d'; TEXT = '#c9d1d9'
+    MA20C = '#f0c27f'; MA60C = '#ff7b72'; BBC = '#58a6ff'; STOPC = '#ff4500'
+    VUP = '#3fb950'; VDN = '#f85149'; VMAC = '#ffa657'
+
+    dates = s['d']
+    o_l, h_l, l_l, c_l = s['o'], s['h'], s['l'], s['c']
+    m20, m60 = s['m20'], s['m60']
+    bu, bm, bd = s['bu'], s['bm'], s['bd']
+    vl, vm, vr = s['vl'], s['vm'], s['vr']
+    stop = s['stop']
+    N = len(dates)
+
+    # customdata：[日期, 開, 高, 低, 收, 20MA, 60MA, BB上, BB中, BB下, 量, 均量, 量比]
+    cd = [[dates[i], o_l[i], h_l[i], l_l[i], c_l[i],
+           m20[i], m60[i], bu[i], bm[i], bd[i],
+           vl[i], vm[i], vr[i]] for i in range(N)]
+    cd_v = [[dates[i], vl[i], vm[i], vr[i]] for i in range(N)]
+
+    htpl = (
+        '<b style="font-size:13px">%{customdata[0]}</b><br>'
+        '<span style="color:#8b949e">─────────────────────</span><br>'
+        '開 <b>%{customdata[1]:.2f}</b> '
+        '高 <b style="color:#3fb950">%{customdata[2]:.2f}</b> '
+        '低 <b style="color:#f85149">%{customdata[3]:.2f}</b> '
+        '收 <b style="color:#58a6ff">%{customdata[4]:.2f}</b><br>'
+        '<span style="color:#f0c27f">20MA&nbsp;%{customdata[5]:.2f}</span>&nbsp;'
+        '<span style="color:#ff7b72">60MA&nbsp;%{customdata[6]:.2f}</span><br>'
+        '布林上&nbsp;%{customdata[7]:.2f}&nbsp;'
+        '中&nbsp;%{customdata[8]:.2f}&nbsp;'
+        '下&nbsp;%{customdata[9]:.2f}<br>'
+        '<span style="color:#8b949e">─────────────────────</span><br>'
+        '<span style="color:#3fb950">成交量 %{customdata[10]:,.0f} 張</span>  '
+        '均量 %{customdata[11]:,.0f} 張  '
+        '<span style="color:#ffa657">量比&nbsp;%{customdata[12]:.2f}x</span>'
+        '<extra></extra>'
+    )
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.68, 0.32], vertical_spacing=0.03)
+
+    # ① BB 上軌（先加，作為 tonexty 的填色目標）
+    fig.add_trace(go.Scatter(
+        x=dates, y=bu, mode='lines', name='布林上軌',
+        line=dict(color=BBC, width=1.2, dash='dot'),
+        showlegend=True, hoverinfo='skip',
+    ), row=1, col=1)
+
+    # ② BB 下軌 + tonexty 填色（填向上一條同軸 trace）
+    fig.add_trace(go.Scatter(
+        x=dates, y=bd, mode='lines', name='布林下軌',
+        line=dict(color=BBC, width=1.2, dash='dot'),
+        fill='tonexty', fillcolor='rgba(88,166,255,0.08)',
+        showlegend=False, hoverinfo='skip',
+    ), row=1, col=1)
+
+    # ③ BB 中軌
+    fig.add_trace(go.Scatter(x=dates, y=bm, mode='lines', name='布林中軌',
+        line=dict(color='#8b949e', width=0.8, dash='dot'),
+        showlegend=False, hoverinfo='skip'), row=1, col=1)
+
+    # ④ K 棒
+    fig.add_trace(go.Candlestick(
+        x=dates, open=o_l, high=h_l, low=l_l, close=c_l,
+        increasing_line_color=VUP, decreasing_line_color=VDN,
+        increasing_fillcolor=VUP,  decreasing_fillcolor=VDN,
+        name='K棒', showlegend=True,
+        hoverinfo='skip', line=dict(width=1),
+    ), row=1, col=1)
+
+    # ⑤ 20MA
+    #
+    # 圖例上帶著**目前的數值**。原本這三個數字（20MA／60MA／停損）在圖表
+    # 上方另外排一排徽章，而圖例就在它們正下方幾十個像素的地方——同一個
+    # 數字在同一個畫面上出現兩次，讀者要先確認那是不是同一件事。
+    #
+    # 併到圖例是因為圖例本來就帶著顏色：看到「20MA 月線 50.55」旁邊那條
+    # 橘線，就知道圖上那條橘線現在在 50.55。徽章沒有這個連結。
+    fig.add_trace(go.Scatter(x=dates, y=m20, mode='lines',
+        name='20MA 月線 {:.2f}'.format(s['ma20_last'] or 0.0),
+        line=dict(color=MA20C, width=2.0),
+        showlegend=True, hoverinfo='skip'), row=1, col=1)
+
+    # ⑥ 60MA
+    fig.add_trace(go.Scatter(x=dates, y=m60, mode='lines',
+        name='60MA 季線 {:.2f}'.format(s['ma60_last'] or 0.0),
+        line=dict(color=MA60C, width=2.0, dash='dash'),
+        showlegend=True, hoverinfo='skip'), row=1, col=1)
+
+    # ⑦ 停損線
+    fig.add_trace(go.Scatter(
+        x=[dates[0], dates[-1]] if N else [], y=[stop, stop] if N else [],
+        mode='lines', name='建議停損 {:.2f}'.format(stop or 0.0),
+        line=dict(color=STOPC, width=1.5, dash='dashdot'),
+        showlegend=True, hoverinfo='skip'), row=1, col=1)
+
+    # ⑧ 成交量 Bar
+    vcols = [VUP if (c_l[i] or 0) >= (o_l[i] or 0) else VDN for i in range(N)]
+    fig.add_trace(go.Bar(x=dates, y=vl, name='成交量(張)',
+        marker_color=vcols, opacity=0.85, showlegend=True,
+        hoverinfo='skip'), row=2, col=1)
+
+    # ⑨ 均量線
+    fig.add_trace(go.Scatter(x=dates, y=vm, mode='lines', name='20日均量',
+        line=dict(color=VMAC, width=1.5),
+        showlegend=True, hoverinfo='skip'), row=2, col=1)
+
+    # ⑩ 價格 invisible scatter（承載 hover tooltip）
+    fig.add_trace(go.Scatter(
+        x=dates, y=c_l, mode='markers',
+        marker=dict(opacity=0, size=14, color='rgba(0,0,0,0)'),
+        customdata=cd, hovertemplate=htpl,
+        showlegend=False, name='__hover_price__',
+    ), row=1, col=1)
+
+    # ⑪ 量圖 invisible scatter（讓量圖也有 spike + tooltip 貫穿）
+    htpl_v = ('成交量 <b style="color:#3fb950">%{customdata[1]:,.0f}</b> 張&nbsp;&nbsp;'
+              '均量 %{customdata[2]:,.0f} 張&nbsp;&nbsp;'
+              '<span style="color:#ffa657">量比 %{customdata[3]:.2f}x</span>'
+              '<extra></extra>')
+    fig.add_trace(go.Scatter(
+        x=dates, y=vl, mode='markers',
+        marker=dict(opacity=0, size=14, color='rgba(0,0,0,0)'),
+        customdata=cd_v, hovertemplate=htpl_v,
+        showlegend=False, name='__hover_vol__',
+    ), row=2, col=1)
+
+    # ── Layout（用 update_xaxes 避免覆蓋 make_subplots 內部的 matches 配置）──
+    # 注意：不在 update_xaxes 設 type='date'，避免與 xaxis2.matches='x' 衝突
+    # plotly 會從 x 資料（YYYY-MM-DD 字串）自動偵測為 date 軸
+    # 註：垂直十字線改由前端 JS（plotly_hover / plotly_unhover）以 shape 手動繪製，
+    # 使其能真正貫穿上（K棒）下（成交量）兩張子圖；此處停用 plotly 原生 x 軸 spike，
+    # 避免原生 spike（僅侷限於單一子圖繪圖區）與自繪十字線重疊顯示。
+    fig.update_xaxes(
+        showspikes=False,
+        gridcolor=GRID, gridwidth=0.5, tickfont=dict(color=TEXT),
+        showgrid=True,
+    )
+    fig.update_yaxes(
+        showspikes=True, spikecolor='#8b949e', spikethickness=1,
+        spikedash='dot', gridcolor=GRID, gridwidth=0.5,
+        tickfont=dict(color=TEXT), zeroline=False,
+    )
+    # rangeslider 也用 update_xaxes 停用，避免 update_layout shorthand 的副作用
+    fig.update_xaxes(rangeslider_visible=False)
+    fig.update_layout(
+        paper_bgcolor=BG, plot_bgcolor=AXES,
+        font=dict(family='Microsoft JhengHei, Arial', color=TEXT, size=12),
+        hovermode='x unified',
+        hoverlabel=dict(bgcolor='rgba(13,17,23,0.95)', bordercolor='#444',
+                        font=dict(color=TEXT, size=12,
+                                  family='Microsoft JhengHei, Arial'),
+                        align='left', namelength=0),
+        # `yanchor='bottom'` 是這裡唯一重要的一個字。
+        #
+        # 沒寫的時候 plotly 用 'auto'，而 auto 對 y>2/3 的解讀是 'top'——
+        # 圖例的**上緣**釘在 y=1.02，整塊往**下**長，於是它蓋在 K 線圖最上面
+        # 那一段上。改成 'bottom' 就是下緣釘在那裡、往上長，離開繪圖區。
+        #
+        # 然後上留白要夠：圖例一行約 22px，加上 y=1.015 那 1.5% 的間隙，
+        # 46px 不夠，會被裁掉一半。
+        legend=dict(orientation='h', x=0.5, xanchor='center',
+                    y=1.015, yanchor='bottom',
+                    bgcolor='rgba(22,27,34,0.9)', bordercolor=GRID,
+                    borderwidth=1, font=dict(size=11)),
+        margin=dict(t=72, b=26, l=64, r=26),
+        height=760, dragmode='pan',
+        autosize=True,
+    )
+    fig.update_yaxes(title_text='價格 (元)',  row=1, col=1,
+                     title_font=dict(color='#8b949e', size=11))
+    fig.update_yaxes(title_text='成交量(張)', row=2, col=1,
+                     title_font=dict(color='#8b949e', size=11))
+
+    # ── 預設視窗（近三個月）連同它的 Y 軸範圍，直接寫進圖裡 ────────
+    #
+    # 原本這件事是前端做的：畫完圖之後模擬點一下「3月」那顆按鈕 → 一次
+    # relayout 改 X 範圍 → 觸發 plotly_relayout → 算出 Y 範圍 → 再一次
+    # relayout。加上 fitPlotSize 那一次，切換一檔股票要跑**三次**完整
+    # relayout，而每一次 relayout 都會把五百根 K 棒重畫一遍（candlestick
+    # 的每一根都是一條 path，這是整張圖最貴的部分）。
+    #
+    # 這些數字在產生報告的時候就全部算得出來，算一次寫進 JSON，前端
+    # newPlot 出來就已經是對的，三次 relayout 變成零次。
+    if N:
+        lo, hi, vhi = _chart_window(s)
+        fig.update_layout(
+            xaxis2=dict(range=[dates[max(0, N - 63)], dates[-1]]),
+            yaxis=dict(range=[lo, hi], autorange=False),
+            yaxis2=dict(range=[0, vhi], autorange=False),
+        )
+    return fig
+
+
+def _chart_window(s):
+    """近三個月那個預設視窗的 Y 軸範圍：``(下緣, 上緣, 量圖上緣)``。
+
+    單獨抽出來是因為前端也要算同一組數字（樣板裡的 range 是空資料算出來的，
+    填了數列之後得重算）。兩邊的公式必須一致，而「一致」這件事由
+    tests/test_chart_js.py 盯著。
+    """
+    N = len(s['d'])
+    d_from = max(0, N - 63)
+    stop = s['stop']
+    win_v = [v for v in s['vl'][d_from:] if v is not None]
+    win_hi = max([v for v in s['h'][d_from:] if v is not None] +
+                 [v for v in s['bu'][d_from:] if v is not None] or [1.0])
+    win_lo = min([v for v in s['l'][d_from:] if v is not None] +
+                 [v for v in s['bd'][d_from:] if v is not None] +
+                 ([stop] if stop is not None else []) or [0.0])
+    pad = (win_hi - win_lo) * 0.06 or (abs(win_hi) or 1.0) * 0.05
+    return win_lo - pad, win_hi + pad, (max(win_v) if win_v else 1.0) * 1.12
+
+
+def chart_template():
+    """那張圖「什麼都畫好了、只是沒有數字」的樣子，給前端填。
+
+    做法是拿 :func:`_chart_figure` 跑一份**只有兩根 K 棒**的假資料，再把每一條
+    trace 的數列清空。為什麼不手寫一份樣板：手寫的那一份會和 `_chart_figure`
+    分岔，而分岔的症狀是「有些股票的圖長得不一樣」——沒有錯誤訊息。
+
+    兩根而不是零根：plotly 的 make_subplots 與 candlestick 在完全沒有資料時
+    某些欄位（例如軸的型別推斷）不會被寫進 JSON，樣板就少了那幾個鍵。
+    """
+    import json as _json
+    import plotly.io as pio
+
+    blank = {
+        'code': '', 'name': '',
+        'd': ['2000-01-03', '2000-01-04'],
+        'stop': 0.0, 'ma20_last': 0.0, 'ma60_last': 0.0,
+    }
+    for k in SERIES_ARRAYS:
+        blank[k] = [0.0, 0.0]
+    fig = _json.loads(pio.to_json(_chart_figure(blank)))
+    for tr in fig['data']:
+        for key in ('x', 'y', 'open', 'high', 'low', 'close', 'customdata'):
+            if key in tr:
+                tr[key] = []
+        if isinstance(tr.get('marker'), dict) and isinstance(
+                tr['marker'].get('color'), list):
+            tr['marker']['color'] = []
+    # 三個預設視窗的範圍也要清掉。它們是拿那兩根假 K 棒算出來的，留著的話每一張
+    # 圖在前端把它們蓋掉之前都會先用那組範圍畫一次——而 `tfSeriesFig` 萬一哪天
+    # 漏掉其中一個軸，症狀就是那個軸卡在 2000 年 1 月、或者 Y 軸貼著 0。
+    # 清成 None，漏掉的那一個會變成 plotly 自己 autorange，錯得看得出來。
+    for axis in ('xaxis', 'xaxis2', 'yaxis', 'yaxis2'):
+        if axis in fig.get('layout', {}):
+            fig['layout'][axis].pop('range', None)
+            fig['layout'][axis].pop('autorange', None)
+    return fig
+
+
 def build_interactive_html(results, today_str, output_dir, now=None, *,
                            link_base='', plotly_cdn=True, chart_years=2.0,
                            excel_url='', rules=None, snapshots=None,
@@ -2079,11 +2443,12 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
       挑出來的標的，下一個問題一定是「這家公司體質怎麼樣」，而那個答案就在
       隔壁那個網站上。
     """
+    # 這裡仍然要 import 一次 plotly，即使這支函式自己已經不畫圖了：`chart_template()`
+    # 會用到它，而 plotly 沒裝的時候該說的話是「跳過互動線圖」，不是在頁面組到
+    # 一半的時候噴一個 ImportError。
     try:
-        import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
-        import plotly.io as pio
-        import json as _json, re as _re, math as _math
+        import plotly.io  # noqa: F401  （只是確認裝得起來）
+        import json as _json, math as _math
     except ImportError:
         print('plotly 未安裝，跳過互動線圖'); return None
     if not results: return None
@@ -2099,10 +2464,6 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
             'build_interactive_html 需要 rules 與 snapshots：側欄那排卡片是從'
             '快照畫出來的，少了它們會產出一份沒有側欄的報告'
         )
-
-    BG='#0d1117'; AXES='#161b22'; GRID='#30363d'; TEXT='#c9d1d9'
-    MA20C='#f0c27f'; MA60C='#ff7b72'; BBC='#58a6ff'; STOPC='#ff4500'
-    VUP='#3fb950'; VDN='#f85149'; VMAC='#ffa657'
 
     def sf(v, d=2):
         """數字轉成可以放進 JSON 的形式；轉不出來就回 None。
@@ -2157,15 +2518,16 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
     #: 所以多留半年的緩衝。
     keep_rows = int(chart_years * 252) + 130 if chart_years else 0
 
-    stock_infos  = []
-    fig_json_tags = []
 
-    # 今天過篩的那幾檔嵌進這一頁；其餘每一檔各寫一個檔案，網頁點下去才抓。
+    stock_infos  = []
+
+    # 今天過篩的那幾檔，畫圖要的資料嵌進這一頁；其餘每一檔各寫一個檔案，網頁點
+    # 下去才抓。兩邊裝的是**同一種東西**（`_chart_series` 的輸出），差別只在
+    # 「已經在頁面上」還是「在 Pages 上等著被抓」。
     #
-    # 為什麼合成同一個迴圈而不是另寫一支：兩份圖必須**一模一樣**。圖的樣式有
-    # 兩百行（軌道顏色、停損線、兩條 hover 軌、Y 軸視窗、rangeselector…），
-    # 複製一份出去之後，改了其中一邊的人不會知道另一邊也要改，而症狀是「有些
-    # 股票的圖長得不一樣」——沒有錯誤訊息。
+    # 圖本身兩邊也是同一張：樣板由 `chart_template()` 產生一次嵌進頁面，前端把
+    # 數列填進去。所以樣式只有 `_chart_figure` 一個出處，不可能分岔——原本那句
+    # 「兩份圖必須一模一樣」的擔心，現在是結構上做不到不一樣。
     extra_list = list((extra_charts or {}).values()) if isinstance(extra_charts, dict) \
         else list(extra_charts or [])
     # 已經嵌在頁面上的那幾檔不必再寫一次檔案。
@@ -2176,218 +2538,10 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
     else:
         os.makedirs(data_dir, exist_ok=True)
     written = 0
+    series_map = {}
 
     for idx, res in enumerate(list(results) + extra_list):
-        df    = res['_df'].copy()          # 由 rangeselector 控制顯示範圍
-        # 指標是在完整歷史上算完的（見 screen_stock），這裡才裁——先裁再算會讓
-        # 最前面 60 根 K 棒的 60MA 變成 NaN，圖上就是一截斷掉的線。
-        if keep_rows and len(df) > keep_rows:
-            df = df.iloc[-keep_rows:]
-        ma20  = res['_ma20'].reindex(df.index).ffill().bfill()
-        ma60  = res['_ma60'].reindex(df.index).ffill().bfill()
-        bup   = res['_boll_up'].reindex(df.index).ffill().bfill()
-        bmid  = res['_boll_mid'].reindex(df.index).ffill().bfill()
-        bdn   = res['_boll_dn'].reindex(df.index).ffill().bfill()
-        vol   = (df['Volume'] / 1000).round(0)
-        vmean = vol.rolling(20).mean().ffill().bfill()
-        vratio= (vol / vmean).round(2)
-        dates = df.index.strftime('%Y-%m-%d').tolist()
-        stop  = res['stop_loss']
-        N     = len(dates)
-
-        o_l=[sf(v) for v in df['Open']];   h_l=[sf(v) for v in df['High']]
-        l_l=[sf(v) for v in df['Low']];    c_l=[sf(v) for v in df['Close']]
-        m20=[sf(v) for v in ma20];         m60=[sf(v) for v in ma60]
-        bu =[sf(v) for v in bup];          bm =[sf(v) for v in bmid]
-        bd =[sf(v) for v in bdn];          vl =[sf(v,0) for v in vol]
-        vm =[sf(v,0) for v in vmean];      vr =[sf(v) for v in vratio]
-
-        # customdata：[日期, 開, 高, 低, 收, 20MA, 60MA, BB上, BB中, BB下, 量, 均量, 量比]
-        cd = [[dates[i],o_l[i],h_l[i],l_l[i],c_l[i],
-               m20[i],m60[i],bu[i],bm[i],bd[i],
-               vl[i],vm[i],vr[i]] for i in range(N)]
-        cd_v = [[dates[i],vl[i],vm[i],vr[i]] for i in range(N)]
-
-        htpl = (
-            '<b style="font-size:13px">%{customdata[0]}</b><br>'
-            '<span style="color:#8b949e">─────────────────────</span><br>'
-            '開 <b>%{customdata[1]:.2f}</b> '
-            '高 <b style="color:#3fb950">%{customdata[2]:.2f}</b> '
-            '低 <b style="color:#f85149">%{customdata[3]:.2f}</b> '
-            '收 <b style="color:#58a6ff">%{customdata[4]:.2f}</b><br>'
-            '<span style="color:#f0c27f">20MA&nbsp;%{customdata[5]:.2f}</span>&nbsp;'
-            '<span style="color:#ff7b72">60MA&nbsp;%{customdata[6]:.2f}</span><br>'
-            '布林上&nbsp;%{customdata[7]:.2f}&nbsp;'
-            '中&nbsp;%{customdata[8]:.2f}&nbsp;'
-            '下&nbsp;%{customdata[9]:.2f}<br>'
-            '<span style="color:#8b949e">─────────────────────</span><br>'
-            '<span style="color:#3fb950">成交量 %{customdata[10]:,.0f} 張</span>  '
-            '均量 %{customdata[11]:,.0f} 張  '
-            '<span style="color:#ffa657">量比&nbsp;%{customdata[12]:.2f}x</span>'
-            '<extra></extra>'
-        )
-
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                            row_heights=[0.68, 0.32], vertical_spacing=0.03)
-
-        # ① BB 上軌（先加，作為 tonexty 的填色目標）
-        fig.add_trace(go.Scatter(
-            x=dates, y=bu, mode='lines', name='布林上軌',
-            line=dict(color=BBC, width=1.2, dash='dot'),
-            showlegend=True, hoverinfo='skip',
-        ), row=1, col=1)
-
-        # ② BB 下軌 + tonexty 填色（填向上一條同軸 trace）
-        fig.add_trace(go.Scatter(
-            x=dates, y=bd, mode='lines', name='布林下軌',
-            line=dict(color=BBC, width=1.2, dash='dot'),
-            fill='tonexty', fillcolor='rgba(88,166,255,0.08)',
-            showlegend=False, hoverinfo='skip',
-        ), row=1, col=1)
-
-        # ③ BB 中軌
-        fig.add_trace(go.Scatter(x=dates, y=bm, mode='lines', name='布林中軌',
-            line=dict(color='#8b949e', width=0.8, dash='dot'),
-            showlegend=False, hoverinfo='skip'), row=1, col=1)
-
-        # ④ K 棒
-        fig.add_trace(go.Candlestick(
-            x=dates, open=o_l, high=h_l, low=l_l, close=c_l,
-            increasing_line_color=VUP, decreasing_line_color=VDN,
-            increasing_fillcolor=VUP,  decreasing_fillcolor=VDN,
-            name='K棒', showlegend=True,
-            hoverinfo='skip', line=dict(width=1),
-        ), row=1, col=1)
-
-        # ⑤ 20MA
-        #
-        # 圖例上帶著**目前的數值**。原本這三個數字（20MA／60MA／停損）在圖表
-        # 上方另外排一排徽章，而圖例就在它們正下方幾十個像素的地方——同一個
-        # 數字在同一個畫面上出現兩次，讀者要先確認那是不是同一件事。
-        #
-        # 併到圖例是因為圖例本來就帶著顏色：看到「20MA 月線 50.55」旁邊那條
-        # 橘線，就知道圖上那條橘線現在在 50.55。徽章沒有這個連結。
-        fig.add_trace(go.Scatter(x=dates, y=m20, mode='lines',
-            name='20MA 月線 {:.2f}'.format(res['ma20_last']),
-            line=dict(color=MA20C, width=2.0),
-            showlegend=True, hoverinfo='skip'), row=1, col=1)
-
-        # ⑥ 60MA
-        fig.add_trace(go.Scatter(x=dates, y=m60, mode='lines',
-            name='60MA 季線 {:.2f}'.format(res['ma60_last']),
-            line=dict(color=MA60C, width=2.0, dash='dash'),
-            showlegend=True, hoverinfo='skip'), row=1, col=1)
-
-        # ⑦ 停損線
-        fig.add_trace(go.Scatter(
-            x=[dates[0], dates[-1]], y=[stop, stop],
-            mode='lines', name='建議停損 {:.2f}'.format(stop),
-            line=dict(color=STOPC, width=1.5, dash='dashdot'),
-            showlegend=True, hoverinfo='skip'), row=1, col=1)
-
-        # ⑧ 成交量 Bar
-        vcols=[VUP if c_l[i]>=o_l[i] else VDN for i in range(N)]
-        fig.add_trace(go.Bar(x=dates, y=vl, name='成交量(張)',
-            marker_color=vcols, opacity=0.85, showlegend=True,
-            hoverinfo='skip'), row=2, col=1)
-
-        # ⑨ 均量線
-        fig.add_trace(go.Scatter(x=dates, y=vm, mode='lines', name='20日均量',
-            line=dict(color=VMAC, width=1.5),
-            showlegend=True, hoverinfo='skip'), row=2, col=1)
-
-        # ⑩ 價格 invisible scatter（承載 hover tooltip）
-        fig.add_trace(go.Scatter(
-            x=dates, y=c_l, mode='markers',
-            marker=dict(opacity=0, size=14, color='rgba(0,0,0,0)'),
-            customdata=cd, hovertemplate=htpl,
-            showlegend=False, name='__hover_price__',
-        ), row=1, col=1)
-
-        # ⑪ 量圖 invisible scatter（讓量圖也有 spike + tooltip 貫穿）
-        htpl_v = ('成交量 <b style="color:#3fb950">%{customdata[1]:,.0f}</b> 張&nbsp;&nbsp;'
-                  '均量 %{customdata[2]:,.0f} 張&nbsp;&nbsp;'
-                  '<span style="color:#ffa657">量比 %{customdata[3]:.2f}x</span>'
-                  '<extra></extra>')
-        fig.add_trace(go.Scatter(
-            x=dates, y=vl, mode='markers',
-            marker=dict(opacity=0, size=14, color='rgba(0,0,0,0)'),
-            customdata=cd_v, hovertemplate=htpl_v,
-            showlegend=False, name='__hover_vol__',
-        ), row=2, col=1)
-
-        # ── Layout（用 update_xaxes 避免覆蓋 make_subplots 內部的 matches 配置）──
-        # 注意：不在 update_xaxes 設 type='date'，避免與 xaxis2.matches='x' 衝突
-        # plotly 會從 x 資料（YYYY-MM-DD 字串）自動偵測為 date 軸
-        # 註：垂直十字線改由前端 JS（plotly_hover / plotly_unhover）以 shape 手動繪製，
-        # 使其能真正貫穿上（K棒）下（成交量）兩張子圖；此處停用 plotly 原生 x 軸 spike，
-        # 避免原生 spike（僅侷限於單一子圖繪圖區）與自繪十字線重疊顯示。
-        fig.update_xaxes(
-            showspikes=False,
-            gridcolor=GRID, gridwidth=0.5, tickfont=dict(color=TEXT),
-            showgrid=True,
-        )
-        fig.update_yaxes(
-            showspikes=True, spikecolor='#8b949e', spikethickness=1,
-            spikedash='dot', gridcolor=GRID, gridwidth=0.5,
-            tickfont=dict(color=TEXT), zeroline=False,
-        )
-        # rangeslider 也用 update_xaxes 停用，避免 update_layout shorthand 的副作用
-        fig.update_xaxes(rangeslider_visible=False)
-        fig.update_layout(
-            paper_bgcolor=BG, plot_bgcolor=AXES,
-            font=dict(family='Microsoft JhengHei, Arial', color=TEXT, size=12),
-            hovermode='x unified',
-            hoverlabel=dict(bgcolor='rgba(13,17,23,0.95)', bordercolor='#444',
-                            font=dict(color=TEXT, size=12,
-                                      family='Microsoft JhengHei, Arial'),
-                            align='left', namelength=0),
-            # `yanchor='bottom'` 是這裡唯一重要的一個字。
-            #
-            # 沒寫的時候 plotly 用 'auto'，而 auto 對 y>2/3 的解讀是 'top'——
-            # 圖例的**上緣**釘在 y=1.02，整塊往**下**長，於是它蓋在 K 線圖最上面
-            # 那一段上。改成 'bottom' 就是下緣釘在那裡、往上長，離開繪圖區。
-            #
-            # 然後上留白要夠：圖例一行約 22px，加上 y=1.015 那 1.5% 的間隙，
-            # 46px 不夠，會被裁掉一半。
-            legend=dict(orientation='h', x=0.5, xanchor='center',
-                        y=1.015, yanchor='bottom',
-                        bgcolor='rgba(22,27,34,0.9)', bordercolor=GRID,
-                        borderwidth=1, font=dict(size=11)),
-            margin=dict(t=72, b=26, l=64, r=26),
-            height=760, dragmode='pan',
-            autosize=True,
-        )
-        fig.update_yaxes(title_text='價格 (元)',  row=1, col=1,
-                         title_font=dict(color='#8b949e', size=11))
-        fig.update_yaxes(title_text='成交量(張)', row=2, col=1,
-                         title_font=dict(color='#8b949e', size=11))
-
-        # ── 預設視窗（近三個月）連同它的 Y 軸範圍，直接寫進圖裡 ────────
-        #
-        # 原本這件事是前端做的：畫完圖之後模擬點一下「3月」那顆按鈕 → 一次
-        # relayout 改 X 範圍 → 觸發 plotly_relayout → 算出 Y 範圍 → 再一次
-        # relayout。加上 fitPlotSize 那一次，切換一檔股票要跑**三次**完整
-        # relayout，而每一次 relayout 都會把五百根 K 棒重畫一遍（candlestick
-        # 的每一根都是一條 path，這是整張圖最貴的部分）。
-        #
-        # 這些數字在產生報告的時候就全部算得出來，算一次寫進 JSON，前端
-        # newPlot 出來就已經是對的，三次 relayout 變成零次。
-        d_from = max(0, N - 63)          # 約三個月的交易日
-        win_v = [v for v in vl[d_from:] if v is not None]
-        win_hi = max([v for v in h_l[d_from:] if v is not None] +
-                     [v for v in bu[d_from:] if v is not None] or [1.0])
-        win_lo = min([v for v in l_l[d_from:] if v is not None] +
-                     [v for v in bd[d_from:] if v is not None] + [stop] or [0.0])
-        pad = (win_hi - win_lo) * 0.06 or (abs(win_hi) or 1.0) * 0.05
-        fig.update_layout(
-            xaxis2=dict(range=[dates[d_from], dates[-1]]),
-            yaxis=dict(range=[win_lo - pad, win_hi + pad], autorange=False),
-            yaxis2=dict(range=[0, (max(win_v) if win_v else 1.0) * 1.12],
-                        autorange=False),
-        )
-
-        fig_json = pio.to_json(fig)
+        s = _chart_series(res, keep_rows, sf)
 
         # 沒過今天這組門檻的那幾檔：寫成自己的檔案，不嵌進頁面。
         #
@@ -2396,19 +2550,16 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         if idx >= len(results):
             with open(os.path.join(data_dir, res['code'] + '.json'),
                       'w', encoding='utf-8') as fh:
-                fh.write(fig_json)
+                fh.write(_json.dumps(s, ensure_ascii=False,
+                                     separators=(',', ':')))
             written += 1
             continue
 
-        # 防止 </script> 提前關閉：把 </ 轉義
-        fig_json_safe = fig_json.replace('</', '<\\/')
-        fig_json_tags.append(
-            '<script type="application/json" id="fig-{i}">{j}</script>'.format(
-                i=idx, j=fig_json_safe)
-        )
+        series_map[s['code']] = s
 
         # 漲跌與漲跌幅：以最近兩個交易日收盤價計算，供左側清單顯示
-        if N >= 2 and c_l[-2]:
+        c_l = s['c']
+        if len(c_l) >= 2 and c_l[-2]:
             chg     = round(c_l[-1] - c_l[-2], 2)
             chg_pct = round(chg / c_l[-2] * 100, 2)
         else:
@@ -2427,6 +2578,7 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
             'url':  (link_base.rstrip('/') + '/' + res['code'] + '.html')
                     if link_base else '',
         })
+
 
     # ── 組裝 HTML ────────────────────────────────────────────────
     n      = len(results)
@@ -2448,22 +2600,31 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
     #
     # `stock_infos` 仍然要算：它是 `INFO`（圖表區那排徽章）和 `drawn`（哪幾檔
     # 真的有圖）的來源。
-    chart_divs = '\n'.join(
-        '<div class="cw" id="cw-{i}">'
-        '<div class="badge-row" id="badges-{i}"></div>'
-        '<div class="trig-line" id="trig-{i}"></div>'
-        '<div class="plot" id="plot-{i}"><p class="ld">&#9203; 載入中...</p></div>'
-        '<div id="rb-{i}">'
+    # 圖表區只有**一格**。
+    #
+    # 原本是兩套：今天過篩的每一檔各一個 `.cw`（圖嵌在頁面上、有徽章、有時間
+    # 範圍按鈕），再加一格 `#tf-pane` 給「調完門檻才多出來的那些」用。而那一格
+    # 什麼都沒有——沒有徽章、沒有觸發條件、沒有時間範圍按鈕，滑鼠移上去也沒有
+    # 貫穿上下圖的十字線。同一份報告裡，同一張圖有兩種待遇。
+    #
+    # 併成一格的前提是「所有股票的圖都用同一條路組出來」，而那正是這一版做的
+    # 事（數列 ＋ 共用樣板 ＋ tfSeriesFig）。既然圖一樣，圍在圖旁邊的東西沒有
+    # 理由不一樣。
+    #
+    # `rb-tf` 的前綴是 `rb-`，所以它吃得到原本 `[id^="rb-"]` 那條樣式。
+    chart_divs = (
+        '<div class="badge-row" id="tf-badges"></div>'
+        '<div class="trig-line" id="tf-trig"></div>'
+        '<div class="plot" id="tf-plot"><p class="ld">&#9203; 載入中...</p></div>'
+        '<div id="rb-tf">'
         '<span>時間範圍：</span>'
-        '<button class="rbtn"     onclick="setRange(1,0,this,{i})">1月</button>'
-        '<button class="rbtn rba" onclick="setRange(3,0,this,{i})">3月</button>'
-        '<button class="rbtn"     onclick="setRange(6,0,this,{i})">6月</button>'
-        '<button class="rbtn"     onclick="setRange(0,1,this,{i})">1年</button>'
-        '<button class="rbtn"     onclick="setRange(0,{y},this,{i})">{y}年</button>'
+        '<button class="rbtn"     onclick="setRange(1,0,this)">1月</button>'
+        '<button class="rbtn rba" onclick="setRange(3,0,this)">3月</button>'
+        '<button class="rbtn"     onclick="setRange(6,0,this)">6月</button>'
+        '<button class="rbtn"     onclick="setRange(0,1,this)">1年</button>'
+        '<button class="rbtn"     onclick="setRange(0,{y},this)">{y}年</button>'
         '</div>'
-        '</div>'.format(i=i, y=int(chart_years) if chart_years else 2)
-        for i in range(n)
-    )
+    ).format(y=int(chart_years) if chart_years else 2)
 
     css = (
         '*{box-sizing:border-box;margin:0;padding:0}'
@@ -2590,7 +2751,6 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         '.sb-more{color:#6e7681;font-size:11px;text-align:center;padding:10px 6px}'
         # 圖表區那塊「這一檔沒有圖」的說明。它出現的時候要把 K 線圖蓋掉——
         # 兩個同時在畫面上，讀者會以為那張圖就是這一檔的。
-        '#chartcol.noting .cw{display:none !important}'
         '#tf-note{margin:auto;max-width:46em;padding:24px 20px;color:#8b949e;'
             'font-size:13px;line-height:1.75;text-align:center}'
         '#tf-note b{color:#e6edf3}'
@@ -2613,9 +2773,6 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
             'border-color:#2ea043;font-weight:700}'
         '#live .live-bar button.go:hover{background:#2ea043;border-color:#3fb950}'
         # ── 圖表區內：徽章列 + 觸發訊號 + 圖表本體 + 時間範圍列 ─
-        '.cw{display:none;width:100%;height:100%;padding:10px 16px 12px;'
-            'flex-direction:column;min-height:0}'
-        '.cw.act{display:flex}'
         '.badge-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;'
             'margin-bottom:6px;flex:0 0 auto}'
         '.badge{display:inline-flex;align-items:center;padding:5px 13px;'
@@ -2678,7 +2835,6 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
             '.nb-tagrow{display:none}'
             '.nb-ind{font-size:10px;margin-top:2px}'
             '#chartcol{flex:1 1 auto;height:auto;min-height:0;overflow-y:auto}'
-            '.cw.act{height:100%;padding:8px 10px 10px}'
             '.plot{flex:1 1 auto;min-height:260px}'
             '.badge{font-size:11.5px;padding:4px 10px}'
             '.trig-line{font-size:12px;margin:2px 0 6px}'
@@ -2688,7 +2844,6 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
 
     js = r"""
 const INFO = INFO_JS_PLACEHOLDER;
-const rendered = {};
 /* 手機：390px 寬的螢幕上，那排工具列會吃掉圖表頂端一整條，而它上面每一顆
    （框選縮放、自動縮放、存圖）在觸控上不是做不到就是有更自然的手勢。捏合縮放
    和拖曳平移不需要它。 */
@@ -2758,13 +2913,15 @@ function twNow() {
 function toISO(d) { return d.toISOString().slice(0, 10); }
 
 /* ── 設定時間範圍（台灣時間往回推）──────────────────────── */
-function setRange(months, years, btn, idx) {
-  var rbWrap = document.getElementById('rb-' + idx);
+function setRange(months, years, btn) {
+  var rbWrap = document.getElementById('rb-tf');
   if (rbWrap) rbWrap.querySelectorAll('.rbtn').forEach(function(b){ b.classList.remove('rba'); });
   if (btn) btn.classList.add('rba');
 
-  var wrap = document.getElementById('plot-' + idx);
-  if (!wrap || !rendered[idx]) return;
+  /* 圖還沒畫出來的時候按這幾顆是沒有意義的（`_twBound` 是「已經畫過一次」的
+     記號）。硬 relayout 一個空的 div，plotly 會丟例外出來。 */
+  var wrap = document.getElementById('tf-plot');
+  if (!wrap || !wrap._twBound) return;
 
   var end   = twNow();
   var start = new Date(end);
@@ -2780,39 +2937,163 @@ function setRange(months, years, btn, idx) {
   });
 }
 
-/* ── 解析 figure JSON（安全，不受 HTML 標籤干擾）─────────── */
-function getChartFig(idx) {
-  var el = document.getElementById('fig-' + idx);
-  if (!el) { console.error('找不到 fig-' + idx); return null; }
-  try { return JSON.parse(el.textContent); }
-  catch(e) { console.error('JSON 解析失敗 fig-' + idx, e); return null; }
+/* ── 從一份數列組出一張圖 ─────────────────────────────────────
+   這一頁上**每一張**圖都從這裡出來：今天過篩那幾檔（數列嵌在 tf-series 裡），
+   和調完門檻才多出來的那些（數列從 Pages 抓回來）。同一條路，所以不會有
+   「有些股票的圖長得不一樣」這種事。
+
+   樣式完全不在這裡。`tf-figtpl` 是 Python 的 `_chart_figure()` 用一份空資料跑
+   出來的樣板——兩百行的軌道顏色、停損線樣式、圖例位置、上下子圖高度比都已經
+   畫好了，這裡只把數字填進對應的 trace。要改樣式就改 Python 那一支，兩種圖
+   一起改。
+
+   trace 的順序是和 `_chart_figure` 約好的（① 布林上軌 …… ⑪ 量圖 hover 軌）。
+   約定會走鐘，所以 tests/test_chart_js.py 拿同一份 series 讓 Python 和這裡各
+   組一張，逐一比對——順序錯了那條測試就紅。 */
+var TF_TPL = null;
+function tfTemplate() {
+  if (TF_TPL) return TF_TPL;
+  var el = document.getElementById('tf-figtpl');
+  if (!el) { console.error('找不到 tf-figtpl'); return null; }
+  try { TF_TPL = JSON.parse(el.textContent); }
+  catch (e) { console.error('圖表樣板解析失敗', e); return null; }
+  return TF_TPL;
 }
 
-/* ── 資訊欄更新 ───────────────────────────────────────────── */
-function updateIB(i) {
-  var s = INFO[i];
-  var badges = document.getElementById('badges-' + i);
-  if (badges && !badges.dataset.filled) {
-    /* 20MA／60MA／停損三個拿掉了——圖例上本來就有這三條線，而且圖例是跟著
-       線的顏色的。同一個數字在同一個畫面上出現兩次，讀者要先確認那是不是
-       同一件事，才能繼續往下看。
-       留下的是**圖上看不到**的：量比、布林寬、ATR。 */
-    badges.innerHTML =
-      '<span class="badge">\u91cf\u6bd4 ' + s.vratio.toFixed(2) + 'x</span>' +
-      '<span class="badge">\u5e03\u6797\u5bec ' + s.bw.toFixed(1) + '%</span>' +
-      '<span class="badge gold">ATR ' + s.atr.toFixed(2) + '</span>' +
-      /* \u6280\u8853\u9762\u770b\u5b8c\uff0c\u4e0b\u4e00\u500b\u554f\u984c\u662f\u9019\u5bb6\u516c\u53f8\u7684\u9ad4\u8cea\u2014\u2014\u90a3\u500b\u7b54\u6848\u5728\u9694\u58c1\u90a3\u500b\u7db2\u7ad9\u4e0a\u3002
-         target="_blank"\uff1a\u9019\u4e00\u9801\u7684\u5716\u8868\u662f\u6709\u72c0\u614b\u7684\uff08\u9078\u4e86\u54ea\u4e00\u6a94\u3001\u62c9\u5230\u54ea\u500b\u7bc4\u570d\uff09\uff0c
-         \u5728\u539f\u5730\u8df3\u8d70\u6703\u628a\u90a3\u4e9b\u5168\u90e8\u4e1f\u6389\u3002 */
-      (s.url
-        ? '<a class="badge link" href="' + s.url + '" target="_blank" ' +
-          'rel="noopener">\u516d\u5927\u8ca1\u52d9\u6307\u6a19\u8a55\u7b49 ' +
-          s.code + '\u2197</a>'
-        : '');
-    var trig = document.getElementById('trig-' + i);
-    if (trig) trig.innerHTML =
-      '<span class="trig-arrow">\u25b6\ufe0e</span>\u00a0' + s.trigger;
-    badges.dataset.filled = '1';
+var TF_SER = null;
+function tfSeriesOf(code) {
+  if (TF_SER === null) {
+    var el = document.getElementById('tf-series');
+    try { TF_SER = el ? JSON.parse(el.textContent) : {}; }
+    catch (e) { console.error('數列解析失敗', e); TF_SER = {}; }
+  }
+  return TF_SER[code] || null;
+}
+
+/* 近三個月那個預設視窗的 Y 軸範圍。和 Python 的 `_chart_window` 同一條公式——
+   樣板裡那組 range 是拿空資料算出來的，填了數列之後一定要重算，否則每一張圖的
+   Y 軸都停在 0 附近，畫面上是一條貼著底的平線。 */
+function tfWindow(s) {
+  var N = s.d.length, from = Math.max(0, N - 63), i;
+  var hi = [], lo = [], vv = [];
+  for (i = from; i < N; i++) {
+    if (s.h[i] !== null) hi.push(s.h[i]);
+    if (s.bu[i] !== null) hi.push(s.bu[i]);
+    if (s.l[i] !== null) lo.push(s.l[i]);
+    if (s.bd[i] !== null) lo.push(s.bd[i]);
+    if (s.vl[i] !== null) vv.push(s.vl[i]);
+  }
+  if (s.stop !== null && s.stop !== undefined) lo.push(s.stop);
+  var winHi = hi.length ? Math.max.apply(null, hi) : 1.0;
+  var winLo = lo.length ? Math.min.apply(null, lo) : 0.0;
+  var pad = (winHi - winLo) * 0.06;
+  if (!pad) pad = (Math.abs(winHi) || 1.0) * 0.05;
+  var vhi = (vv.length ? Math.max.apply(null, vv) : 1.0) * 1.12;
+  return { lo: winLo - pad, hi: winHi + pad, vhi: vhi };
+}
+
+function tfFix(v) { return (v === null || v === undefined) ? '0.00' : v.toFixed(2); }
+
+function tfSeriesFig(s) {
+  var tpl = tfTemplate();
+  if (!tpl || !s || !s.d || !s.d.length) return null;
+  /* 深拷貝：樣板只解析一次，所有股票共用它。直接改的話第二檔會蓋掉第一檔的
+     資料，而畫面上看起來只是「切過去圖沒變」。 */
+  var fig = JSON.parse(JSON.stringify(tpl));
+  var d = s.d, N = d.length, t = fig.data, i;
+
+  var cd = new Array(N), cdv = new Array(N), vcol = new Array(N);
+  for (i = 0; i < N; i++) {
+    cd[i] = [d[i], s.o[i], s.h[i], s.l[i], s.c[i],
+             s.m20[i], s.m60[i], s.bu[i], s.bm[i], s.bd[i],
+             s.vl[i], s.vm[i], s.vr[i]];
+    cdv[i] = [d[i], s.vl[i], s.vm[i], s.vr[i]];
+    vcol[i] = ((s.c[i] || 0) >= (s.o[i] || 0)) ? '#3fb950' : '#f85149';
+  }
+
+  t[0].x = d; t[0].y = s.bu;                     /* ① 布林上軌 */
+  t[1].x = d; t[1].y = s.bd;                     /* ② 布林下軌 */
+  t[2].x = d; t[2].y = s.bm;                     /* ③ 布林中軌 */
+  t[3].x = d;                                    /* ④ K 棒 */
+  t[3].open = s.o; t[3].high = s.h; t[3].low = s.l; t[3].close = s.c;
+  t[4].x = d; t[4].y = s.m20;                    /* ⑤ 20MA */
+  t[4].name = '20MA 月線 ' + tfFix(s.ma20_last);
+  t[5].x = d; t[5].y = s.m60;                    /* ⑥ 60MA */
+  t[5].name = '60MA 季線 ' + tfFix(s.ma60_last);
+  t[6].x = [d[0], d[N - 1]];                     /* ⑦ 停損線 */
+  t[6].y = [s.stop, s.stop];
+  t[6].name = '建議停損 ' + tfFix(s.stop);
+  t[7].x = d; t[7].y = s.vl;                     /* ⑧ 成交量 */
+  t[7].marker = t[7].marker || {};
+  t[7].marker.color = vcol;
+  t[8].x = d; t[8].y = s.vm;                     /* ⑨ 20日均量 */
+  t[9].x = d; t[9].y = s.c; t[9].customdata = cd;      /* ⑩ 價格 hover 軌 */
+  t[10].x = d; t[10].y = s.vl; t[10].customdata = cdv; /* ⑪ 量圖 hover 軌 */
+
+  var w = tfWindow(s);
+  fig.layout.xaxis2 = fig.layout.xaxis2 || {};
+  fig.layout.xaxis2.range = [d[Math.max(0, N - 63)], d[N - 1]];
+  fig.layout.yaxis = fig.layout.yaxis || {};
+  fig.layout.yaxis.range = [w.lo, w.hi];
+  fig.layout.yaxis.autorange = false;
+  fig.layout.yaxis2 = fig.layout.yaxis2 || {};
+  fig.layout.yaxis2.range = [0, w.vhi];
+  fig.layout.yaxis2.autorange = false;
+  return fig;
+}
+
+
+
+/* ── 圖表上方那排徽章與觸發條件 ─────────────────────────────
+
+   以代號為鍵，不是以索引。索引那一版只認得「排程當天過篩的那幾檔」——調寬門檻
+   多出來的股票沒有索引，所以它們的圖上面什麼都沒有。
+
+   量比／布林寬／ATR 三個數字每一檔都有（它們在快照裡，而快照是全市場的），
+   所以三個徽章對每一檔都畫得出來。`INFO` 只有排程那幾檔，拿它當補充：有就用
+   它的（那是當天收盤算的），沒有就用快照的。 */
+function tfBadges(code) {
+  var badges = document.getElementById('tf-badges');
+  var trig = document.getElementById('tf-trig');
+  if (!badges) return;
+  var hit = (typeof TF_HITS !== 'undefined')
+    ? TF_HITS.find(function (h) { return h[0][C.code] === code; }) : null;
+  var row = hit ? hit[0] : null;
+  var info = null, i;
+  for (i = 0; i < INFO.length; i++) { if (INFO[i].code === code) { info = INFO[i]; break; } }
+
+  var vratio = info ? info.vratio : (row ? row[C.vol_ratio] : null);
+  var atr    = info ? info.atr    : (row ? row[C.atr14] : null);
+  /* 布林寬：INFO 存的是百分比，快照存的是一整串比例（壓縮那一關要看一段時間，
+     不是只看今天），所以取最後一個再乘一百。單位弄混的話畫面上會出現
+     「布林寬 0.1%」這種看起來像真的、其實差一百倍的數字。 */
+  var bw = info ? info.bw
+         : (row && row[C.bw] && row[C.bw].length
+            ? row[C.bw][row[C.bw].length - 1] * 100 : null);
+  var url = info ? info.url : (TF_LINK ? TF_LINK + '/' + code + '.html' : '');
+
+  var html = '';
+  if (vratio !== null && vratio !== undefined)
+    html += '<span class="badge">量比 ' + vratio.toFixed(2) + 'x</span>';
+  if (bw !== null && bw !== undefined)
+    html += '<span class="badge">布林寬 ' + bw.toFixed(1) + '%</span>';
+  if (atr !== null && atr !== undefined)
+    html += '<span class="badge gold">ATR ' + atr.toFixed(2) + '</span>';
+  /* 技術面看完，下一個問題是這家公司的體質——那個答案在隔壁那個網站上。
+     target="_blank"：這一頁的圖表是有狀態的（選了哪一檔、拉到哪個範圍），
+     在原地跳走會把那些全部丟掉。 */
+  if (url)
+    html += '<a class="badge link" href="' + url + '" target="_blank" rel="noopener">' +
+            '六大財務指標評等 ' + tfEsc(code) + '↗</a>';
+  badges.innerHTML = html;
+
+  /* 觸發條件用**現在這組門檻**算出來的那幾個（tfPass 的回傳值），不是排程當天
+     那一份。門檻是使用者剛剛自己調的，這一行要說的是「它為什麼出現在這組條件
+     下」——拿排程當天的理由去回答那個問題是答非所問。 */
+  if (trig) {
+    var txt = hit ? hit[1].join('｜') : (info ? info.trigger : '');
+    trig.innerHTML = txt
+      ? '<span class="trig-arrow">▶︎</span> ' + tfEsc(txt) : '';
   }
 }
 
@@ -2954,74 +3235,67 @@ function attachAutoY(div) {
   });
 }
 
-/* ── 切換個股 ─────────────────────────────────────────────── */
-function showChart(idx) {
-  /* 側欄那排卡片的 .act 由 tfMark() 管，這裡**不能**碰。
-     
-     以前兩者是同一個索引：第 i 張卡片對到第 i 張圖。現在不是了——卡片是「通過
-     你這組門檻的那幾檔」，圖是「排程當天通過預設門檻的那幾檔」，兩份名單的長度
-     和順序都不一樣。這裡照舊用 idx 去標，標到的會是另一檔。
-     
-     這不是推論出來的：改完第一次跑就踩到了。點 2317，亮起來的是 2330。 */
-  document.querySelectorAll('.cw').forEach(function(el,i){ el.classList.toggle('act', i===idx); });
-  updateIB(idx);
+/* ── 把一份數列畫到那唯一的圖表區 ───────────────────────────
 
-  var wrap = document.getElementById('plot-' + idx);
+   `Plotly.react` 而不是 `newPlot`：同一格連續換好幾檔的時候，react 沿用已經在
+   那裡的畫布只更新資料；newPlot 每次都把整張圖拆掉重蓋，而六百根 K 棒每一根都
+   是一條 path，那是整張圖最貴的部分。
 
-  /* plotly 沒載進來的時候要**說出來**。
-     這一段上線過一次：CDN 那個版本 404，`Plotly` 是 undefined，於是每一張圖
-     都是一塊空白——沒有錯誤訊息、沒有紅字，看起來就像「圖表還在載入」。
-     使用者回報的是「趨勢圖跑不出來」，而那句話沒辦法告訴任何人該修哪裡。 */
+   十字線與自動 Y 軸的監聽器只掛一次（`_twBound`）——react 不會換掉那個 div，
+   所以掛過的還在；每次都掛的話同一個事件會被處理好幾遍。 */
+function tfDraw(code, s) {
+  var wrap = document.getElementById('tf-plot');
+  if (!wrap) return;
   if (typeof Plotly === 'undefined') {
-    if (wrap) {
-      wrap.innerHTML =
-        '<p class="ld" style="color:#f85149">\u26a0 \u5716\u8868\u51fd\u5f0f\u5eab' +
-        '\u6c92\u6709\u8f09\u5165\uff08plotly.js\uff09\u3002' +
-        '<br><span style="color:#8b949e;font-size:13px">' +
-        '\u53ef\u80fd\u662f\u7db2\u8def\u3001CDN\u3001\u6216\u700f\u89bd\u5668' +
-        '\u64cb\u6389\u4e86\u5916\u90e8\u8173\u672c\u3002' +
-        '\u91cd\u65b0\u6574\u7406\u9801\u9762\u8a66\u8a66\u770b\u3002</span></p>';
-    }
+    wrap.innerHTML =
+      '<p class="ld" style="color:#f85149">⚠ 圖表函式庫' +
+      '沒有載入（plotly.js）。' +
+      '<br><span style="color:#8b949e;font-size:13px">' +
+      '可能是網路、CDN、或瀏覽器' +
+      '擋掉了外部腳本。' +
+      '重新整理頁面試試看。</span></p>';
     return;
   }
-
-  if (!rendered[idx]) {
-    rendered[idx] = true;
-    var fig = getChartFig(idx);
-    if (!fig) {
-      wrap.innerHTML = '<p class="ld" style="color:#f85149">\u26a0 \u5716\u8868\u8cc7\u6599\u89e3\u6790\u5931\u6557</p>';
-      return;
-    }
-    /* 預設視窗（近三個月）與它的 Y 軸範圍已經寫在圖裡了，所以這裡先把
-       尺寸也一起放進 layout 再 newPlot——畫出來就是最終的樣子，不必畫完
-       再 relayout 一次。原本這一步要跑三次完整 relayout（尺寸、X 範圍、
-       Y 範圍），而每一次都會把五百根 K 棒重畫一遍。 */
-    tuneForNarrow(fig);
-    var w0 = wrap.clientWidth, h0 = wrap.clientHeight;
-    if (w0 > 0 && h0 > 0) {
-      fig.layout.width = w0; fig.layout.height = h0;
-      wrap._twW = w0; wrap._twH = h0;
-    }
-    wrap.innerHTML = '';   /* 清空「載入中」佔位文字，避免殘留在圖表下方 */
-    Plotly.newPlot(wrap, fig.data, fig.layout, PLY_CFG)
-      .then(function() {
-        attachHover(wrap);
-        attachAutoY(wrap);
-      })
-      .catch(function(e) {
-        wrap.innerHTML = '<p class="ld" style="color:#f85149">\u26a0 Plotly \u7573\u8b5c\u5931\u6557: ' + e.message + '</p>';
-      });
-  } else {
-    /* 已經畫過的圖，切回來的時候它的時間範圍和 Y 軸就是離開時的樣子——
-       那正是讀者上次留在的位置。重新套用一次預設範圍會把他捲過的地方
-       洗掉，還多付一次 relayout。只在視窗真的變過大小時才動它。 */
-    fitPlotSize(wrap);
+  var fig = tfSeriesFig(s);
+  if (!fig) {
+    wrap.innerHTML = '<p class="ld" style="color:#f85149">⚠ 圖表資料解析失敗</p>';
+    return;
   }
+  /* 預設視窗（近三個月）與它的 Y 軸範圍是 tfSeriesFig 算好的，所以這裡把尺寸也
+     一起放進 layout 再畫——畫出來就是最終的樣子，不必畫完再 relayout 一次。
+     原本這一步要跑三次完整 relayout（尺寸、X 範圍、Y 範圍）。 */
+  tuneForNarrow(fig);
+  var w0 = wrap.clientWidth, h0 = wrap.clientHeight;
+  if (w0 > 0 && h0 > 0) {
+    fig.layout.width = w0; fig.layout.height = h0;
+    wrap._twW = w0; wrap._twH = h0;
+  }
+  var ph = wrap.querySelector('.ld');
+  if (ph) ph.remove();          /* 清掉「載入中」佔位文字 */
+  tfBadges(code);
+  /* 換一檔就回到預設的三個月。那是每一張圖被算好的視窗，而上一檔拉到的範圍
+     對這一檔沒有意義（兩檔的上市日期、停損位置都不一樣）。 */
+  var rb = document.getElementById('rb-tf');
+  if (rb) {
+    var btns = rb.querySelectorAll('.rbtn');
+    for (var i = 0; i < btns.length; i++) btns[i].classList.remove('rba');
+    if (btns[1]) btns[1].classList.add('rba');   /* 〔3月〕 */
+  }
+  Plotly.react(wrap, fig.data, fig.layout, PLY_CFG)
+    .then(function () {
+      if (wrap._twBound) return;
+      wrap._twBound = true;
+      attachHover(wrap);
+      attachAutoY(wrap);
+    })
+    .catch(function (e) {
+      wrap.innerHTML = '<p class="ld" style="color:#f85149">⚠ Plotly 畳譜失敗: ' + e.message + '</p>';
+    });
 }
 
 window.addEventListener('resize', function() {
   syncHdHeight();
-  var a = document.querySelector('.cw.act .plot');
+  var a = document.getElementById('tf-plot');
   if (a) fitPlotSize(a);
 });
 
@@ -3089,18 +3363,25 @@ document.addEventListener('DOMContentLoaded', function() { syncHdHeight(); });
         '</div>',  # /#sidebar
         # `#tf-note` 是「這一檔沒有圖」時說話的地方。預設 hidden，由 tfNoChart()
         # 打開——留一片空白的圖表區，讀者會以為是還沒載入完。
-        # `#tf-pane` 是抓回來那幾張圖畫的地方，和嵌進頁面的那幾張（.cw）分開：
-        # 共用一格的話，畫上去就會把原本那一檔的圖洗掉，切回去要整張重畫。
-        # `#tf-note` 則是「拿不到圖」時說話的地方。兩個預設都 hidden。
+        # `#tf-pane` 是**唯一**的圖表區（徽章、觸發條件、圖、時間範圍按鈕都在
+        # 它裡面），`#tf-note` 則是「拿不到圖」時說話的地方。兩個預設都 hidden
+        # ——留一片空白的圖表區，讀者會以為是還沒載入完。
         ('<div id="chartcol">'
          '<div id="tf-note" hidden></div>'
          '<div id="tf-pane" hidden>'
          '<div class="tf-pane-head"><b id="tf-plot-title"></b>'
          '<span id="tf-plot-msg"></span></div>'
-         '<div id="tf-plot"></div></div>'
-         + chart_divs + '</div>'),
+         + chart_divs + '</div></div>'),
         '</div>',  # /#main
-        '\n'.join(fig_json_tags),   # <-- 圖表資料放在獨立 script[type=application/json]
+        # 圖表資料。兩塊，都放在獨立的 script[type=application/json] 裡：
+        #
+        # * `tf-figtpl`：那張圖的**樣板**——樣式全部畫好、數列是空的。一頁只有
+        #   一份，十檔股票共用。以前是每一檔各帶一份完整的圖 JSON，同一套兩百行
+        #   樣式在同一個檔案裡重複十遍。
+        # * `tf-series`：今天過篩那幾檔的數列，以代號為鍵。沒過篩的那幾檔在
+        #   Pages 上，點下去才抓，格式和這裡**一模一樣**。
+        _script_json('tf-figtpl', chart_template()),
+        _script_json('tf-series', series_map),
         '<script>' + js + '</script>',
         '</body></html>',
     ]

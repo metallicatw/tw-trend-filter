@@ -332,8 +332,17 @@ def test_有圖沒圖的那幾檔都在側欄上而且分得出來():
     assert 'const TF_LINK = "https://example.invalid/six"' in html
     assert 'function tfOpen' in html
     assert 'function tfNoChart' in html
-    # 有圖的那幾檔走 showChart（就是以前點側欄卡片做的事）。
-    assert 'showChart(at)' in html
+    # `TF_DRAWN` 現在**只管樣式**，不管路由：點哪一張卡片都走同一條
+    # `tfFetchChart(code)`，數列在頁面上就直接用，不在就去抓。所以這裡不再找
+    # `showChart(at)`（那個分岔拿掉了），改成確認那條「有沒有圖」的判斷還在，
+    # 而且它認得第二個來源——附了圖表資料（TF_DATA）的話，全市場每一檔都點得開。
+    assert 'tfFetchChart(code)' in html, '點卡片不再走同一條路了'
+    # 找的是那個**呼叫**，不是「showChart」這九個字母——原始碼的註解裡寫著
+    # 「以前這裡分兩條：嵌過的叫 showChart() …」，拿字串去整頁找會把那句註解
+    # 一起找到，然後這條測試永遠紅。
+    assert 'showChart(at)' not in html, '又冒出第二條開圖的路'
+    assert 'hasOwnProperty.call(TF_DRAWN, code) || !!TF_DATA' in html, \
+        '「有沒有圖」漏掉了 TF_DATA 這個來源，放寬門檻多出來的股票會全被標成沒有圖'
 
 
 # ── 快照真的到得了那一頁 ──────────────────────────────────────────
@@ -443,15 +452,19 @@ def test_側欄選中的那一檔和右邊畫的那一張是同一檔(tmp_path):
     """
     html = _page(tmp_path, snapshots=[_snap(code='2330'), _snap(code='6505')])
     body = html[html.index('<body>'):]
-    # showChart 不可以再碰側欄。
-    seg = body[body.index('function showChart('):]
+    # 那個「兩份名單、兩套索引」的狀況現在是**結構上**不成立的：圖表區只有一格，
+    # 畫哪一檔由**代號**決定，不再有「第 idx 張圖」這種東西。所以這裡先確認
+    # showChart 真的不在了——它回來就代表索引那條路也回來了。
+    assert 'function showChart' not in body, '按索引開圖的那條路又回來了'
+    seg = body[body.index('function tfDraw('):]
     seg = seg[: seg.index('\n}')]
-    assert ".nb'" not in seg and '.nb"' not in seg, 'showChart 又去標側欄了'
+    assert ".nb'" not in seg and '.nb"' not in seg, 'tfDraw 又去標側欄了'
     # 載入時不可以有第二個地方決定開哪一張圖。只看 DOMContentLoaded 的處理常式
     # 內容，不是整份 HTML——原始碼的註解裡寫著「`showChart(0)` 拿掉了」，拿字串
     # 去整頁找會把那句註解一起找到，然後這條測試永遠紅。
     for h in _dom_ready_handlers(body):
-        assert 'showChart(' not in h, f'又有人在載入時寫死開某一張圖：{h[:80]}'
+        for fn in ('showChart(', 'tfDraw(', 'tfFetchChart('):
+            assert fn not in h, f'又有人在載入時寫死開某一張圖：{h[:80]}'
     assert 'function tfMark' in body and 'function tfOpen' in body
 
 
@@ -477,24 +490,38 @@ def _dom_ready_handlers(body):
 def test_每一檔沒過篩的股票各寫一個圖表資料檔(tmp_path):
     """點了才抓，而不是全部嵌進同一頁。
 
-    1,900 檔兩年的 K 棒全嵌進來是好幾百 MB；一檔一個檔案，點下去抓的只有 15～40 KB。
+    1,900 檔兩年的 K 棒全嵌進來是好幾百 MB；一檔一個檔案，點下去才抓那一檔。
+
     檔名就是代號，所以前端直接組得出網址，不需要一份索引——而一份索引就是第二個
     會過期的東西。
+
+    檔案裡裝的是**數列**，不是一整張 plotly 圖（本來是）。一整張圖裡日期那六百多
+    個字串被十一條 trace 各存一份、customdata 又把每條數列原封不動再存一次、然後
+    同一套兩百行的樣式每一檔都帶一份——240 KB。數列只有數字，59 KB。樣式由頁面上
+    那份共用的樣板提供（`tf-figtpl`），圖在瀏覽器組（`tfSeriesFig`）。
     """
     import json as _json
     import os
+
+    from tw_trend_filter.pipeline import SERIES_ARRAYS
 
     d = tmp_path / 'trend-d'
     extra = {'6505': _fake_result(code='6505', name='台塑化')}
     html = _page(tmp_path, snapshots=[_snap(code='2330'), _snap(code='6505')],
                  extra_charts=extra, data_dir=str(d), data_base='trend-d')
     assert (d / '6505.json').is_file(), '沒過篩的那一檔沒有寫出圖表資料'
-    fig = _json.loads((d / '6505.json').read_text(encoding='utf-8'))
-    assert fig['data'], '寫出來的不是一張圖'
+    ser = _json.loads((d / '6505.json').read_text(encoding='utf-8'))
+    assert ser['code'] == '6505'
+    assert ser['d'], '寫出來的數列是空的'
+    n = len(ser['d'])
+    for key in SERIES_ARRAYS:
+        assert len(ser[key]) == n, f'{key} 和日期不一樣長，plotly 會把線畫到一半就停'
     # 已經嵌在頁面上的那一檔不必再寫一份。
     assert not (d / '2330.json').exists(), '嵌過的又寫了一次，白花時間和空間'
     assert 'const TF_DATA = "trend-d"' in html
     assert 'function tfFetchChart' in html
+    # 頁面上要有那份共用樣板，不然抓回來的數列沒有東西可以填。
+    assert 'id="tf-figtpl"' in html, '頁面上沒有圖表樣板，抓回來的數列畫不出圖'
     assert os.path.getsize(d / '6505.json') > 1000
 
 

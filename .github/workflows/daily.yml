@@ -242,9 +242,16 @@ jobs:
       # `pages/trend-d/<代號>.json`：沒過今天預設門檻的那幾檔的完整 K 線圖。
       # 報告頁上調完門檻按〔篩選〕，多出來的那些股票點下去就是抓這裡。
       #
-      # 為什麼是 Pages 不是 git：這一批每天整個換掉，約 1,900 個檔、幾百 MB。
-      # 進 git 的話 repo 每天長那麼多，而且 force push 之後那些物件還會留一陣子
-      # 才被回收。Pages 的 artifact 是覆蓋的，不是累積的。
+      # 檔案裡裝的是**數列**（日期、OHLC、三條布林、兩條均線、量與均量），不是
+      # 一整張 plotly 圖。一整張圖裡日期那六百多個字串被十一條 trace 各存一份、
+      # customdata 又把每條數列原封不動再存一次、然後同一套兩百行的樣式每一檔
+      # 都帶一份——量出來一檔 240 KB，全市場四百多 MB。換成數列之後一檔 59 KB
+      # （gzip 11.5 KB），整包約 100 MB。樣式由報告頁上那一份共用的樣板提供，
+      # 圖在瀏覽器組（見 pipeline 的 `chart_template` 與 `tfSeriesFig`）。
+      #
+      # 為什麼是 Pages 不是 git：這一批每天整個換掉。進 git 的話 repo 每天長那麼
+      # 多，而且 force push 之後那些物件還會留一陣子才被回收。Pages 的 artifact
+      # 是覆蓋的，不是累積的。
       #
       # 為什麼和 report 分支並存：tw-six-metrics 的建站流程是去 clone `report`
       # 拿 index.html 的。那條路不動——這裡只是多發一份帶資料的到 Pages，而

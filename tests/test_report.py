@@ -144,11 +144,15 @@ def test_離線模式把_plotly_內嵌進來(tmp_path):
 def test_裁切之後_60ma_仍然是完整的一條線(tmp_path):
     # chart_years=1 會把 900 天裁到約 380 天。指標若是裁完才算，
     # 最前面 59 個點會是 null，圖上就是一截斷掉的線。
+    #
+    # 看的地方從 `fig-0`（一整張 plotly 圖）換成 `tf-series`（那一檔的數列）：
+    # 頁面現在送的是「數列 ＋ 一份共用的樣板」，圖由前端組（見 tfSeriesFig）。
+    # 要守的事情一個字都沒變——指標仍然是在**完整**歷史上算完才裁。
     html = _build(tmp_path, chart_years=1)
-    fig = re.search(r'<script type="application/json" id="fig-0">(.*?)</script>',
+    ser = re.search(r'<script type="application/json" id="tf-series">(.*?)</script>',
                     html, re.S)
-    assert fig, '找不到圖表資料'
-    assert 'null' not in fig.group(1), '裁切後出現 null，指標是在裁切之後才算的'
+    assert ser, '找不到數列'
+    assert 'null' not in ser.group(1), '裁切後出現 null，指標是在裁切之後才算的'
 
 
 def test_裁切真的讓檔案變小(tmp_path):
@@ -243,15 +247,33 @@ def test_沒有任何標的時不產生檔案(tmp_path):
 # 的每一根都是一條 path）。所以規則是：能不 relayout 就不 relayout。
 # ─────────────────────────────────────────────────────────────────────────
 
-def test_預設視窗和它的_y_軸範圍直接寫在圖裡(tmp_path):
-    """畫出來就要是最終樣子，不能畫完再 relayout 三次調成最終樣子。"""
+def test_預設視窗和它的_y_軸範圍一開始就是對的(tmp_path):
+    """畫出來就要是最終樣子，不能畫完再 relayout 三次調成最終樣子。
+
+    原本這三個範圍是 Python 寫進圖 JSON 裡的，所以這條測試去 `fig-0` 讀。現在
+    圖是前端用一份共用樣板組的，樣板裡那三個範圍**故意是空的**（見
+    `chart_template`：留著的話會是那兩根假 K 棒算出來的值），改由
+    `tfSeriesFig()` 在填數列的時候算。
+
+    要守的事情沒變：`Plotly.newPlot` 拿到的那份 layout 就已經帶著最終範圍，
+    不是畫完再調三次（每一次 relayout 都要把六百根 K 棒重畫一遍）。
+
+    這裡驗 Python 這一側算出來的那組範圍對不對；「前端算出來的和這裡一模一樣」
+    由 tests/test_chart_js.py 直接跑那段 JS 比對。
+    """
     import json
 
+    from tw_trend_filter.pipeline import _chart_figure, chart_template
+
     html = _build(tmp_path)
-    fig = json.loads(
-        re.search(r'id="fig-0">(.*?)</script>', html, re.S).group(1).replace(r"<\/", "</")
+    ser = json.loads(
+        re.search(r'id="tf-series">(.*?)</script>', html, re.S)
+        .group(1).replace(r"<\/", "</")
     )
-    layout = fig["layout"]
+    (s,) = ser.values()
+    layout = json.loads(
+        __import__("plotly.io", fromlist=["io"]).to_json(_chart_figure(s))
+    )["layout"]
     assert layout["xaxis2"].get("range"), "X 軸沒有預設範圍，前端就得自己按一次按鈕"
     assert layout["yaxis"].get("range"), "Y 軸沒有預設範圍"
     assert layout["yaxis"].get("autorange") is False
@@ -264,15 +286,44 @@ def test_預設視窗和它的_y_軸範圍直接寫在圖裡(tmp_path):
         - __import__("datetime").date.fromisoformat(lo)
     ).days < 130
 
+    # 樣板自己不帶範圍：帶著的話，前端漏算其中一個軸也看不出來——那個軸會靜靜地
+    # 停在造樣板用的那兩根假 K 棒上。
+    tpl = chart_template()["layout"]
+    for axis in ("xaxis2", "yaxis", "yaxis2"):
+        assert "range" not in tpl.get(axis, {}), f"樣板的 {axis} 還留著範圍"
 
-def test_切回已經畫過的圖不重新套用預設範圍(tmp_path):
-    """讀者捲到的位置是他自己選的，切走再切回來不該被洗掉——而且重套一次
-    就是一次完整 relayout。"""
+    # 前端三個軸都要設。漏一個不會報錯，只會讓那張圖的某一軸自己 autorange。
+    js = html[html.index("function tfSeriesFig"):]
+    js = js[: js.index("\nfunction tfDraw")]
+    for axis in ("xaxis2", "yaxis", "yaxis2"):
+        assert f"fig.layout.{axis}.range" in js, f"tfSeriesFig 沒有設 {axis} 的範圍"
+
+
+def test_換一檔就回到那一檔自己的預設視窗(tmp_path):
+    """這條的意思**反過來了**，理由寫在下面。
+
+    原本是「切回已經畫過的圖不要重新套用預設範圍」——那時候每一檔各有自己的一格
+    圖，切回去看到的就是離開時的樣子，而重套一次範圍既洗掉讀者捲過的位置、又多
+    付一次 relayout（一次 relayout 要把六百根 K 棒整個重畫）。
+
+    現在圖表區只有**一格**，每一檔都畫在同一塊畫布上。在這個前提下「保留上一檔
+    的範圍」是錯的：那個範圍是屬於上一檔的。近三個月那個預設視窗是**逐檔算**
+    的——它的上下界取自那一檔自己最後 63 根 K 棒的高低點，而且把那一檔的停損線
+    也算進去（見 `_chart_window`）。把 2330 拉到的範圍套到 1101 上，畫面上會是
+    一張半空的圖，而且沒有任何東西說明為什麼。
+
+    所以換一檔就回到那一檔自己的預設視窗，時間範圍那排按鈕也跟著回到〔3月〕
+    ——不然按鈕說 1 年、圖上是 3 個月，兩者互相矛盾。
+
+    至於 relayout 的成本：`tfDraw` 走的是 `Plotly.react`，範圍是跟著資料一起交
+    出去的，不是畫完再調一次。
+    """
     html = _build(tmp_path)
-    switch = html[html.index("function showChart"):]
-    switch = switch[: switch.index("\nwindow.addEventListener")]
-    already = switch[switch.rindex("} else {"):]
-    assert ".click()" not in already, "切回已畫過的圖時又去模擬點了一次時間範圍按鈕"
+    draw = html[html.index("function tfDraw("):]
+    draw = draw[: draw.index("\n}")]
+    assert "Plotly.react" in draw, "又改回 newPlot 了，換一檔要把整張圖拆掉重蓋"
+    assert ".click()" not in draw, "又去模擬點了一次時間範圍按鈕"
+    assert "rba" in draw, "換一檔的時候時間範圍按鈕沒有跟著回到預設的那一顆"
 
 
 def test_尺寸沒變就不重新排版(tmp_path):

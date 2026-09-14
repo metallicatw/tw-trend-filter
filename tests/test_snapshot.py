@@ -525,6 +525,42 @@ def test_每一檔沒過篩的股票各寫一個圖表資料檔(tmp_path):
     assert os.path.getsize(d / '6505.json') > 1000
 
 
+def test_圖表資料的網址帶著這一份報告的版本(tmp_path):
+    """`trend-d/<代號>.json` 每天整批換掉，網址卻一模一樣。
+
+    不帶版本的話有兩種壞法，而且兩種都不報錯：
+
+    1. **昨天的圖配今天的報告**。瀏覽器與 Pages 前面的 CDN 照 max-age 留著舊的
+       那一份，於是今天的報告畫出昨天的 K 線——看起來完全正常，只是最後一根不
+       見了，而那正是你在看的那一根。
+    2. **被快取起來的 404**。報告先推 report 分支、Pages 隨後才發布，中間那一小
+       段時間點下去是 404；而 404 可以被快取，所以檔案一分鐘後上去了，同一個
+       瀏覽器還是一直重播那個 404。
+
+    這一條守的是「網址帶得動版本」，以及「第一趟不是 force-cache」——那個設定
+    的意思正是「有快取就用，不要問伺服器」，等於把上面兩件事都釘死。
+    """
+    html = _page(tmp_path, snapshots=[_snap(code='2330')],
+                 extra_charts={'6505': _fake_result(code='6505', name='台塑化')},
+                 data_dir=str(tmp_path / 'd'), data_base='trend-d')
+    import re
+
+    m = re.search(r'const TF_VER = "([^"]*)"', html)
+    assert m and m.group(1), '圖表資料的網址沒有帶版本'
+    assert "'?v=' + encodeURIComponent(TF_VER)" in html, '版本沒有接到網址上'
+    # 只看 tfGrab 的函式內容，不是整頁——註解裡寫著當初為什麼拿掉 force-cache，
+    # 拿字串去整頁找會把那句註解一起找到，然後這條測試永遠紅。
+    grab = html[html.index('async function tfGrab('):]
+    grab = grab[: grab.index('\n      }')]
+    assert 'force-cache' not in grab, (
+        "又用回 force-cache 了：那個設定的意思是「有快取就用，不要問伺服器」，"
+        "會把舊資料和舊的 404 一起釘死"
+    )
+    assert "fetch(url, {cache: mode})" in grab, 'tfGrab 沒有讓呼叫端決定快取模式'
+    # 404 要再試一次、而且那一次要繞過快取，不然發布空窗期的誤判會黏住。
+    assert "tfGrab(code, 'reload')" in html, '404 之後沒有繞過快取再試一次'
+
+
 def test_不給_data_dir_就一個檔案都不寫(tmp_path):
     """本機自己跑一份報告，不該在旁邊生出 1,900 個檔案。"""
     extra = {'6505': _fake_result(code='6505', name='台塑化')}

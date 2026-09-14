@@ -1689,7 +1689,8 @@ LIVE_FIELDS: tuple[tuple[str, str, str, str, str], ...] = (
 )
 
 
-def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base=''):
+def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
+                data_ver=''):
     """頁首那一塊〔調整篩選條件〕，以及驅動左邊那排卡片的那段 JS。
 
     ## 這一塊是這一頁的控制器，不是附註
@@ -1764,6 +1765,7 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base=''):
     drawn_js = json.dumps(dict(drawn or {}), ensure_ascii=False, sort_keys=True)
     link_js = json.dumps((link_base or '').rstrip('/'))
     data_js = json.dumps((data_base or '').rstrip('/'))
+    ver_js = json.dumps(str(data_ver or ''))
     cols = json.dumps({k: i for i, k in enumerate(SNAPSHOT_COLUMNS)})
     return f"""
       <div id="live">
@@ -1791,6 +1793,20 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base=''):
       // 沒過預設篩選的那幾檔，圖表資料放在這個路徑底下（一檔一個 <代號>.json）。
       // 空字串代表這一份報告沒有附圖表資料（例如本機自己跑一份）。
       const TF_DATA = {data_js};
+      // 這一份報告的建置時間戳。它跟在圖表資料的網址後面（`?v=…`），
+      // 而那一個查詢字串修掉兩個不同的毛病：
+      //
+      // 1. **昨天的圖配今天的報告**。`trend-d/<代號>.json` 每天整批換掉，
+      //    網址卻一模一樣。瀏覽器（和 Pages 前面的 CDN）照 max-age 留著
+      //    舊的那一份，於是今天的報告畫出昨天的 K 線——不報錯，只是最後
+      //    一根不見了，而那正是你在看的那一根。
+      // 2. **被快取起來的 404**。報告是先推 report 分支、Pages 隨後才發布
+      //    的，中間有一小段時間報告已經更新、資料還沒上去。那時候點一檔
+      //    沒過預設篩選的股票會拿到 404——而 404 是可以被快取的，所以就算
+      //    一分鐘後檔案已經在那裡，同一個瀏覽器還是會一直重播那個 404。
+      //    （這一版之前用的是 `cache: 'force-cache'`，那個設定的意思正是
+      //    「有快取就用，不要問伺服器」——等於把那個 404 釘死。）
+      const TF_VER = {ver_js};
       const TF_CACHE = {{}};        // 抓過就不再抓第二次
       let TF_ROWS = [];
       let TF_HITS = [];
@@ -1948,6 +1964,19 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base=''):
       // 對讀者是點一檔股票下載 39 KB 變 11.5 KB；對排程是每天往 Pages 推的
       // 那包從四百多 MB 變一百 MB。而且圖和頁面內嵌那幾張走的是同一條組裝路徑，
       // 不可能長得不一樣。
+      // 抓一檔的數列。`mode` 是 fetch 的 cache 模式：第一趟用 'default'（照
+      // HTTP 的規矩走，Pages 給的 max-age 內重複點同一檔仍然是命中快取），
+      // 404 之後那一趟用 'reload'（一定去問伺服器）。
+      async function tfGrab(code, mode) {{
+        const url = TF_DATA + '/' + code + '.json' +
+                    (TF_VER ? '?v=' + encodeURIComponent(TF_VER) : '');
+        const r = await fetch(url, {{cache: mode}});
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const s = await r.json();
+        if (!s || !s.d || !s.d.length) throw new Error('這一檔的資料是空的');
+        return s;
+      }}
+
       async function tfFetchChart(code) {{
         // 今天過篩的那幾檔的數列本來就在頁面上——那些不必跑一趟網路。
         let s = (typeof tfSeriesOf === 'function') ? tfSeriesOf(code) : null;
@@ -1957,16 +1986,27 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base=''):
           s = TF_CACHE[code];
           if (!s) {{
             try {{
-              const r = await fetch(TF_DATA + '/' + code + '.json', {{cache: 'force-cache'}});
-              if (!r.ok) throw new Error('HTTP ' + r.status);
-              s = await r.json();
-              if (!s || !s.d || !s.d.length) throw new Error('這一檔的資料是空的');
-              TF_CACHE[code] = s;
+              s = await tfGrab(code, 'default');
             }} catch (e) {{
-              // 換過股票了就不要把錯誤蓋在新的那一張上面。
-              if (TF_CUR === code) tfNoChart(code, e.message);
-              return;
+              // 404 再試一次，這次繞過快取。
+              //
+              // 為什麼值得多跑一趟：報告是先推 report 分支、Pages 隨後才發布的，
+              // 中間那一小段時間點下去就是 404。那不是「這一檔沒有圖」，是「還沒
+              // 上去」——而使用者看到的訊息會是前者，然後他會去找一個不存在的
+              // 問題。重試一次就把那一段時間內的誤判清掉。
+              //
+              // 只重試一次、而且只在 404：其他錯誤（斷線、JSON 壞掉）重試只是
+              // 讓使用者多等一倍的時間看同一句話。
+              if (String(e.message).indexOf('404') >= 0) {{
+                try {{ s = await tfGrab(code, 'reload'); }} catch (e2) {{ e = e2; }}
+              }}
+              if (!s) {{
+                // 換過股票了就不要把錯誤蓋在新的那一張上面。
+                if (TF_CUR === code) tfNoChart(code, e.message);
+                return;
+              }}
             }}
+            TF_CACHE[code] = s;
           }}
         }}
         if (TF_CUR !== code) return;      // 抓回來的時候使用者已經點了別檔
@@ -3343,7 +3383,7 @@ document.addEventListener('DOMContentLoaded', function() { syncHdHeight(); });
         # 點到的會是隔壁那一檔，而且不會報錯。
         _live_block(rules, snapshots=snapshots,
                     drawn={s['code']: i for i, s in enumerate(stock_infos)},
-                    link_base=link_base, data_base=data_base),
+                    link_base=link_base, data_base=data_base, data_ver=ts),
         # 「滑鼠移入圖表 → 顯示指標｜左鍵拖曳｜滾輪縮放」那一行拿掉了。
         # 它教的是三件**試一次就知道**的事，而它每天出現在每一位讀者眼前，
         # 佔的還是頁首最寬的那一段。手機上更沒有滑鼠也沒有滾輪。

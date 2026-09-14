@@ -174,6 +174,7 @@ SNAPSHOT_COLUMNS: tuple[str, ...] = (
     'cross_ago', 'bw',                # ③ 發動：幾天前交叉、最近 N 天的頻寬
     'boll_up', 'donchian', 'vol_ratio',   # ④ 突破＋爆量
     'atr14',                          # 停損
+    'chg', 'chg_pct',                 # 側欄卡片上的漲跌（判定用不到）
 )
 
 
@@ -907,6 +908,12 @@ def run(
 
             don_last = (None if pd.isna(donchian.iloc[-1])
                         else round(float(donchian.iloc[-1]), 2))
+            # 漲跌與漲跌幅。放進快照是因為側欄那排卡片現在由前端畫——它要畫
+            # 的是**通過目前門檻**的那幾檔，而那一組隨時會變，所以每一檔都得
+            # 自己帶著卡片上要顯示的東西。
+            prev = float(close.iloc[-2]) if len(close) > 1 else price
+            chg = round(price - prev, 2)
+            chg_pct = round(chg / prev * 100, 2) if prev else 0.0
             snap = {
                 'code': code, 'name': NAME_MAP.get(code, code),
                 'industry': lookup_industry(code, ISIN_INDUSTRY),
@@ -922,6 +929,8 @@ def run(
                 'donchian': don_last,
                 'vol_ratio': round(vol_ratio, 2),
                 'atr14': round(atr_val, 2),
+                'chg': chg,
+                'chg_pct': chg_pct,
             }
             with _snap_lock:
                 SNAPSHOTS.append(snap)
@@ -1634,29 +1643,31 @@ LIVE_FIELDS: tuple[tuple[str, str, str, str, str], ...] = (
 )
 
 
-def _rules_block(rules, snapshots=None, drawn=None, link_base=''):
-    """頁首那一塊〔篩選條件〕——而且門檻是**可以當場改的**。
+def _live_block(rules, snapshots=None, drawn=None, link_base=''):
+    """頁首那一塊〔調整篩選條件〕，以及驅動左邊那排卡片的那段 JS。
 
-    `drawn` 是「這一頁上哪幾檔真的有圖」：``{代號: 側欄第幾張}``。它決定清單上
-    的名字是跳到圖（有圖）還是連去〔六大財務指標評等〕個股頁（沒圖）——所以它
-    必須來自 `stock_infos` 的實際順序，不是 `results` 的順序：資料不足的那幾檔
-    會在畫圖的迴圈裡被跳過，兩份的索引從那一檔起就錯開了。
+    ## 這一塊是這一頁的控制器，不是附註
 
-    ## 為什麼這裡做得到即時，而不是按一下等三十分鐘
+    改門檻 → 左邊那排卡片當場換掉 → 點一張就看那一檔的圖。和以前的操作完全一樣，
+    差別只在那排卡片不再是排程當天篩出來的那一組，而是**你現在這組門檻**篩出來的。
 
-    四部曲的每一個可調門檻，最後都只是拿一個數字去比大小。所以「換一組門檻會
-    篩出哪幾檔」不需要重算任何指標——只需要每一檔在最後一根 K 棒上的那十幾個
-    數字。那一份快照（含今天沒過篩的每一檔）就嵌在這一頁裡，1,900 檔壓縮後約
-    150 KB，而這份報告本來就有一兩 MB。
+    所以它不收合。收合的是〔預設篩選條件〕那把尺（右邊的燈泡）——那是查一次就
+    記得的東西，而輸入框是每次都要用的。
 
-    所以按下去是零等待，也**不需要任何憑證**——沒有東西要去伺服器上跑。
+    ## 為什麼做得到即時，而不是按一下等三十分鐘
 
-    ## 兩個誠實的限制，寫在畫面上
+    四部曲的每一個可調門檻，最後都只是拿一個數字去比大小。所以「換一組門檻會篩出
+    哪幾檔」不需要重算任何指標——只需要每一檔在最後一根 K 棒上的那十幾個數字。
+    那份快照（含今天沒過篩的每一檔）就嵌在這一頁裡，1,900 檔壓縮後約 150 KB，
+    而這份報告本來就有一兩 MB。
 
-    * K 線圖只有排程當天篩出來的那幾檔有。放寬門檻多出來的股票，清單上有、圖
-      沒有——那幾檔連到〔六大財務指標評等〕的個股頁。要每一檔都有圖，等於把
-      1,900 檔兩年的 K 棒全嵌進來，那是好幾百 MB。
-    * 「即時」是篩選零等待，不是盤中即時報價。資料還是每個交易日一份。
+    零等待，而且**不需要任何憑證**——沒有東西要去伺服器上跑。
+
+    ## 側欄只有一份實作
+
+    那排卡片以前是 Python 組好 HTML 送進來的。現在改由 JS 從快照畫，而 Python 那
+    一份**整個拿掉了**——不是留著當備援。兩份會在其中一邊改了樣式之後安靜地長得
+    不一樣，而這一頁本來就非有 JavaScript 不可（圖是 Plotly 畫的）。
 
     ## 判定寫了兩次
 
@@ -1664,6 +1675,13 @@ def _rules_block(rules, snapshots=None, drawn=None, link_base=''):
     而唯一的替代方案是把判定搬去伺服器——那就回到「按一下等三十分鐘」。重複的
     代價由 `tests/test_snapshot.py` 扛著：同一份快照、同一組門檻，兩邊的答案必須
     逐檔相同。
+
+    ## `drawn`
+
+    ``{代號: 側欄第幾張圖}``，決定點一張卡片是切到它的圖、還是顯示「這一檔今天
+    沒過預設篩選，這一頁上沒有它的圖」。它必須來自 `stock_infos` 的實際順序，
+    不是 `results` 的順序：資料不足的那幾檔會在畫圖的迴圈裡被跳過，兩份的索引從
+    那一檔起就錯開，而錯開的症狀是「點 A 跳到 B」——不會報錯。
     """
     if rules is None:
         return ''
@@ -1671,15 +1689,19 @@ def _rules_block(rules, snapshots=None, drawn=None, link_base=''):
         f'<li><b>{escape(label)}</b><span>{escape(text)}</span></li>'
         for label, text in rules.describe()
     )
-    block = (
-        '<details id="rules"><summary>篩選條件</summary>'
-        f'<ol>{items}</ol>'
+    # 〔預設篩選條件〕：右邊那顆燈泡。它是一把查一次就記得的尺，而輸入框是每次
+    # 都要用的——兩者的使用頻率差一個數量級，所以只有它收起來。
+    tip = (
+        '<details id="rules"><summary title="預設篩選條件">'
+        '<span aria-hidden="true">\U0001F4A1</span>'
+        '<span class="tiplabel">預設篩選條件</span></summary>'
+        f'<div class="tipbox"><ol>{items}</ol>'
         '<p class="stop">停損：進場後設在 <b>'
         f'收盤 − {rules.atr_stop:g} × ATR(14)</b>，'
-        '固定不放寬；收盤跌破 20MA 考慮出場。</p>'
+        '固定不放寬；收盤跌破 20MA 考慮出場。</p></div></details>'
     )
     if not snapshots:
-        return block + '</details>'
+        return tip
 
     fields = ''.join(
         f'<label><span>{escape(label)}</span>'
@@ -1695,39 +1717,31 @@ def _rules_block(rules, snapshots=None, drawn=None, link_base=''):
     # 是「一個裝著空 dict 的 set」——而那會在執行的時候才炸。
     drawn_js = json.dumps(dict(drawn or {}), ensure_ascii=False, sort_keys=True)
     link_js = json.dumps((link_base or '').rstrip('/'))
-    return block + f"""
+    cols = json.dumps({k: i for i, k in enumerate(SNAPSHOT_COLUMNS)})
+    return f"""
       <div id="live">
-        <div class="live-head">
-          <b>自己調門檻</b>
-          <span class="live-note">就在這一頁重算，不用等——資料是 {escape(_snap_note(snapshots))}。</span>
-        </div>
         <div class="live-fields">{fields}</div>
         <div class="live-bar">
           <button type="button" onclick="tfReset()">回到預設</button>
           <span id="live-count"></span>
+          {tip}
         </div>
-        <p class="live-limit">
-          「不用等」指的是<b>篩選</b>不用等，不是盤中即時報價——快照每個交易日一份。
-          標著〔無圖〕的是今天沒過預設篩選、這一頁上沒有畫它的 K 線圖的股票；
-          要它們的圖和 Excel，得用新門檻重跑一次。
-        </p>
-        <div class="live-wrap"><table id="live-table"><thead><tr>
-          <th>代號</th><th>名稱</th><th>產業</th><th class="n">收盤</th>
-          <th class="n">量比</th><th class="n">停損</th><th>觸發</th>
-        </tr></thead><tbody></tbody></table></div>
       </div>
-      </details>
       <script type="application/json" id="tf-snap">{rows}</script>
       <script>
-      // 這一段是 `pipeline.passes()` 的逐行翻譯。改了一邊要改另一邊，
+      // 這一段裡的 tfPass 是 `pipeline.passes()` 的逐行翻譯。改了一邊要改另一邊，
       // 而 tests/test_snapshot.py 會在兩邊不一致的時候紅。
       const TF_DAYS = {SNAPSHOT_DAYS};
-      const TF_KEYS = {json.dumps(list(LIVE_FIELDS and [f[0] for f in LIVE_FIELDS]))};
+      const TF_KEYS = {json.dumps([f[0] for f in LIVE_FIELDS])};
       const TF_DEFAULT = {json.dumps({f[0]: _live_default(rules, f[0]) for f in LIVE_FIELDS})};
+      // 欄位名 → 在那一列裡的位置。寫成名字而不是數字，是因為 `row[12]` 這種
+      // 東西在 SNAPSHOT_COLUMNS 中間插一欄之後會安靜地變成另一個指標。
+      const C = {cols};
       // 有圖的那幾檔：代號 → 側欄第幾張。放寬門檻多出來的股票不在裡面。
       const TF_DRAWN = {drawn_js};
       const TF_LINK = {link_js};
       let TF_ROWS = [];
+      let TF_HITS = [];
 
       function tfRules() {{
         const r = {{}};
@@ -1743,8 +1757,10 @@ def _rules_block(rules, snapshots=None, drawn=None, link_base=''):
       // 回傳 null 代表沒過；過了就回觸發訊號。和 passes() 同一個順序、
       // 同一組比較符號——`<=` 和 `<` 在邊界上是不同的答案。
       function tfPass(row, r) {{
-        const [ , , , close, vol20, amt20, ma20, ma60,
-                crossAgo, bw, up, don, volRatio ] = row;
+        const close = row[C.close], vol20 = row[C.vol20], amt20 = row[C.amt20];
+        const ma20 = row[C.ma20], ma60 = row[C.ma60];
+        const crossAgo = row[C.cross_ago], bw = row[C.bw];
+        const up = row[C.boll_up], don = row[C.donchian], volRatio = row[C.vol_ratio];
         if (close <= r.min_price) return null;
         if (vol20 <= r.min_vol20 || amt20 <= r.min_amount) return null;
         if (close <= ma60 || ma20 <= ma60) return null;
@@ -1766,41 +1782,122 @@ def _rules_block(rules, snapshots=None, drawn=None, link_base=''):
         return t;
       }}
 
+      function tfEsc(s) {{
+        return String(s).replace(/[&<>"]/g, function (c) {{
+          return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c];
+        }});
+      }}
+
+      // 一張側欄卡片。這是**唯一**一份實作——Python 那一份拿掉了。
+      // 台股慣例：漲紅、跌綠。
+      function tfCard(row, triggers, i) {{
+        const code = row[C.code], chg = row[C.chg], pct = row[C.chg_pct];
+        const cls = chg > 0 ? 'up' : (chg < 0 ? 'dn' : 'fl');
+        const sign = chg > 0 ? '▲ ' : (chg < 0 ? '▼ ' : '');
+        const drawn = Object.prototype.hasOwnProperty.call(TF_DRAWN, code);
+        const ext = TF_LINK
+          ? '<a class="nb-ext" href="' + TF_LINK + '/' + code + '.html" target="_blank"' +
+            ' rel="noopener" title="看這一檔的六大財務指標評等"' +
+            ' onclick="event.stopPropagation()">六大↗</a>'
+          : '';
+        const tags = triggers.map(function (t) {{
+          return '<span class="nb-tag">' + tfEsc(t) + '</span>';
+        }}).join('');
+        return '<div class="nb' + (drawn ? '' : ' nochart') + '" id="sb-' + i +
+          '" data-code="' + tfEsc(code) + '" onclick="tfOpen(\\'' + tfEsc(code) + '\\')">' +
+          '<div class="nb-top"><span class="nb-code">' + tfEsc(code) + '</span>' +
+          '<span class="nb-close ' + cls + '">' + row[C.close].toFixed(2) + '</span></div>' +
+          '<div class="nb-bot"><span class="nb-name">' + tfEsc(row[C.name]) + '</span>' +
+          '<span class="nb-pct ' + cls + '">' + sign + Math.abs(chg).toFixed(2) +
+          ' (' + pct.toFixed(2) + '%)</span></div>' +
+          '<div class="nb-ind">' + tfEsc(row[C.industry] || '') + '</div>' +
+          '<div class="nb-tagrow">' + tags + ext + '</div></div>';
+      }}
+
       function tfApply() {{
         const r = tfRules();
-        const hits = [];
+        TF_HITS = [];
         for (const row of TF_ROWS) {{
           const t = tfPass(row, r);
-          if (t) hits.push([row, t]);
+          if (t) TF_HITS.push([row, t]);
         }}
-        hits.sort((a, b) => b[0][12] - a[0][12] || (a[0][0] < b[0][0] ? -1 : 1));
+        // 量比高的排前面，同量比照代號。和 Excel 那一份同一個排法。
+        TF_HITS.sort(function (a, b) {{
+          return b[0][C.vol_ratio] - a[0][C.vol_ratio] ||
+                 (a[0][C.code] < b[0][C.code] ? -1 : 1);
+        }});
         const n = document.getElementById('live-count');
-        n.textContent = hits.length + ' 檔符合';
-        n.className = hits.length ? 'hit' : 'miss';
-        const body = document.getElementById('live-table').querySelector('tbody');
-        // 只畫前 200 列：再多就不是拿來讀的了，而 DOM 會開始卡。
-        body.innerHTML = hits.slice(0, 200).map(([row, t]) => {{
-          const stop = (row[3] - r.atr_stop * row[13]).toFixed(2);
-          // 三種情況，刻意長得不一樣：有圖（跳過去）、沒圖但有個股頁（開新分頁，
-          // 標成「無圖」）、兩者皆無（純文字）。把沒圖的也畫成一個會跳的連結，
-          // 是讓人點一下之後什麼都沒發生。
-          let name;
-          if (Object.prototype.hasOwnProperty.call(TF_DRAWN, row[0])) {{
-            name = '<a href="#" onclick="return tfJump(\\'' + row[0] + '\\')">' + row[1] + '</a>';
-          }} else if (TF_LINK) {{
-            name = '<a class="ext" target="_blank" rel="noopener" href="' + TF_LINK +
-                   '/' + row[0] + '.html" title="今天沒過篩，這一頁上沒有它的圖">' +
-                   row[1] + '<span class="nochart">無圖</span></a>';
-          }} else {{
-            name = row[1] + '<span class="nochart">無圖</span>';
-          }}
-          return '<tr><td class="c">' + row[0] + '</td><td>' + name +
-                 '</td><td class="i">' + row[2] + '</td><td class="n">' + row[3].toFixed(2) +
-                 '</td><td class="n">' + row[12].toFixed(2) + '</td><td class="n">' + stop +
-                 '</td><td class="t">' + t.join('｜') + '</td></tr>';
-        }}).join('') + (hits.length > 200
-          ? '<tr><td colspan="7" class="more">還有 ' + (hits.length - 200) +
-            ' 檔沒列出來——把門檻收緊一點。</td></tr>' : '');
+        n.textContent = TF_HITS.length + ' 檔符合';
+        n.className = TF_HITS.length ? 'hit' : 'miss';
+        const list = document.getElementById('sb-list');
+        // 只畫前 300 張：再多就不是拿來讀的了，而 DOM 會開始卡。
+        list.innerHTML = TF_HITS.slice(0, 300).map(function (h, i) {{
+          return tfCard(h[0], h[1], i);
+        }}).join('') + (TF_HITS.length > 300
+          ? '<div class="sb-more">還有 ' + (TF_HITS.length - 300) +
+            ' 檔沒列出來——把門檻收緊一點。</div>' : '');
+        // 門檻改過之後，原本選中的那一檔可能已經不在名單上了。還在就留著，
+        // 不在就跳到新名單的第一張——空著一張圖停在畫面上比切走更難懂。
+        const still = TF_HITS.findIndex(function (h) {{ return h[0][C.code] === TF_CUR; }});
+        if (still >= 0) tfMark(still);
+        else if (TF_HITS.length) tfOpen(TF_HITS[0][0][C.code]);
+        else tfOpen(null);
+      }}
+
+      let TF_CUR = null;
+
+      function tfMark(i) {{
+        const cards = document.querySelectorAll('#sb-list .nb');
+        for (const c of cards) c.classList.remove('act');
+        if (!cards[i]) return;
+        cards[i].classList.add('act');
+        // 手機上側欄是一條橫向滑動的列，選到的那一張可能在畫面外——換到它卻看
+        // 不到哪一張亮著，等於不知道自己在看哪一檔。
+        if (cards[i].scrollIntoView) {{
+          cards[i].scrollIntoView({{block: 'nearest', inline: 'nearest'}});
+        }}
+      }}
+
+      // 點一張卡片。有圖就切過去；沒圖的顯示為什麼沒有、以及去哪裡看。
+      function tfOpen(code) {{
+        TF_CUR = code;
+        const i = TF_HITS.findIndex(function (h) {{ return h[0][C.code] === code; }});
+        tfMark(i);
+        if (code === null) {{ tfNoChart(null); return false; }}
+        const at = TF_DRAWN[code];
+        if (at === undefined) {{ tfNoChart(code); return false; }}
+        tfHideNote();
+        if (typeof showChart === 'function') showChart(at);
+        return false;
+      }}
+
+      function tfHideNote() {{
+        const el = document.getElementById('tf-note');
+        if (el) el.hidden = true;
+        const col = document.getElementById('chartcol');
+        if (col) col.classList.remove('noting');
+      }}
+
+      // 沒有圖的時候，圖表區要說出**為什麼**，而不是留一片空白。
+      function tfNoChart(code) {{
+        const el = document.getElementById('tf-note');
+        const col = document.getElementById('chartcol');
+        if (!el) return;
+        el.hidden = false;
+        if (col) col.classList.add('noting');
+        if (code === null) {{
+          el.innerHTML = '<b>這組門檻下沒有任何一檔通過。</b>' +
+            '<p>把門檻放寬一點，或按〔回到預設〕。</p>';
+          return;
+        }}
+        const six = TF_LINK
+          ? '<p><a href="' + TF_LINK + '/' + code + '.html" target="_blank" rel="noopener">' +
+            '到〔六大財務指標評等〕看 ' + code + ' ↗</a></p>'
+          : '';
+        el.innerHTML = '<b>' + tfEsc(code) + '：這一頁上沒有它的 K 線圖。</b>' +
+          '<p>圖只有今天通過<b>預設門檻</b>的那幾檔有。' +
+          '放寬門檻多出來的股票，指標都在（左邊卡片上那些數字就是），' +
+          '但 K 棒沒有——把 1,900 檔兩年的 K 棒全嵌進來是好幾百 MB。</p>' + six;
       }}
 
       function tfReset() {{
@@ -1811,26 +1908,6 @@ def _rules_block(rules, snapshots=None, drawn=None, link_base=''):
         tfApply();
       }}
 
-      // 點名字跳到它的圖：側欄那張卡片的 id 是 btn-<第幾張>，而 TF_DRAWN 存的
-      // 就是那個序號。直接呼叫 showChart() 也行，但按卡片會順便把它標成 .act，
-      // 那是讀者回到側欄時找得到自己在哪的唯一線索。
-      function tfJump(code) {{
-        const i = TF_DRAWN[code];
-        if (i === undefined) return false;
-        const btn = document.getElementById('btn-' + i);
-        if (!btn) return false;
-        btn.click();
-        btn.scrollIntoView({{block: 'nearest'}});
-        return false;
-      }}
-
-      // 這一塊展開／收合會把頁首撐高或縮回，而 #main 的高度是用頁首實際高度
-      // 算出來的（--hd-h）。不同步的話，展開之後圖表區會被擠到視窗外面。
-      function tfSync() {{
-        if (typeof syncHdHeight === 'function') syncHdHeight();
-        if (typeof fitPlotSize === 'function') fitPlotSize(document.querySelector('.cw.act .plot'));
-      }}
-
       document.addEventListener('DOMContentLoaded', function () {{
         try {{ TF_ROWS = JSON.parse(document.getElementById('tf-snap').textContent); }}
         catch (e) {{ TF_ROWS = []; }}
@@ -1838,8 +1915,6 @@ def _rules_block(rules, snapshots=None, drawn=None, link_base=''):
           const el = document.getElementById('f_' + k);
           if (el) el.addEventListener('input', tfApply);
         }}
-        const det = document.getElementById('rules');
-        if (det) det.addEventListener('toggle', tfSync);
         tfApply();
       }});
       </script>"""
@@ -1879,6 +1954,18 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
     except ImportError:
         print('plotly 未安裝，跳過互動線圖'); return None
     if not results: return None
+    # `rules` 與 `snapshots` 現在是**必要的**，而不是「沒有就不畫那一塊」。
+    #
+    # 側欄那排卡片改由前端從快照畫（見 `_live_block`），所以少了任何一個，產出
+    # 的會是一份**沒有側欄**的報告——打得開、不報錯、什麼都點不到。以前它們可以
+    # 是 None，那時候頁面只是少一塊說明；現在它們是頁面的骨架。
+    #
+    # 在這裡擋掉，而不是讓它安靜地產一份壞掉的 HTML。
+    if rules is None or snapshots is None:
+        raise ValueError(
+            'build_interactive_html 需要 rules 與 snapshots：側欄那排卡片是從'
+            '快照畫出來的，少了它們會產出一份沒有側欄的報告'
+        )
 
     BG='#0d1117'; AXES='#161b22'; GRID='#30363d'; TEXT='#c9d1d9'
     MA20C='#f0c27f'; MA60C='#ff7b72'; BBC='#58a6ff'; STOPC='#ff4500'
@@ -2189,45 +2276,17 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
     ts_display = today_str.replace('-', '/')  # 用於 HTML 顯示
     info_js = _json.dumps(stock_infos, ensure_ascii=False)
 
-    def _esc(t):
-        return (str(t).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
-
-    # 側欄卡片右上角那個 ↗ 直接開個股頁。它在 `onclick="showChart(i)"` 的卡片
-    # **裡面**，所以要擋掉事件冒泡——不然點連結會順便把圖表也切過去，讀者回來
-    # 之後看到的是另一檔。
-    def _sb_link(s):
-        if not s.get('url'):
-            return ''
-        return ('<a class="nb-ext" href="{u}" target="_blank" rel="noopener" '
-                'title="看這一檔的六大財務指標評等" '
-                'onclick="event.stopPropagation()">六大&#x2197;</a>').format(u=s['url'])
-
-    nav_btns = '\n'.join(
-        '<div class="nb" id="btn-{i}" onclick="showChart({i})">'
-        '<div class="nb-top">'
-        '<span class="nb-code">{code}</span>'
-        '<span class="nb-close {pcls}">{close:.2f}</span>'
-        '</div>'
-        '<div class="nb-bot">'
-        '<span class="nb-name">{name}</span>'
-        '<span class="nb-pct {pcls}">{sign}{chg:.2f} ({pct:.2f}%)</span>'
-        '</div>'
-        # 產業從右邊圖表區那排徽章搬到這裡。它是這一檔**是什麼**，和代號、
-        # 名稱同一類；擺在右邊那排「20MA 幾塊、停損幾塊」中間，等於把一個
-        # 身分混進一串數字裡。
-        '<div class="nb-ind">{ind}</div>'
-        '<div class="nb-tagrow"><span class="nb-tag">{trig}</span>{ext}</div>'
-        '</div>'.format(
-            i=i, code=s['code'], name=_esc(s['name']),
-            ind=_esc(s.get('ind') or '—'),
-            close=s['close'], pct=abs(s['chg_pct']), chg=abs(s['chg']),
-            # 數字不帶正負號——方向由三角形表示，再加一個 +/- 是同一件事講兩次。
-            sign='▲ ' if s['chg_pct'] > 0 else ('▼ ' if s['chg_pct'] < 0 else ''),
-            pcls='up' if s['chg_pct'] > 0 else ('dn' if s['chg_pct'] < 0 else 'fl'),
-            ext=_sb_link(s),
-            trig=_esc(s['trigger'])[:22] + ('…' if len(s['trigger']) > 22 else ''))
-        for i, s in enumerate(stock_infos)
-    )
+    # 側欄那排卡片以前在這裡組（`nav_btns`）。整段拿掉了。
+    #
+    # 它畫的是「排程當天通過預設門檻的那幾檔」，而現在那排卡片要畫的是「通過
+    # **你現在這組門檻**的那幾檔」——那一組隨時會變，Python 在建站的時候不可能
+    # 知道。所以改由 `tfCard()` 從快照畫（見 `_live_block`）。
+    #
+    # 沒有留一份當「沒有 JS 時的備援」：兩份實作會在其中一邊改了樣式之後安靜地
+    # 長得不一樣，而這一頁本來就非有 JavaScript 不可——圖是 Plotly 畫的。
+    #
+    # `stock_infos` 仍然要算：它是 `INFO`（圖表區那排徽章）和 `drawn`（哪幾檔
+    # 真的有圖）的來源。
     chart_divs = '\n'.join(
         '<div class="cw" id="cw-{i}">'
         '<div class="badge-row" id="badges-{i}"></div>'
@@ -2250,9 +2309,10 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         'body{background:#0d1117;color:#c9d1d9;'
             'font-family:"Microsoft JhengHei",Arial,sans-serif;overflow-x:hidden}'
         # ── 頂部標題列（桌機顯示，手機隱藏）───────────────────
+        # h1 和 Excel 連結拿掉之後，這一塊只剩兩列：資訊那一行、輸入框那一列。
+        # 所以是縱向堆疊，不是橫排——橫排會讓輸入框擠在日期旁邊。
         '#hd{background:#161b22;border-bottom:1px solid #30363d;'
-            'padding:9px 16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}'
-        '#hd h1{font-size:15px;color:#e6edf3;white-space:nowrap}'
+            'padding:8px 16px 10px;display:flex;flex-direction:column;gap:2px}'
         '.meta{font-size:12px;color:#8b949e}'
         '.tip{font-size:12px;color:#f0c27f;margin-left:auto}'
         # ── 主體：左側清單 + 右側圖表，左右分欄、各自獨立捲動 ───
@@ -2292,13 +2352,19 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         '.nb-pct.dn{color:#3fb950}'
         '.nb-pct.fl{color:#8b949e}'
         '.nb-ind{font-size:11px;color:#79c0ff;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}'
-        '.nb-tagrow{display:flex;align-items:center;gap:6px;margin-top:6px}'
-        '.nb-tag{display:inline-block;padding:2px 8px;'
+        # 換行，不是擠成一排。門檻放寬之後一檔可以同時觸發四個訊號，而四顆
+        # 徽章塞進 300px 的側欄裡，每一顆都會被截成「黃…」「布…」——四個
+        # 都認不出來，等於那一列不存在。寧可高一點。
+        '.nb-tagrow{display:flex;flex-wrap:wrap;align-items:center;gap:5px;margin-top:6px}'
+        # `flex:0 0 auto` 是那條換行規則的另一半：不加的話，flex 仍然會先把每一
+        # 顆壓到最小寬度、壓不下去才換行，於是四顆一樣被截成「黃…」。
+        '.nb-tag{display:inline-block;flex:0 0 auto;padding:2px 8px;'
             'border-radius:11px;font-size:10.5px;background:rgba(240,194,127,.14);'
-            'color:#f0c27f;border:1px solid rgba(240,194,127,.32);'
-            'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}'
+            'color:#f0c27f;border:1px solid rgba(240,194,127,.32);white-space:nowrap}'
         # 側欄卡片上那個「六大↗」。刻意做得比觸發訊號那顆淡一點：它是一條出口，
         # 不是這一頁在講的事。
+        # 換行之後 `margin-left:auto` 會把它推到自己一行的最右邊——那正是要的：
+        # 它是一條出口，不是觸發訊號的一部分。
         '.nb-ext{margin-left:auto;flex:0 0 auto;padding:2px 8px;border-radius:11px;'
             'font-size:10.5px;text-decoration:none;background:rgba(88,166,255,.12);'
             'color:#58a6ff;border:1px solid rgba(88,166,255,.30);white-space:nowrap}'
@@ -2307,36 +2373,12 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         'a.badge.link{text-decoration:none;background:rgba(88,166,255,.16);'
             'color:#79c0ff;border-color:rgba(88,166,255,.42)}'
         'a.badge.link:hover{background:rgba(88,166,255,.30);border-color:#58a6ff}'
-        # 頂端那條 Excel 下載連結。
-        # 〔篩選條件〕：預設收起來，按一下展開。
+        # ── 〔調整篩選條件〕：頁首的控制器，**不收合** ──────────
         #
-        # 這四行以前只寫在 Excel 的第一分頁裡，而多數人只看這一頁——等於「這份
-        # 名單是怎麼篩出來的」對他們來說不存在。攤開來放又會把頁首撐成一大塊，
-        # 而它是每天回來看的人早就知道的東西。所以收起來，但**在頁面上**。
-        '#rules{font-size:12px;color:#8b949e;margin-top:4px}'
-        '#rules>summary{cursor:pointer;list-style:none;color:#58a6ff;'
-        'display:inline-flex;align-items:center;gap:4px;padding:2px 0}'
-        '#rules>summary::-webkit-details-marker{display:none}'
-        '#rules>summary::before{content:"\\25B8";display:inline-block;'
-        'transition:transform .15s}'
-        '#rules[open]>summary::before{transform:rotate(90deg)}'
-        '#rules ol{margin:6px 0 0;padding-left:0;list-style:none;'
-        'display:grid;gap:4px}'
-        '#rules li{display:grid;grid-template-columns:auto 1fr;gap:8px;'
-        'align-items:baseline;line-height:1.55}'
-        '#rules b{color:#e6edf3;font-weight:600;white-space:nowrap}'
-        '#rules .stop{margin:8px 0 0;color:#8b949e}'
-        '#rules .stop b{color:#ff7b72}'
-        # ── 〔自己調門檻〕：就在〔篩選條件〕底下 ───────────────
-        #
-        # 整塊在 #topbar 裡，而 #topbar 是 sticky、#main 的高度是用它的實際高度
-        # 算出來的。所以清單**一定**要有自己的 max-height 和捲軸：沒有的話，
-        # 放寬門檻篩出四百檔就會把頁首撐到比視窗還高，圖表區整個被擠出去。
-        '#live{margin-top:10px;padding-top:8px;border-top:1px solid #21262d}'
-        '#live .live-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}'
-        '#live .live-head b{color:#e6edf3;font-size:12.5px}'
-        '#live .live-note{color:#6e7681;font-size:11px}'
-        '#live .live-fields{display:flex;flex-wrap:wrap;gap:6px 10px;margin-top:6px}'
+        # 它決定左邊那排卡片是哪幾檔。每次進來都要用，所以攤開；收起來的是右邊
+        # 那顆燈泡裡的〔預設篩選條件〕——那是查一次就記得的一把尺。
+        '#live{margin-top:6px}'
+        '#live .live-fields{display:flex;flex-wrap:wrap;gap:6px 10px}'
         '#live label{display:inline-flex;align-items:center;gap:4px;'
             'font-size:11px;color:#8b949e}'
         '#live input{width:74px;background:#0d1117;color:#e6edf3;'
@@ -2344,41 +2386,55 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
             'font-family:inherit;font-size:11.5px}'
         '#live input:focus{outline:none;border-color:#58a6ff}'
         '#live em{font-style:normal;color:#6e7681;font-size:10.5px}'
-        '#live .live-bar{display:flex;align-items:center;gap:10px;margin-top:6px}'
+        '#live .live-bar{display:flex;align-items:center;gap:10px;margin-top:6px;'
+            'flex-wrap:wrap}'
         '#live .live-bar button{background:#21262d;color:#c9d1d9;'
             'border:1px solid #30363d;border-radius:5px;padding:3px 10px;'
             'font-family:inherit;font-size:11.5px;cursor:pointer}'
         '#live .live-bar button:hover{background:#30363d;border-color:#8b949e}'
         '#live #live-count{font-size:11.5px;font-weight:600}'
-        # 兩個誠實的限制寫在畫面上，不是只寫在原始碼的註解裡。
-        '#live .live-limit{margin:6px 0 0;color:#6e7681;font-size:10.5px;'
-            'line-height:1.6;max-width:74em}'
-        '#live .live-limit b{color:#8b949e;font-weight:600}'
         '#live #live-count.hit{color:#7ee787}'
         '#live #live-count.miss{color:#8b949e}'
-        '#live .live-wrap{max-height:26vh;overflow:auto;margin-top:6px;'
-            'border:1px solid #21262d;border-radius:6px}'
-        '#live table{border-collapse:collapse;width:100%;font-size:11.5px}'
-        '#live th{position:sticky;top:0;background:#161b22;color:#8b949e;'
-            'text-align:left;font-weight:600;padding:4px 8px;'
-            'border-bottom:1px solid #30363d;white-space:nowrap}'
-        '#live td{padding:3px 8px;border-bottom:1px solid #161b22;color:#c9d1d9}'
-        '#live tr:hover td{background:#161b22}'
-        '#live td.c{color:#e6edf3;font-weight:600}'
-        '#live td.i{color:#79c0ff}'
-        '#live th.n,#live td.n{text-align:right;font-variant-numeric:tabular-nums}'
-        '#live td.t{color:#f0c27f}'
-        '#live td.more{color:#6e7681;text-align:center;padding:6px}'
-        '#live a{color:#58a6ff;text-decoration:none}'
-        '#live a:hover{text-decoration:underline}'
-        # 「無圖」不是錯誤，是這一頁的邊界：門檻放寬多出來的股票，排程當天沒有
-        # 畫它的圖。做成一顆很淡的標籤，看得見但不搶眼。
-        '#live .nochart{margin-left:5px;padding:0 5px;border-radius:9px;'
-            'font-size:9.5px;color:#6e7681;border:1px solid #30363d}'
-        '#hd a.dl{color:#7ee787;text-decoration:none;font-size:12px;'
-            'border:1px solid rgba(126,231,135,.32);border-radius:12px;'
-            'padding:3px 10px;white-space:nowrap}'
-        '#hd a.dl:hover{background:rgba(126,231,135,.14)}'
+        # ── 〔預設篩選條件〕：那顆燈泡 ────────────────────────
+        #
+        # 用 <details> 而不是 hover 提示：手機上沒有 hover，而這一頁一半的時間
+        # 是在手機上看的。展開的內容絕對定位，所以按一下不會把底下的圖擠下去。
+        '#rules{position:relative;font-size:12px;color:#8b949e;margin-left:auto}'
+        '#rules>summary{cursor:pointer;list-style:none;color:#8b949e;'
+            'display:inline-flex;align-items:center;gap:5px;padding:3px 10px;'
+            'border:1px solid #30363d;border-radius:12px;font-size:11.5px;'
+            'white-space:nowrap}'
+        '#rules>summary:hover{color:#e6edf3;border-color:#58a6ff}'
+        '#rules[open]>summary{color:#e6edf3;border-color:#58a6ff}'
+        '#rules>summary::-webkit-details-marker{display:none}'
+        '#rules .tipbox{position:absolute;right:0;top:calc(100% + 6px);z-index:60;'
+            'width:min(560px,86vw);background:#161b22;border:1px solid #30363d;'
+            'border-left:3px solid #58a6ff;border-radius:6px;padding:10px 13px;'
+            'box-shadow:0 8px 24px rgba(0,0,0,.45);text-align:left;'
+            'line-height:1.6}'
+        '#rules ol{margin:0;padding-left:0;list-style:none;display:grid;gap:4px}'
+        '#rules li{display:grid;grid-template-columns:auto 1fr;gap:8px;'
+            'align-items:baseline;line-height:1.55}'
+        '#rules b{color:#e6edf3;font-weight:600;white-space:nowrap}'
+        '#rules .stop{margin:8px 0 0;color:#8b949e}'
+        '#rules .stop b{color:#ff7b72}'
+        # ── 側欄：沒有圖的那幾檔 ─────────────────────────────
+        #
+        # 「沒有圖」不是錯誤，是這一頁的邊界：放寬門檻多出來的股票，排程當天沒有
+        # 畫它的 K 線。卡片照常有（指標都在），只是左邊那條色帶淡掉——看得出來
+        # 不一樣，但不是警告。
+        '.nb.nochart{border-style:dashed;opacity:.86}'
+        '.nb.nochart .nb-code{color:#8b949e}'
+        '.sb-more{color:#6e7681;font-size:11px;text-align:center;padding:10px 6px}'
+        # 圖表區那塊「這一檔沒有圖」的說明。它出現的時候要把 K 線圖蓋掉——
+        # 兩個同時在畫面上，讀者會以為那張圖就是這一檔的。
+        '#chartcol.noting .cw{display:none !important}'
+        '#tf-note{margin:auto;max-width:46em;padding:24px 20px;color:#8b949e;'
+            'font-size:13px;line-height:1.75;text-align:center}'
+        '#tf-note b{color:#e6edf3}'
+        '#tf-note p{margin:8px 0 0}'
+        '#tf-note a{color:#58a6ff;text-decoration:none}'
+        '#tf-note a:hover{text-decoration:underline}'
         # ── 圖表區內：徽章列 + 觸發訊號 + 圖表本體 + 時間範圍列 ─
         '.cw{display:none;width:100%;height:100%;padding:10px 16px 12px;'
             'flex-direction:column;min-height:0}'
@@ -2429,9 +2485,7 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
             'html,body{overflow:hidden}'
             ':root{--hd-h:auto}'
             '#hd{flex-wrap:wrap;gap:6px;padding:8px 10px}'
-            '#hd h1{font-size:13px;white-space:normal}'
             '#hd .meta{font-size:11px}'
-            '#hd a.dl{font-size:11px;padding:2px 8px}'
             '#main{flex-direction:column;height:calc(100vh - var(--hd-h,86px))}'
             # 側欄變成一條橫向滑動的籌碼列。
             '#sidebar{width:100%;flex:0 0 auto;height:auto;max-height:none;'
@@ -2725,14 +2779,13 @@ function attachAutoY(div) {
 
 /* ── 切換個股 ─────────────────────────────────────────────── */
 function showChart(idx) {
-  document.querySelectorAll('.nb').forEach(function(b,i){
-    b.classList.toggle('act', i===idx);
-    /* 手機上清單是一條橫向滑動的列，選到的那一張可能在畫面外——換到它卻看不到
-       哪一張亮著，等於不知道自己在看哪一檔。 */
-    if (i === idx && b.scrollIntoView) {
-      b.scrollIntoView({block: 'nearest', inline: 'nearest'});
-    }
-  });
+  /* 側欄那排卡片的 .act 由 tfMark() 管，這裡**不能**碰。
+     
+     以前兩者是同一個索引：第 i 張卡片對到第 i 張圖。現在不是了——卡片是「通過
+     你這組門檻的那幾檔」，圖是「排程當天通過預設門檻的那幾檔」，兩份名單的長度
+     和順序都不一樣。這裡照舊用 idx 去標，標到的會是另一檔。
+     
+     這不是推論出來的：改完第一次跑就踩到了。點 2317，亮起來的是 2330。 */
   document.querySelectorAll('.cw').forEach(function(el,i){ el.classList.toggle('act', i===idx); });
   updateIB(idx);
 
@@ -2795,7 +2848,13 @@ window.addEventListener('resize', function() {
   if (a) fitPlotSize(a);
 });
 
-document.addEventListener('DOMContentLoaded', function() { syncHdHeight(); showChart(0); });
+/* `showChart(0)` 拿掉了。哪一檔先顯示現在由 tfApply() 決定——它畫完側欄之後
+   會叫 tfOpen() 開第一張卡片，而那一張未必是 results[0]。
+   
+   兩邊都做的症狀很安靜：側欄亮著 2317，右邊畫的是 2330。這一頁的 DOMContentLoaded
+   有兩個監聽器（〔調整篩選條件〕那段在文件裡比較前面，所以先跑），後跑的這一個
+   會把前一個開好的圖蓋掉，但蓋不掉側欄上的那個亮框。 */
+document.addEventListener('DOMContentLoaded', function() { syncHdHeight(); });
 """
     js = js.replace('INFO_JS_PLACEHOLDER', info_js)\
            .replace('TS_PH', ts.replace('_', ''))
@@ -2810,45 +2869,50 @@ document.addEventListener('DOMContentLoaded', function() { syncHdHeight(); showC
         '</head><body>',
         '<div id="topbar">',
         '<div id="hd">',
-        '<h1>&#x1F1F9;&#x1F1FC; \u53f0\u80a1\u9806\u52e2\u4ea4\u6613\u7be9\u9078\u7cfb\u7d71 V3.1</h1>',
-        '<div class="meta">\u7be9\u9078\u65e5\u671f\uff1a' + ts_display +
-        '&nbsp;|&nbsp;\u5171&nbsp;<b style="color:#3fb950">' + str(n) +
-        '</b>&nbsp;\u6a94\u901a\u904e</div>',
-        # 〔篩選條件〕就在這一行底下。以前它只寫在 Excel 的第一分頁，而多數人
-        # 只看這一頁——等於「這份名單是怎麼篩出來的」對他們來說不存在。
+        # 〔🇹🇼 台股順勢交易篩選系統 V3.1〕那一行拿掉了。
+        #
+        # 這一頁是嵌在〔六大財務指標評等〕網站的〔台股趨勢選股〕分頁裡的——分頁
+        # 標籤上已經寫著它是什麼，而這一行在它正下方又說了一次，佔掉頁首最高的
+        # 那一段。版本號更是只有寫它的人看得懂。
+        #
+        # 時間跟在日期後面：同一天重跑過兩次的時候，這是唯一分得出「我現在看的
+        # 是哪一份」的東西。
+        #
+        # 「共 N 檔通過」改成「**預設門檻**共 N 檔通過」：底下那排卡片現在會隨著
+        # 你調的門檻變，兩個數字不一樣是正常的，而不說清楚就會看起來像壞掉。
+        '<div class="meta">\u7be9\u9078\u65e5\u671f\uff1a' + ts_display + ' ' +
+        now.strftime('%H:%M') +
+        '&nbsp;|&nbsp;\u9810\u8a2d\u9580\u6abb\u5171&nbsp;<b style="color:#3fb950">' +
+        str(n) + '</b>&nbsp;\u6a94\u901a\u904e</div>',
+        # 〔調整篩選條件〕就在這一行底下，**不收合**——它是這一頁的控制器，改了
+        # 就換掉左邊那排卡片。收起來的是右邊那顆燈泡裡的〔預設篩選條件〕。
+        #
         # `drawn` 取自 stock_infos 而不是 results：畫圖的迴圈會跳過資料不足的那
-        # 幾檔，而側欄卡片的 id 是照 stock_infos 編的。用 results 的索引，點到的
-        # 會是隔壁那一檔。
-        _rules_block(rules, snapshots=snapshots,
-                     drawn={s['code']: i for i, s in enumerate(stock_infos)},
-                     link_base=link_base),
+        # 幾檔，而側欄卡片對應的圖是照 stock_infos 編號的。用 results 的索引，
+        # 點到的會是隔壁那一檔，而且不會報錯。
+        _live_block(rules, snapshots=snapshots,
+                    drawn={s['code']: i for i, s in enumerate(stock_infos)},
+                    link_base=link_base),
         # 「滑鼠移入圖表 → 顯示指標｜左鍵拖曳｜滾輪縮放」那一行拿掉了。
         # 它教的是三件**試一次就知道**的事，而它每天出現在每一位讀者眼前，
         # 佔的還是頁首最寬的那一段。手機上更沒有滑鼠也沒有滾輪。
-        # Excel 版（每一檔一張 K 線圖）的連結。
         #
-        # 指向哪裡由呼叫端決定（見 `__main__._env_excel_url`）：排程上是這個
-        # repo 的 Releases 頁——不過期、不必登入就下載得到、每天一個、歷史全留。
-        #
-        # 「30 天內」那句只在連到 **Actions 的執行頁面**時才出現，因為那是
-        # artifact 的保留期限。一句寫死的「30 天內」掛在一個永久連結旁邊，
-        # 比不寫糟：它會讓人以為那份檔案會消失，而它不會。
-        ('<a class="dl" href="' + excel_url + '" target="_blank" rel="noopener" '
-         + ('title="\u8a72\u6b21\u57f7\u884c\u7684 Artifacts \u5340\uff0c'
-            '\u4fdd\u7559 30 \u5929">'
-            '\u2b07\ufe0f Excel \u5831\u8868\uff0830 \u5929\u5167\uff09</a>'
-            if '/actions/runs/' in excel_url else
-            'title="\u6bcf\u500b\u4ea4\u6613\u65e5\u4e00\u4efd\uff0c'
-            '\u6700\u65b0\u7684\u5728\u6700\u4e0a\u9762">'
-            '\u2b07\ufe0f Excel \u5831\u8868</a>'))
-        if excel_url else '',
+        # 〔⬇️ Excel 報表〕那顆連結也拿掉了。這一頁上有的東西 Excel 裡幾乎都有，
+        # 而且這一頁還多了「自己調門檻」——那是 Excel 給不了的。Excel 照常每天
+        # 產、照常發到 Releases，要的人去那裡拿；只是它不再佔著頁首的位置。
+        # （`excel_url` 這個參數留著：拿掉它會讓呼叫端跟著改，而它隨時可能要回來。）
         '</div>',
         '</div>',  # /#topbar
         '<div id="main">',
         '<div id="sidebar">',
-        '<div id="sb-list">' + nav_btns + '</div>',
+        # 空的。側欄那排卡片由 tfApply() 從快照畫出來——Python 那一份**拿掉了**，
+        # 不是留著當備援。兩份實作會在其中一邊改了樣式之後安靜地長得不一樣，
+        # 而這一頁本來就非有 JavaScript 不可（圖是 Plotly 畫的）。
+        '<div id="sb-list"></div>',
         '</div>',  # /#sidebar
-        '<div id="chartcol">' + chart_divs + '</div>',
+        # `#tf-note` 是「這一檔沒有圖」時說話的地方。預設 hidden，由 tfNoChart()
+        # 打開——留一片空白的圖表區，讀者會以為是還沒載入完。
+        '<div id="chartcol"><div id="tf-note" hidden></div>' + chart_divs + '</div>',
         '</div>',  # /#main
         '\n'.join(fig_json_tags),   # <-- 圖表資料放在獨立 script[type=application/json]
         '<script>' + js + '</script>',

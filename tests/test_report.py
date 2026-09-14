@@ -50,18 +50,38 @@ def _fake_result(code='2330', name='台積電', days=900):
     }
 
 
+def _fake_snap(code='2330', name='台積電'):
+    """和 `_fake_result` 同一檔的快照。
+
+    側欄那排卡片是前端從快照畫的，所以**沒有快照就沒有側欄**——這個 helper 存在
+    是為了讓每一條報告測試都拿到一份完整的頁面，而不是一份沒有側欄的。
+    """
+    from tw_trend_filter.pipeline import SNAPSHOT_COLUMNS, SNAPSHOT_DAYS
+
+    snap = {
+        'code': code, 'name': name, 'industry': '半導體業',
+        'close': 200.0, 'vol20': 5000.0, 'amt20': 9e8,
+        'ma20': 195.0, 'ma60': 180.0,
+        'cross_ago': 3, 'bw': [0.30] * (SNAPSHOT_DAYS - 1) + [0.05],
+        'boll_up': 196.0, 'donchian': 198.0,
+        'vol_ratio': 1.35, 'atr14': 4.2,
+        'chg': 1.0, 'chg_pct': 0.5,
+    }
+    assert set(snap) == set(SNAPSHOT_COLUMNS), '快照欄位和 SNAPSHOT_COLUMNS 對不上'
+    return snap
+
+
 def _build(tmp_path, **kw):
+    from tw_trend_filter.pipeline import DEFAULT_RULES
+
+    kw.setdefault('rules', DEFAULT_RULES)
+    kw.setdefault('snapshots', [_fake_snap()])
     path = build_interactive_html(
         [_fake_result()], '2026-09-04', str(tmp_path),
         datetime.datetime(2026, 9, 4, 15, 30), **kw)
     assert path, 'build_interactive_html 回傳 None'
     return open(path, encoding='utf-8').read()
 
-
-#: 側欄那顆 ↗ 是 Python 端組出來的，沒有連結時整段不會出現。
-#: 不能拿 class 名去找——CSS 裡永遠有一份 `.nb-ext` 的定義，那樣的測試
-#: 對著一份沒有連結的報告也會過。
-SIDEBAR_LINK = 'class="nb-ext" href='
 
 #: 圖表區那顆是前端畫的，所以 JS 樣板一定在 HTML 裡；真正決定畫不畫的是
 #: INFO 陣列裡那個 url 欄位。
@@ -70,29 +90,34 @@ def _has_badge_link(html, url):
 
 
 def test_link_base_變成每一檔的個股頁連結(tmp_path):
+    """側欄那顆 ↗ 和圖表區那顆，兩個都要在。
+
+    側欄那排卡片現在由前端從快照畫（門檻可調，Python 在建站時不知道會篩出哪
+    幾檔），所以 Python 端能驗的是**送給前端的那個基底網址**。整條路由
+    `test_snapshot.py` 的端對端那幾條顧。
+    """
     html = _build(tmp_path, link_base='https://example.org/stock')
-    # 側欄那顆和圖表區那顆，兩個都要在。
-    assert SIDEBAR_LINK in html
-    assert 'https://example.org/stock/2330.html' in html
+    assert 'const TF_LINK = "https://example.org/stock"' in html
     assert _has_badge_link(html, 'https://example.org/stock/2330.html')
 
 
 def test_側欄連結不會順便切換圖表(tmp_path):
-    # 連結在 onclick="showChart(i)" 的卡片裡面，沒擋住冒泡的話點它會
-    # 連帶切走圖表，讀者從新分頁回來時看的是另一檔。
+    # 連結在 onclick="tfOpen(code)" 的卡片裡面，沒擋住冒泡的話點它會連帶切走
+    # 圖表，讀者從新分頁回來時看的是另一檔。
     html = _build(tmp_path, link_base='https://example.org/stock')
     assert 'event.stopPropagation()' in html
 
 
 def test_沒給_link_base_就完全不畫連結(tmp_path):
     html = _build(tmp_path, link_base='')
-    assert SIDEBAR_LINK not in html
-    assert _has_badge_link(html, '')          # url 是空的 → 前端不畫那顆
+    assert 'const TF_LINK = ""' in html       # 空字串 → 前端不畫那顆
+    assert _has_badge_link(html, '')
     assert 'example.org' not in html
 
 
 def test_結尾斜線不會生出雙斜線(tmp_path):
     html = _build(tmp_path, link_base='https://example.org/stock/')
+    assert 'const TF_LINK = "https://example.org/stock"' in html
     assert 'https://example.org/stock/2330.html' in html
     assert 'stock//2330' not in html
 
@@ -132,25 +157,22 @@ def test_裁切真的讓檔案變小(tmp_path):
     assert len(short_html) < len(long_html)
 
 
-def test_excel_連結有給才出現(tmp_path):
-    assert 'Excel' not in _build(tmp_path, excel_url='')
-    # 連到 Actions 的執行頁面時（沒有 release 可用的退路），30 天這件事要寫在
-    # 連結旁邊，不能讓人點下去才知道過期了。
-    html = _build(tmp_path, excel_url='https://github.com/a/b/actions/runs/1')
-    assert 'https://github.com/a/b/actions/runs/1' in html
-    assert '30 天' in html
+def test_報告頁上不再有_excel_連結(tmp_path):
+    """〔⬇️ Excel 報表〕那顆連結拿掉了。
 
+    這一頁上有的東西 Excel 裡幾乎都有，而且這一頁還多了「自己調門檻」——那是
+    Excel 給不了的。Excel 照常每天產、照常發到 Releases，只是不再佔著頁首。
 
-def test_releases_的連結不寫_30_天(tmp_path):
-    """「30 天內」是 artifact 的保留期限，不是 release 的。
-
-    一句寫死的「30 天內」掛在一個永久連結旁邊，比不寫糟——它會讓人以為那份
-    檔案會消失，而它不會。
+    `excel_url` 這個參數**留著**（呼叫端不必跟著改，而它隨時可能要回來），所以
+    這條測試守的是「傳了也不會畫出來」——不然某天有人把那顆連結加回去，而沒有
+    人記得當初為什麼拿掉。
     """
     html = _build(tmp_path, excel_url='https://github.com/a/b/releases')
-    assert 'https://github.com/a/b/releases' in html
-    assert '30 天' not in html
-    assert 'Excel 報表' in html
+    assert 'https://github.com/a/b/releases' not in html
+    # 數的是那顆連結的樣子，不是「Excel」這四個字母——JS 的註解裡有一句「和
+    # Excel 那一份同一個排法」，拿字串去找會把它一起找到，然後這條測試永遠紅。
+    assert 'class="dl"' not in html
+    assert 'Excel 報表' not in html
 
 
 def test_連結指的是_releases_列表頁(monkeypatch=None):

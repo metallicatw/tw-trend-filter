@@ -517,5 +517,5 @@ def test_沒給門檻就整塊不出現():
     """印一組**可能不是這一趟用的**門檻，比不印更糟。"""
     import tw_trend_filter.pipeline as pl
 
-    assert pl._rules_block(None) == ''
-    assert 'id="rules"' in pl._rules_block(DEFAULT_RULES)
+    assert pl._live_block(None) == ''
+    assert 'id="rules"' in pl._live_block(DEFAULT_RULES)

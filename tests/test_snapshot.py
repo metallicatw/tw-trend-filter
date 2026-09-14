@@ -39,7 +39,7 @@ from tw_trend_filter.pipeline import (
     SNAPSHOT_COLUMNS,
     SNAPSHOT_DAYS,
     Rules,
-    _rules_block,
+    _live_block,
     passes,
     snapshot_row,
 )
@@ -76,7 +76,7 @@ console.log(JSON.stringify(out));
 
 def _page_js():
     """報告網頁上那一段 `<script>`（不含裝快照的那個 application/json）。"""
-    html = _rules_block(DEFAULT_RULES, snapshots=[_snap()])
+    html = _live_block(DEFAULT_RULES, snapshots=[_snap()])
     # 最後一個 <script> … </script> 就是判定那一段；前面那個是
     # <script type="application/json">，開頭的標籤不一樣，所以 rsplit 不會切錯。
     head, _, tail = html.rpartition('<script>')
@@ -143,6 +143,9 @@ def _snap(close=100.0, **kw):
         'bw': [0.30] * (SNAPSHOT_DAYS - 1) + [0.05],
         'boll_up': close * 0.98, 'donchian': close * 0.99,
         'vol_ratio': 1.5, 'atr14': close * 0.02,
+        # 判定用不到這兩個，側欄卡片要用。給一組固定值就好——它們進不了
+        # `passes()`，但少了它們 `snapshot_row()` 會 KeyError。
+        'chg': 1.0, 'chg_pct': 1.0,
     }
     s.update(kw)
     assert set(s) == set(SNAPSHOT_COLUMNS), '快照欄位和 SNAPSHOT_COLUMNS 對不上'
@@ -299,34 +302,43 @@ def test_網頁上的預設值就是這一次真的跑的那組門檻():
     1.1 篩的——畫面和內容安靜地不一致，正是這個專案踩過的那一類錯。
     """
     r = Rules(min_price=33, min_amount=1.23e8, vol_ratio=1.05)
-    html = _rules_block(r, snapshots=[_snap()])
+    html = _live_block(r, snapshots=[_snap()])
     assert 'id="f_min_price" type="number" min="0" step="1" value="33"' in html
     assert 'value="123"' in html          # 成交金額換算成百萬
     assert 'id="f_vol_ratio"' in html and 'value="1.05"' in html
 
 
-def test_沒有快照就不畫那一塊():
-    """沒有快照的時候（例如舊版的呼叫端），頁面上不該出現一個按了沒反應的表單。"""
-    html = _rules_block(DEFAULT_RULES)
-    assert '篩選條件' in html
+def test_沒有快照就只剩那把尺():
+    """沒有快照的時候只留〔預設篩選條件〕那顆燈泡，不畫一個按了沒反應的表單。
+
+    （`build_interactive_html` 那一層現在會直接擋掉沒有快照的呼叫——見
+    `test_沒有快照的報告根本產不出來`。這一條守的是 `_live_block` 自己。）
+    """
+    html = _live_block(DEFAULT_RULES)
+    assert '預設篩選條件' in html
     assert 'id="live"' not in html
     assert 'tfPass' not in html
 
 
-def test_有圖的那幾檔點名字跳到圖沒圖的連去個股頁():
-    """`TF_DRAWN` 空的話，清單上每一個名字都會變成純文字——而那是它壞掉時的樣子。"""
-    html = _rules_block(DEFAULT_RULES, snapshots=[_snap()],
-                        drawn={'2330': 0, '2317': 1},
-                        link_base='https://example.invalid/six/')
+def test_有圖沒圖的那幾檔都在側欄上而且分得出來():
+    """`TF_DRAWN` 決定點一張卡片是切到它的圖，還是說「這一頁上沒有它的圖」。
+
+    空的話每一張卡片都會變成「沒有圖」——而那正是它壞掉時的樣子，不會報錯。
+    """
+    html = _live_block(DEFAULT_RULES, snapshots=[_snap()],
+                       drawn={'2330': 0, '2317': 1},
+                       link_base='https://example.invalid/six/')
     assert '"2317": 1' in html or '"2317":1' in html
     assert 'const TF_LINK = "https://example.invalid/six"' in html
-    assert 'function tfJump' in html
-    assert "document.getElementById('btn-' + i)" in html
+    assert 'function tfOpen' in html
+    assert 'function tfNoChart' in html
+    # 有圖的那幾檔走 showChart（就是以前點側欄卡片做的事）。
+    assert 'showChart(at)' in html
 
 
 # ── 快照真的到得了那一頁 ──────────────────────────────────────────
 #
-# 上面每一支都在驗 `_rules_block()` 本身。但這一整條路上最容易斷的不是它，
+# 上面每一支都在驗 `_live_block()` 本身。但這一整條路上最容易斷的不是它，
 # 是**呼叫端忘了把 snapshots 傳下去**——那時候頁面照樣產得出來、照樣沒有錯誤，
 # 只是〔自己調門檻〕整塊不見了。這一支從 `build_interactive_html` 這一端進去。
 
@@ -375,18 +387,86 @@ def test_快照傳得到報告頁上(tmp_path):
     assert 'id="live"' in html
     assert 'id="tf-snap"' in html
     assert 'function tfPass' in html
-    assert '#live .live-wrap{max-height' in html, '清單沒有高度上限，會把頁首撐爆'
+    # 〔調整篩選條件〕不收合：它是這一頁的控制器，改了就換掉左邊那排卡片。
+    # 收起來的是右邊那顆燈泡裡的〔預設篩選條件〕。
+    assert '<div id="live">' in html
+    assert '<details id="rules">' in html
+    assert '預設篩選條件' in html
 
 
-def test_沒傳快照的時候那一塊整個不出現(tmp_path):
-    html = _page(tmp_path)
-    assert '篩選條件' in html
-    assert 'id="live"' not in html
+def test_沒有快照的報告根本產不出來(tmp_path):
+    """少了快照，產出的會是一份**沒有側欄**的報告：打得開、不報錯、什麼都點不到。
+
+    所以在 `build_interactive_html` 那一層就擋掉，而不是讓它安靜地產一份壞的。
+    以前 `rules=None` 的意思是「不畫那一塊說明」；現在它們是頁面的骨架。
+    """
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match='snapshots'):
+        _page(tmp_path, snapshots=None)
 
 
-def test_有圖的那幾檔在_TF_DRAWN_裡而且序號對得上側欄(tmp_path):
+def test_側欄整排卡片由前端畫_python_端不再組一份(tmp_path):
+    """兩份實作會在其中一邊改了樣式之後安靜地長得不一樣。
+
+    舊版是 Python 組好 `nav_btns` 送進 HTML。它畫的是「排程當天通過預設門檻的
+    那幾檔」——而現在那排卡片要畫的是「通過**你現在這組門檻**的那幾檔」，那一組
+    Python 在建站時不可能知道。所以只留前端那一份。
+    """
+    html = _page(tmp_path, snapshots=[_snap(code='2330'), _snap(code='6505')])
+    assert '<div id="sb-list"></div>' in html, 'Python 又組了一份側欄'
+    assert 'function tfCard' in html, '前端那一份不見了'
+    assert 'id="btn-0"' not in html, '舊的側欄卡片還在'
+
+
+def test_有圖的那幾檔在_TF_DRAWN_裡而且序號對得上(tmp_path):
     """序號錯一位的症狀是「點 A 跳到 B」，而它不會報錯。"""
     html = _page(tmp_path, snapshots=[_snap(code='2330'), _snap(code='6505')])
     assert '"2330": 0' in html or '"2330":0' in html
     assert '6505' not in html.split('const TF_DRAWN =')[1].split(';')[0]
-    assert 'id="btn-0"' in html
+
+
+def test_側欄選中的那一檔和右邊畫的那一張是同一檔(tmp_path):
+    """兩邊由不同的東西決定，所以會各走各的——而症狀很安靜：側欄亮著 2317，
+    右邊畫的是 2330。
+
+    真的踩到過兩次，兩次都是「有兩個地方在管同一件事」：
+
+    1. `showChart(idx)` 自己會去標側欄第 idx 張卡片。以前那是對的（第 i 張卡片
+       就是第 i 張圖），現在不是了——卡片是「通過你這組門檻的那幾檔」，圖是
+       「排程當天通過預設門檻的那幾檔」，兩份名單的長度和順序都不一樣。
+    2. 頁面載入時 `DOMContentLoaded` 有兩個監聽器，後跑的那個寫死 `showChart(0)`，
+       把前一個開好的圖蓋掉，卻蓋不掉側欄上的亮框。
+
+    所以這條測試守的是**唯一性**：側欄的 .act 只有 tfMark 在寫，開哪一張圖只有
+    tfOpen 在決定。
+    """
+    html = _page(tmp_path, snapshots=[_snap(code='2330'), _snap(code='6505')])
+    body = html[html.index('<body>'):]
+    # showChart 不可以再碰側欄。
+    seg = body[body.index('function showChart('):]
+    seg = seg[: seg.index('\n}')]
+    assert ".nb'" not in seg and '.nb"' not in seg, 'showChart 又去標側欄了'
+    # 載入時不可以有第二個地方決定開哪一張圖。只看 DOMContentLoaded 的處理常式
+    # 內容，不是整份 HTML——原始碼的註解裡寫著「`showChart(0)` 拿掉了」，拿字串
+    # 去整頁找會把那句註解一起找到，然後這條測試永遠紅。
+    for h in _dom_ready_handlers(body):
+        assert 'showChart(' not in h, f'又有人在載入時寫死開某一張圖：{h[:80]}'
+    assert 'function tfMark' in body and 'function tfOpen' in body
+
+
+def _dom_ready_handlers(body):
+    """每一個 `DOMContentLoaded` 監聽器的函式內容。
+
+    只做到「切到下一個 `});`」這種粗淺的程度就夠了：這裡要問的是「這個處理常式
+    裡有沒有人呼叫 showChart」，不是要解析 JavaScript。
+    """
+    out, at = [], 0
+    needle = "addEventListener('DOMContentLoaded'"
+    while True:
+        i = body.find(needle, at)
+        if i < 0:
+            return out
+        end = body.find('});', i)
+        out.append(body[i:end if end > 0 else i + 400])
+        at = i + len(needle)

@@ -810,6 +810,8 @@ def run(
     index_copy: str = '',
     open_when_done: bool = False,
     rules: Rules = DEFAULT_RULES,
+    data_dir: str = '',
+    data_base: str = '',
 ) -> dict:
     """跑完一次全市場篩選，回傳 ``{'results', 'xlsx', 'html', 'index'}``。
 
@@ -854,6 +856,16 @@ def run(
     # 每一檔的指標快照（**包含今天沒過篩的**）。網頁上的即時重篩讀這一份。
     SNAPSHOTS: list[dict] = []
     _snap_lock = _threading.Lock()
+    # 每一檔畫圖要用的那幾條序列（同樣**包含今天沒過篩的**）。
+    #
+    # 放寬門檻篩出來的股票要能當場看到它的 K 線圖，而圖需要兩年的 OHLCV 加五條
+    # 指標線——那不可能全部嵌進同一頁（1,900 檔約好幾百 MB）。所以在這裡留著，
+    # 由 `build_interactive_html` 一檔一個檔案寫出去，網頁點下去才抓。
+    #
+    # 記憶體：1,900 檔 × 約 500 根 × 十條序列，約 50 MB。掃描本身的下載成本遠
+    # 高於這個。
+    CHARTS: dict[str, dict] = {}
+    _chart_lock = _threading.Lock()
 
     def screen_stock(ticker):
         try:
@@ -934,6 +946,36 @@ def run(
             }
             with _snap_lock:
                 SNAPSHOTS.append(snap)
+
+            # 畫圖要用的那幾條序列。**在判定之前**留下來，因為今天沒過篩的那幾檔
+            # 正是放寬門檻之後會需要圖的那些。欄位名稱和 `results` 的那幾個一模
+            # 一樣，所以 `build_interactive_html` 的畫圖迴圈一行都不必為它們改。
+            #
+            # `stop_loss` 用**預設門檻**算：這一檔今天沒過篩，沒有「它的」停損。
+            # 圖上那條線因此是預設值，而側欄卡片上的停損跟著你調的倍數走——
+            # 兩個數字不一樣是對的，圖上那條線的圖例會寫出它是幾倍。
+            with _chart_lock:
+                CHARTS[code] = {
+                    'ticker': ticker, 'code': code,
+                    'name': NAME_MAP.get(code, code),
+                    'industry': lookup_industry(code, ISIN_INDUSTRY),
+                    'close': round(price, 2),
+                    'ma20_last': round(float(ma20.iloc[-1]), 2),
+                    'ma60_last': round(float(ma60.iloc[-1]), 2),
+                    'boll_up_last': round(float(boll_up.iloc[-1]), 2),
+                    'boll_mid_last': round(float(boll_ma.iloc[-1]), 2),
+                    'boll_dn_last': round(float(boll_dn.iloc[-1]), 2),
+                    'boll_bw_pct': round(float(bw.iloc[-1]) * 100, 2),
+                    'vol_today': int(volume.iloc[-1]),
+                    'vol20_avg': round(vol20, 0),
+                    'vol_ratio': round(vol_ratio, 2),
+                    'amt_M': round(amt20 / 1e6, 1),
+                    'atr14': round(atr_val, 2),
+                    'stop_loss': round(price - DEFAULT_RULES.atr_stop * atr_val, 2),
+                    'trigger': '',
+                    '_df': df, '_ma20': ma20, '_ma60': ma60,
+                    '_boll_up': boll_up, '_boll_mid': boll_ma, '_boll_dn': boll_dn,
+                }
 
             ok, trigger_parts = passes(snap, rules)
             if not ok:
@@ -1561,6 +1603,10 @@ def run(
         link_base=link_base, plotly_cdn=plotly_cdn,
         chart_years=chart_years, excel_url=excel_url, rules=rules,
         snapshots=sorted(SNAPSHOTS, key=lambda x: x['code']),
+        # 沒過今天這組門檻的那幾檔，各寫一個 <代號>.json 到 `data_dir`；
+        # 網頁用 `data_base` 組出網址，點下去才抓。`data_dir` 空的時候整段
+        # 不做——本機自己跑一份不需要多那 1,900 個檔案。
+        extra_charts=CHARTS, data_dir=data_dir, data_base=data_base,
     )
 
     # 排程要的是一個固定的檔名（`index.html`），因為下游——tw-six-metrics 的建站
@@ -1643,7 +1689,7 @@ LIVE_FIELDS: tuple[tuple[str, str, str, str, str], ...] = (
 )
 
 
-def _live_block(rules, snapshots=None, drawn=None, link_base=''):
+def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base=''):
     """頁首那一塊〔調整篩選條件〕，以及驅動左邊那排卡片的那段 JS。
 
     ## 這一塊是這一頁的控制器，不是附註
@@ -1717,11 +1763,13 @@ def _live_block(rules, snapshots=None, drawn=None, link_base=''):
     # 是「一個裝著空 dict 的 set」——而那會在執行的時候才炸。
     drawn_js = json.dumps(dict(drawn or {}), ensure_ascii=False, sort_keys=True)
     link_js = json.dumps((link_base or '').rstrip('/'))
+    data_js = json.dumps((data_base or '').rstrip('/'))
     cols = json.dumps({k: i for i, k in enumerate(SNAPSHOT_COLUMNS)})
     return f"""
       <div id="live">
         <div class="live-fields">{fields}</div>
         <div class="live-bar">
+          <button type="button" class="go" onclick="tfApply()">篩選</button>
           <button type="button" onclick="tfReset()">回到預設</button>
           <span id="live-count"></span>
           {tip}
@@ -1740,6 +1788,10 @@ def _live_block(rules, snapshots=None, drawn=None, link_base=''):
       // 有圖的那幾檔：代號 → 側欄第幾張。放寬門檻多出來的股票不在裡面。
       const TF_DRAWN = {drawn_js};
       const TF_LINK = {link_js};
+      // 沒過預設篩選的那幾檔，圖表資料放在這個路徑底下（一檔一個 <代號>.json）。
+      // 空字串代表這一份報告沒有附圖表資料（例如本機自己跑一份）。
+      const TF_DATA = {data_js};
+      const TF_CACHE = {{}};        // 抓過就不再抓第二次
       let TF_ROWS = [];
       let TF_HITS = [];
 
@@ -1858,31 +1910,88 @@ def _live_block(rules, snapshots=None, drawn=None, link_base=''):
         }}
       }}
 
-      // 點一張卡片。有圖就切過去；沒圖的顯示為什麼沒有、以及去哪裡看。
+      // 點一張卡片。
+      //
+      // 今天過篩的那幾檔，圖已經嵌在這一頁上（TF_DRAWN），切過去就是。
+      // 其他每一檔各有一個自己的 <代號>.json，點下去才抓——所以放寬門檻多出來
+      // 的股票也看得到完整的 K 線圖，而這一頁不必背著 1,900 檔的 K 棒。
       function tfOpen(code) {{
         TF_CUR = code;
         const i = TF_HITS.findIndex(function (h) {{ return h[0][C.code] === code; }});
         tfMark(i);
         if (code === null) {{ tfNoChart(null); return false; }}
         const at = TF_DRAWN[code];
-        if (at === undefined) {{ tfNoChart(code); return false; }}
-        tfHideNote();
-        if (typeof showChart === 'function') showChart(at);
+        if (at !== undefined) {{
+          tfHideNote();
+          if (typeof showChart === 'function') showChart(at);
+          return false;
+        }}
+        tfFetchChart(code);
         return false;
+      }}
+
+      // 抓一檔的圖表資料，畫在圖表區。
+      //
+      // 同一檔只抓一次（TF_CACHE）。抓的時候先說「載入中」——15 KB 在手機上
+      // 也要一下子，而一片空白看起來像壞掉。
+      async function tfFetchChart(code) {{
+        if (!TF_DATA) {{ tfNoChart(code); return; }}
+        const host = document.getElementById('tf-plot');
+        tfShowPane(code, '載入 ' + code + ' 的走勢圖…');
+        let fig = TF_CACHE[code];
+        if (!fig) {{
+          try {{
+            const r = await fetch(TF_DATA + '/' + code + '.json', {{cache: 'force-cache'}});
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            fig = await r.json();
+            TF_CACHE[code] = fig;
+          }} catch (e) {{
+            // 換過股票了就不要把錯誤蓋在新的那一張上面。
+            if (TF_CUR === code) tfNoChart(code, e.message);
+            return;
+          }}
+        }}
+        if (TF_CUR !== code) return;      // 抓回來的時候使用者已經點了別檔
+        if (typeof Plotly === 'undefined') {{ tfNoChart(code, 'plotly.js 沒有載入'); return; }}
+        tfShowPane(code, '');
+        try {{
+          Plotly.newPlot(host, fig.data, fig.layout,
+                         {{responsive: true, displayModeBar: false}});
+        }} catch (e) {{ tfNoChart(code, e.message); }}
+      }}
+
+      // 那一格是給「抓回來的圖」用的，和嵌進頁面的那幾張（.cw）分開——
+      // 共用的話，畫上去就會把原本那一檔的圖洗掉，切回去要重畫。
+      function tfShowPane(code, msg) {{
+        const col = document.getElementById('chartcol');
+        const pane = document.getElementById('tf-pane');
+        const note = document.getElementById('tf-note');
+        if (note) note.hidden = true;
+        if (col) col.classList.add('noting');
+        pane.hidden = false;
+        document.getElementById('tf-plot-msg').textContent = msg;
+        // 標題帶名字：只有代號的話，切了三檔之後分不出自己在看哪一家。
+        const row = (TF_HITS.find(function (h) {{ return h[0][C.code] === code; }}) || [])[0];
+        document.getElementById('tf-plot-title').textContent =
+          row ? (code + '　' + row[C.name]) : code;
       }}
 
       function tfHideNote() {{
         const el = document.getElementById('tf-note');
         if (el) el.hidden = true;
+        const pane = document.getElementById('tf-pane');
+        if (pane) pane.hidden = true;
         const col = document.getElementById('chartcol');
         if (col) col.classList.remove('noting');
       }}
 
       // 沒有圖的時候，圖表區要說出**為什麼**，而不是留一片空白。
-      function tfNoChart(code) {{
+      function tfNoChart(code, why) {{
         const el = document.getElementById('tf-note');
         const col = document.getElementById('chartcol');
+        const pane = document.getElementById('tf-pane');
         if (!el) return;
+        if (pane) pane.hidden = true;
         el.hidden = false;
         if (col) col.classList.add('noting');
         if (code === null) {{
@@ -1894,10 +2003,16 @@ def _live_block(rules, snapshots=None, drawn=None, link_base=''):
           ? '<p><a href="' + TF_LINK + '/' + code + '.html" target="_blank" rel="noopener">' +
             '到〔六大財務指標評等〕看 ' + code + ' ↗</a></p>'
           : '';
-        el.innerHTML = '<b>' + tfEsc(code) + '：這一頁上沒有它的 K 線圖。</b>' +
-          '<p>圖只有今天通過<b>預設門檻</b>的那幾檔有。' +
-          '放寬門檻多出來的股票，指標都在（左邊卡片上那些數字就是），' +
-          '但 K 棒沒有——把 1,900 檔兩年的 K 棒全嵌進來是好幾百 MB。</p>' + six;
+        // 兩種情況，訊息不一樣：這一份報告根本沒附圖表資料（例如本機自己跑
+        // 一份），或是有附但這一檔抓不到（網路、檔案不在）。混在一起講，讀者
+        // 會去修錯的東西。
+        const head = TF_DATA
+          ? '<b>' + tfEsc(code) + '：圖表資料拿不到。</b>' +
+            '<p>' + tfEsc(why || '') + '</p>'
+          : '<b>' + tfEsc(code) + '：這一份報告沒有附圖表資料。</b>' +
+            '<p>只有今天通過<b>預設門檻</b>的那幾檔有圖。' +
+            '排程產的那一份每一檔都有。</p>';
+        el.innerHTML = head + six;
       }}
 
       function tfReset() {{
@@ -1911,12 +2026,29 @@ def _live_block(rules, snapshots=None, drawn=None, link_base=''):
       document.addEventListener('DOMContentLoaded', function () {{
         try {{ TF_ROWS = JSON.parse(document.getElementById('tf-snap').textContent); }}
         catch (e) {{ TF_ROWS = []; }}
+        // 改門檻**不會**馬上重篩——要按〔篩選〕（或在任何一格按 Enter）。
+        //
+        // 邊打邊篩那一版試過：打「1200」的過程中會先用 1、12、120 各篩一次，
+        // 左邊那排卡片跳三次，而且每一次都可能把你正在看的那一檔換掉。
+        // 門檻是一組值，不是一個值——要一起生效。
         for (const k of TF_KEYS) {{
           const el = document.getElementById('f_' + k);
-          if (el) el.addEventListener('input', tfApply);
+          if (!el) continue;
+          el.addEventListener('input', tfStale);
+          el.addEventListener('keydown', function (e) {{
+            if (e.key === 'Enter') {{ e.preventDefault(); tfApply(); }}
+          }});
         }}
         tfApply();
       }});
+
+      // 門檻改過、還沒按〔篩選〕：把數字淡掉並說一聲。
+      // 不說的話，畫面上那個「368 檔符合」會變成一個安靜的謊。
+      function tfStale() {{
+        const n = document.getElementById('live-count');
+        n.textContent = '門檻改了——按〔篩選〕';
+        n.className = 'stale';
+      }}
       </script>"""
 
 
@@ -1932,7 +2064,8 @@ def _snap_note(snapshots):
 
 def build_interactive_html(results, today_str, output_dir, now=None, *,
                            link_base='', plotly_cdn=True, chart_years=2.0,
-                           excel_url='', rules=None, snapshots=None):
+                           excel_url='', rules=None, snapshots=None,
+                           extra_charts=None, data_dir='', data_base=''):
     """產生互動線圖那一份 HTML，回傳檔案路徑。
 
     和本機版的三個差別，全都是因為這一份要放上網、給手機開：
@@ -2027,7 +2160,24 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
     stock_infos  = []
     fig_json_tags = []
 
-    for idx, res in enumerate(results):
+    # 今天過篩的那幾檔嵌進這一頁；其餘每一檔各寫一個檔案，網頁點下去才抓。
+    #
+    # 為什麼合成同一個迴圈而不是另寫一支：兩份圖必須**一模一樣**。圖的樣式有
+    # 兩百行（軌道顏色、停損線、兩條 hover 軌、Y 軸視窗、rangeselector…），
+    # 複製一份出去之後，改了其中一邊的人不會知道另一邊也要改，而症狀是「有些
+    # 股票的圖長得不一樣」——沒有錯誤訊息。
+    extra_list = list((extra_charts or {}).values()) if isinstance(extra_charts, dict) \
+        else list(extra_charts or [])
+    # 已經嵌在頁面上的那幾檔不必再寫一次檔案。
+    embedded = {r['code'] for r in results}
+    extra_list = [r for r in extra_list if r['code'] not in embedded]
+    if not data_dir:
+        extra_list = []
+    else:
+        os.makedirs(data_dir, exist_ok=True)
+    written = 0
+
+    for idx, res in enumerate(list(results) + extra_list):
         df    = res['_df'].copy()          # 由 rangeselector 控制顯示範圍
         # 指標是在完整歷史上算完的（見 screen_stock），這裡才裁——先裁再算會讓
         # 最前面 60 根 K 棒的 60MA 變成 NaN，圖上就是一截斷掉的線。
@@ -2237,8 +2387,19 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
                         autorange=False),
         )
 
-        # 將 figure JSON 存成 <script type="application/json"> tag
         fig_json = pio.to_json(fig)
+
+        # 沒過今天這組門檻的那幾檔：寫成自己的檔案，不嵌進頁面。
+        #
+        # 檔名就是代號，所以前端要哪一檔就直接組得出網址，不需要一份索引——
+        # 而一份索引就是第二個會過期的東西。
+        if idx >= len(results):
+            with open(os.path.join(data_dir, res['code'] + '.json'),
+                      'w', encoding='utf-8') as fh:
+                fh.write(fig_json)
+            written += 1
+            continue
+
         # 防止 </script> 提前關閉：把 </ 轉義
         fig_json_safe = fig_json.replace('</', '<\\/')
         fig_json_tags.append(
@@ -2395,6 +2556,7 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         '#live #live-count{font-size:11.5px;font-weight:600}'
         '#live #live-count.hit{color:#7ee787}'
         '#live #live-count.miss{color:#8b949e}'
+        '#live #live-count.stale{color:#f0c27f}'
         # ── 〔預設篩選條件〕：那顆燈泡 ────────────────────────
         #
         # 用 <details> 而不是 hover 提示：手機上沒有 hover，而這一頁一半的時間
@@ -2435,6 +2597,21 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         '#tf-note p{margin:8px 0 0}'
         '#tf-note a{color:#58a6ff;text-decoration:none}'
         '#tf-note a:hover{text-decoration:underline}'
+        # 抓回來那幾張圖的容器。高度要**明確**——Plotly 畫進一個沒有高度的
+        # div 會得到一張 450px 的預設圖，和旁邊那幾張對不起來。
+        '#tf-pane{display:flex;flex-direction:column;width:100%;height:100%;'
+            'min-height:0;padding:10px 16px 12px}'
+        # `display:flex` 會蓋掉 hidden 屬性預設的 display:none——沒有這一行，
+        # 那一格會一直在畫面上（而且是空的）。
+        '#tf-pane[hidden]{display:none}'
+        '.tf-pane-head{display:flex;align-items:baseline;gap:10px;'
+            'font-size:13px;color:#8b949e;padding:0 0 6px}'
+        '.tf-pane-head b{color:#e6edf3;font-size:15px}'
+        '#tf-plot{flex:1 1 auto;min-height:0}'
+        # 〔篩選〕按鈕。做得比〔回到預設〕重一點——它是這一列的主要動作。
+        '#live .live-bar button.go{background:#238636;color:#fff;'
+            'border-color:#2ea043;font-weight:700}'
+        '#live .live-bar button.go:hover{background:#2ea043;border-color:#3fb950}'
         # ── 圖表區內：徽章列 + 觸發訊號 + 圖表本體 + 時間範圍列 ─
         '.cw{display:none;width:100%;height:100%;padding:10px 16px 12px;'
             'flex-direction:column;min-height:0}'
@@ -2892,7 +3069,7 @@ document.addEventListener('DOMContentLoaded', function() { syncHdHeight(); });
         # 點到的會是隔壁那一檔，而且不會報錯。
         _live_block(rules, snapshots=snapshots,
                     drawn={s['code']: i for i, s in enumerate(stock_infos)},
-                    link_base=link_base),
+                    link_base=link_base, data_base=data_base),
         # 「滑鼠移入圖表 → 顯示指標｜左鍵拖曳｜滾輪縮放」那一行拿掉了。
         # 它教的是三件**試一次就知道**的事，而它每天出現在每一位讀者眼前，
         # 佔的還是頁首最寬的那一段。手機上更沒有滑鼠也沒有滾輪。
@@ -2912,7 +3089,16 @@ document.addEventListener('DOMContentLoaded', function() { syncHdHeight(); });
         '</div>',  # /#sidebar
         # `#tf-note` 是「這一檔沒有圖」時說話的地方。預設 hidden，由 tfNoChart()
         # 打開——留一片空白的圖表區，讀者會以為是還沒載入完。
-        '<div id="chartcol"><div id="tf-note" hidden></div>' + chart_divs + '</div>',
+        # `#tf-pane` 是抓回來那幾張圖畫的地方，和嵌進頁面的那幾張（.cw）分開：
+        # 共用一格的話，畫上去就會把原本那一檔的圖洗掉，切回去要整張重畫。
+        # `#tf-note` 則是「拿不到圖」時說話的地方。兩個預設都 hidden。
+        ('<div id="chartcol">'
+         '<div id="tf-note" hidden></div>'
+         '<div id="tf-pane" hidden>'
+         '<div class="tf-pane-head"><b id="tf-plot-title"></b>'
+         '<span id="tf-plot-msg"></span></div>'
+         '<div id="tf-plot"></div></div>'
+         + chart_divs + '</div>'),
         '</div>',  # /#main
         '\n'.join(fig_json_tags),   # <-- 圖表資料放在獨立 script[type=application/json]
         '<script>' + js + '</script>',
@@ -2922,6 +3108,8 @@ document.addEventListener('DOMContentLoaded', function() { syncHdHeight(); });
     html_path = os.path.join(output_dir, 'TW_Stock_Trend_Following_Trading_Filter_Result_V3.1_' + ts + '.html')
     with open(html_path, 'w', encoding='utf-8') as f:
         f.write(''.join(parts))
+    if written:
+        print(f'另外寫了 {written:,} 檔的圖表資料到 {data_dir}（點下去才抓）')
     mb = os.path.getsize(html_path) / 1024 / 1024
     print('\u4e92\u52d5\u7dda\u5716\u5132\u5b58\uff1a{} ({:.1f} MB)'.format(html_path, mb))
     return html_path

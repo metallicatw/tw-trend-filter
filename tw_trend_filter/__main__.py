@@ -58,6 +58,8 @@ def _run(args, rules):
         chart_years=args.chart_years,
         excel_url=args.excel_url or _env_excel_url(),
         index_copy=args.index,
+        data_dir=args.data_dir,
+        data_base=args.data_base,
         open_when_done=args.local,
         rules=rules,
     )
@@ -81,6 +83,15 @@ def main(argv: list[str] | None = None) -> int:
                     help='每一檔下載多長的歷史（yfinance 的 period，預設 2y）')
     ap.add_argument('--chart-years', type=float, default=2.0,
                     help='互動線圖保留最近幾年的 K 棒（預設 2）')
+    # 沒過預設篩選的那幾檔，圖表資料一檔一個 JSON 寫到這裡；網頁用 --data-base
+    # 組出網址，點下去才抓。
+    #
+    # 為什麼要兩個參數：檔案**寫在哪**和網頁**去哪裡抓**不是同一件事。排程上前者
+    # 是 runner 的 `pages/trend-d`，後者是瀏覽器看到的相對路徑 `trend-d`。
+    ap.add_argument('--data-dir', default='',
+                    help='把每一檔的圖表資料寫到這個目錄（不給就不寫）')
+    ap.add_argument('--data-base', default='',
+                    help='網頁抓圖表資料的路徑或網址（例如 trend-d）')
     ap.add_argument('--link-base', default='',
                     help='個股頁連結的前綴，例如 '
                          'https://metallicatw.github.io/tw-six-metrics/stock')

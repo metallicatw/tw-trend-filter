@@ -470,3 +470,54 @@ def _dom_ready_handlers(body):
         end = body.find('});', i)
         out.append(body[i:end if end > 0 else i + 400])
         at = i + len(needle)
+
+
+# ── 沒過預設篩選的那幾檔，圖是抓回來的 ──────────────────────────────
+
+def test_每一檔沒過篩的股票各寫一個圖表資料檔(tmp_path):
+    """點了才抓，而不是全部嵌進同一頁。
+
+    1,900 檔兩年的 K 棒全嵌進來是好幾百 MB；一檔一個檔案，點下去抓的只有 15～40 KB。
+    檔名就是代號，所以前端直接組得出網址，不需要一份索引——而一份索引就是第二個
+    會過期的東西。
+    """
+    import json as _json
+    import os
+
+    d = tmp_path / 'trend-d'
+    extra = {'6505': _fake_result(code='6505', name='台塑化')}
+    html = _page(tmp_path, snapshots=[_snap(code='2330'), _snap(code='6505')],
+                 extra_charts=extra, data_dir=str(d), data_base='trend-d')
+    assert (d / '6505.json').is_file(), '沒過篩的那一檔沒有寫出圖表資料'
+    fig = _json.loads((d / '6505.json').read_text(encoding='utf-8'))
+    assert fig['data'], '寫出來的不是一張圖'
+    # 已經嵌在頁面上的那一檔不必再寫一份。
+    assert not (d / '2330.json').exists(), '嵌過的又寫了一次，白花時間和空間'
+    assert 'const TF_DATA = "trend-d"' in html
+    assert 'function tfFetchChart' in html
+    assert os.path.getsize(d / '6505.json') > 1000
+
+
+def test_不給_data_dir_就一個檔案都不寫(tmp_path):
+    """本機自己跑一份報告，不該在旁邊生出 1,900 個檔案。"""
+    extra = {'6505': _fake_result(code='6505', name='台塑化')}
+    html = _page(tmp_path, snapshots=[_snap(code='2330')], extra_charts=extra)
+    assert 'const TF_DATA = ""' in html
+    # 空的 TF_DATA 之下，點下去要說「這一份報告沒有附圖表資料」，
+    # 而不是去抓一個組不出來的網址。
+    assert '這一份報告沒有附圖表資料' in html
+
+
+def test_改門檻不會馬上重篩_要按篩選(tmp_path):
+    """邊打邊篩那一版試過：打「1200」的過程中會先用 1、12、120 各篩一次，
+    左邊那排卡片跳三次，而且每一次都可能把你正在看的那一檔換掉。
+
+    門檻是一組值，不是一個值——要一起生效。所以輸入框只負責把數字標成「改過了」，
+    真正重篩的是〔篩選〕那顆按鈕（或在任何一格按 Enter）。
+    """
+    html = _page(tmp_path, snapshots=[_snap(code='2330')])
+    assert 'button class="go" onclick="tfApply()"' in html.replace('  ', ' ') \
+        or 'class="go" onclick="tfApply()"' in html, '沒有〔篩選〕按鈕'
+    assert "addEventListener('input', tfStale)" in html, '打字還在直接重篩'
+    assert "e.key === 'Enter'" in html, 'Enter 送不出去'
+    assert 'function tfStale' in html

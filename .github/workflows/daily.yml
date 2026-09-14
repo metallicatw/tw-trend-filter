@@ -58,6 +58,12 @@ concurrency:
 
 permissions:
   contents: write
+  # 圖表資料（一檔一個 JSON，約 1,900 個）改由 Pages 發布，**不進 git**。
+  # 那是每天都會整批換掉的產出：進 git 的話，repo 每天長好幾十 MB，而那些
+  # 物件在 force push 之後還會留一陣子才被回收。Pages 的 artifact 沒有這個問題
+  # ——它是覆蓋的，不是累積的。
+  pages: write
+  id-token: write
 
 jobs:
   screen:
@@ -65,6 +71,10 @@ jobs:
     # 全市場約 1,900 檔，八條連線大約 20～35 分鐘。90 分鐘的上限是留給
     # Yahoo 偶爾變慢的那幾天，而不是讓一個卡住的 job 燒掉六小時。
     timeout-minutes: 90
+    # deploy-pages 要求 job 綁在這個 environment 上，少了它那一步會直接失敗。
+    environment:
+      name: github-pages
+      url: ${{ steps.pages.outputs.page_url }}
 
     steps:
       - uses: actions/checkout@v4
@@ -126,6 +136,8 @@ jobs:
             --output-dir output \
             --index index.html \
             --link-base "https://metallicatw.github.io/tw-six-metrics/stock" \
+            --data-dir pages/trend-d \
+            --data-base "https://metallicatw.github.io/tw-trend-filter/trend-d" \
             --limit "$LIMIT" \
             "${flags[@]}"
           code=$?
@@ -188,6 +200,48 @@ jobs:
           path: output/*.xlsx
           retention-days: 30
           compression-level: 9
+
+      # ── 圖表資料上 Pages ─────────────────────────────────────
+      #
+      # `pages/trend-d/<代號>.json`：沒過今天預設門檻的那幾檔的完整 K 線圖。
+      # 報告頁上調完門檻按〔篩選〕，多出來的那些股票點下去就是抓這裡。
+      #
+      # 為什麼是 Pages 不是 git：這一批每天整個換掉，約 1,900 個檔、幾百 MB。
+      # 進 git 的話 repo 每天長那麼多，而且 force push 之後那些物件還會留一陣子
+      # 才被回收。Pages 的 artifact 是覆蓋的，不是累積的。
+      #
+      # 為什麼和 report 分支並存：tw-six-metrics 的建站流程是去 clone `report`
+      # 拿 index.html 的。那條路不動——這裡只是多發一份帶資料的到 Pages，而
+      # 報告裡的 `--data-base` 指的是 Pages 上的絕對網址，所以不管 index.html
+      # 被複製到哪個網站底下，它都抓得到同一批資料。
+      #
+      # 兩個站都在 metallicatw.github.io 之下，同源，沒有 CORS 問題。
+      - name: 準備 Pages 內容
+        if: steps.screen.outputs.healthy != 'no'
+        run: |
+          set -euo pipefail
+          test -s index.html || { echo "::error::沒有產生 index.html"; exit 1; }
+          mkdir -p pages
+          cp index.html pages/index.html
+          n=$(find pages/trend-d -name '*.json' 2>/dev/null | wc -l)
+          du -sh pages 2>/dev/null || true
+          echo "Pages：index.html ＋ $n 檔的圖表資料"
+          if [ "$n" -eq 0 ]; then
+            echo "::warning::圖表資料一個檔都沒有——報告上點沒過篩的股票會說抓不到"
+          fi
+
+      - uses: actions/configure-pages@v5
+        if: steps.screen.outputs.healthy != 'no'
+
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.screen.outputs.healthy != 'no'
+        with:
+          path: pages
+
+      - name: 發布 Pages
+        if: steps.screen.outputs.healthy != 'no'
+        id: pages
+        uses: actions/deploy-pages@v4
 
       # 報告推到 `report` 分支，**不進 main**。
       #

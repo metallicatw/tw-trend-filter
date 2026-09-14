@@ -201,48 +201,6 @@ jobs:
           retention-days: 30
           compression-level: 9
 
-      # ── 圖表資料上 Pages ─────────────────────────────────────
-      #
-      # `pages/trend-d/<代號>.json`：沒過今天預設門檻的那幾檔的完整 K 線圖。
-      # 報告頁上調完門檻按〔篩選〕，多出來的那些股票點下去就是抓這裡。
-      #
-      # 為什麼是 Pages 不是 git：這一批每天整個換掉，約 1,900 個檔、幾百 MB。
-      # 進 git 的話 repo 每天長那麼多，而且 force push 之後那些物件還會留一陣子
-      # 才被回收。Pages 的 artifact 是覆蓋的，不是累積的。
-      #
-      # 為什麼和 report 分支並存：tw-six-metrics 的建站流程是去 clone `report`
-      # 拿 index.html 的。那條路不動——這裡只是多發一份帶資料的到 Pages，而
-      # 報告裡的 `--data-base` 指的是 Pages 上的絕對網址，所以不管 index.html
-      # 被複製到哪個網站底下，它都抓得到同一批資料。
-      #
-      # 兩個站都在 metallicatw.github.io 之下，同源，沒有 CORS 問題。
-      - name: 準備 Pages 內容
-        if: steps.screen.outputs.healthy != 'no'
-        run: |
-          set -euo pipefail
-          test -s index.html || { echo "::error::沒有產生 index.html"; exit 1; }
-          mkdir -p pages
-          cp index.html pages/index.html
-          n=$(find pages/trend-d -name '*.json' 2>/dev/null | wc -l)
-          du -sh pages 2>/dev/null || true
-          echo "Pages：index.html ＋ $n 檔的圖表資料"
-          if [ "$n" -eq 0 ]; then
-            echo "::warning::圖表資料一個檔都沒有——報告上點沒過篩的股票會說抓不到"
-          fi
-
-      - uses: actions/configure-pages@v5
-        if: steps.screen.outputs.healthy != 'no'
-
-      - uses: actions/upload-pages-artifact@v3
-        if: steps.screen.outputs.healthy != 'no'
-        with:
-          path: pages
-
-      - name: 發布 Pages
-        if: steps.screen.outputs.healthy != 'no'
-        id: pages
-        uses: actions/deploy-pages@v4
-
       # 報告推到 `report` 分支，**不進 main**。
       #
       # 原本是 commit 回 main，而那讓兩種完全不同的東西擠在同一條線上：程式碼
@@ -278,6 +236,66 @@ jobs:
           git commit -q -m "報告：${{ steps.screen.outputs.date }}（${{ steps.screen.outputs.count }} 檔通過）"
           # force：這條分支本來就是「只有最新那一份」，不是歷史。
           git push -f origin report
+
+      # ── 圖表資料上 Pages ─────────────────────────────────────
+      #
+      # `pages/trend-d/<代號>.json`：沒過今天預設門檻的那幾檔的完整 K 線圖。
+      # 報告頁上調完門檻按〔篩選〕，多出來的那些股票點下去就是抓這裡。
+      #
+      # 為什麼是 Pages 不是 git：這一批每天整個換掉，約 1,900 個檔、幾百 MB。
+      # 進 git 的話 repo 每天長那麼多，而且 force push 之後那些物件還會留一陣子
+      # 才被回收。Pages 的 artifact 是覆蓋的，不是累積的。
+      #
+      # 為什麼和 report 分支並存：tw-six-metrics 的建站流程是去 clone `report`
+      # 拿 index.html 的。那條路不動——這裡只是多發一份帶資料的到 Pages，而
+      # 報告裡的 `--data-base` 指的是 Pages 上的絕對網址，所以不管 index.html
+      # 被複製到哪個網站底下，它都抓得到同一批資料。
+      #
+      # 兩個站都在 metallicatw.github.io 之下，同源，沒有 CORS 問題。
+      - name: 準備 Pages 內容
+        if: steps.screen.outputs.healthy != 'no'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          test -s index.html || { echo "::error::沒有產生 index.html"; exit 1; }
+          mkdir -p pages
+          cp index.html pages/index.html
+          n=$(find pages/trend-d -name '*.json' 2>/dev/null | wc -l)
+          du -sh pages 2>/dev/null || true
+          echo "Pages：index.html ＋ $n 檔的圖表資料"
+          if [ "$n" -eq 0 ]; then
+            echo "::warning::圖表資料一個檔都沒有——報告上點沒過篩的股票會說抓不到"
+          fi
+
+      # 這四步**全部 continue-on-error**。
+      #
+      # 上線第一天就踩到：這個 repo 還沒開 Pages，`configure-pages` 回
+      # 「Get Pages site failed … Not Found」，整個 job 紅掉——而那一天的**報告
+      # 也沒有發布**，因為這幾步原本排在 report 分支之前。
+      #
+      # 圖表資料是加分項：有它，放寬門檻多出來的股票點得出圖；沒有它，報告照樣
+      # 是完整的（那些股票會說「這一份報告沒有附圖表資料」）。加分項不該有能力
+      # 擋掉主要產出，所以 report 分支先推，這幾步排在後面而且不會讓 job 紅。
+      #
+      # `enablement: true`：第一次跑的時候順手把 Pages 打開（權限是上面那個
+      # `pages: write`），省掉一次「去 Settings 按一下」而且沒有人記得要按。
+      - uses: actions/configure-pages@v5
+        if: steps.screen.outputs.healthy != 'no'
+        continue-on-error: true
+        with:
+          enablement: true
+
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.screen.outputs.healthy != 'no'
+        continue-on-error: true
+        with:
+          path: pages
+
+      - name: 發布 Pages
+        if: steps.screen.outputs.healthy != 'no'
+        continue-on-error: true
+        id: pages
+        uses: actions/deploy-pages@v4
 
       - name: 摘要
         if: always()

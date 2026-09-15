@@ -853,6 +853,27 @@ def run(
     SCREEN_ERRORS = _collections.Counter()
     SCREEN_ERROR_SAMPLES: list[str] = []
     _err_lock = _threading.Lock()
+    #: 真的掃到的檔數——**由 `screen_stock` 自己加，不是由呼叫端加**。
+    #:
+    #: 這個區別是這支程式最重要的一行。上一版在 `_screen_and_collect` 裡無條件
+    #: `_scanned[0] += 1`，理由看起來很自然：那個函式跑完了，就算掃過一檔。
+    #: 但 `screen_stock` 有三種回 None 的方式，而它們的意思完全不同：
+    #:
+    #:   1. 下載失敗（兩次都沒拿到）      ← 沒掃到
+    #:   2. 拿到了但不足 65 根（新上市）  ← 沒得掃，正常
+    #:   3. 算完了，這檔今天沒過篩        ← 掃到了
+    #:
+    #: 呼叫端分不出這三種，所以它加出來的 `_scanned` 恆等於母體大小。而
+    #: `__main__` 拿 `scanned / universe` 當健康門檻，於是那道門檻恆為 100%：
+    #: Yahoo 整天不給資料 → 1,900 檔全部走第 1 種 → healthy=yes → `git push -f`
+    #: 把昨天那份好的報告蓋成一份「今天 0 檔通過」。而「0 檔通過」在台股是
+    #: 一個合理的日子，所以連看摘要都分不出來。
+    #:
+    #: 只有第 3 種會加到這裡。第 1 種記進 SCREEN_ERRORS['DownloadFailed']，
+    #: 第 2 種記進 _too_short——它不是失敗，不該讓門檻誤判。
+    _scanned = [0]
+    _too_short = [0]
+    _scan_lock = _threading.Lock()
     # 每一檔的指標快照（**包含今天沒過篩的**）。網頁上的即時重篩讀這一份。
     SNAPSHOTS: list[dict] = []
     _snap_lock = _threading.Lock()
@@ -882,12 +903,32 @@ def run(
                                      auto_adjust=True, progress=False, threads=False)
                 except Exception:
                     df = None
-            if df is None or len(df) < 65: return None
+            if df is None:
+                # 兩次都沒拿到。這**不是**「這檔今天沒過篩」，是「這檔沒問到」，
+                # 而那兩件事在上一版長得一模一樣（都是 return None、都不記帳）。
+                # 記在 SCREEN_ERRORS 裡，讓 __main__ 的
+                # `errors <= universe * 0.10` 那一半真的擋得住東西。
+                with _err_lock:
+                    SCREEN_ERRORS['DownloadFailed'] += 1
+                    if len(SCREEN_ERROR_SAMPLES) < 5:
+                        SCREEN_ERROR_SAMPLES.append(f'{ticker}: 兩次下載都沒拿到資料')
+                return None
+            if len(df) < 65:
+                # 拿到了，只是歷史不夠算 60MA（新上市）。這是正常的，每天都有
+                # 幾檔，**不可以**算成失敗——算成失敗的話，掛牌潮那幾週會誤觸
+                # 門檻，而誤觸一次之後就沒有人再相信那個門檻了。
+                with _scan_lock:
+                    _too_short[0] += 1
+                return None
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.droplevel(1)
             df = df.dropna(subset=['Close','Volume'])
             df.index = pd.to_datetime(df.index).tz_localize(None)
             close, volume = df['Close'], df['Volume']
+            # 資料拿到了、長度夠、欄位讀得開——到這裡才算真的掃到這一檔。
+            # 之後再丟例外的話，那是程式的問題，由 SCREEN_ERRORS 那一半負責。
+            with _scan_lock:
+                _scanned[0] += 1
 
             # 指標**全部算完**，才拿門檻去判。
             #
@@ -1178,19 +1219,23 @@ def run(
 
     _lock    = threading.Lock()
     RESULTS  = []
-    _scanned = [0]
+    # 進度用的計數器，和 `_scanned` 是兩回事：這個數的是「跑完幾檔」（含沒問到
+    # 的），純粹為了讓 log 有進度感；`_scanned` 數的是「真的掃到幾檔」，是健康
+    # 門檻的分子。兩個混用正是上一版的 bug。
+    _done = [0]
 
     def _screen_and_collect(args):
         i, ticker = args
         r = screen_stock(ticker)
         with _lock:
-            _scanned[0] += 1
+            _done[0] += 1
             if r:
                 RESULTS.append(r)
                 print(f"✅ {r['code']:>4s} {r['name']:<8s} "
                       f"收:{r['close']:>7.2f} 量比:{r['vol_ratio']:.2f}x │ {r['trigger']}")
-            if _scanned[0] % 100 == 0:
-                print(f'── 已掃描 {_scanned[0]}/{len(TICKERS)} 檔 ──')
+            if _done[0] % 100 == 0:
+                print(f'── 已跑完 {_done[0]}/{len(TICKERS)} 檔'
+                      f'（真的掃到 {_scanned[0]} 檔）──')
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         list(executor.map(_screen_and_collect, enumerate(TICKERS)))
@@ -1203,9 +1248,12 @@ def run(
     errors = sum(SCREEN_ERRORS.values())
     print('='*60)
     print(f'🎯 篩選完成！今日共 {len(RESULTS)} 檔標的通過'
-          f'（實際掃描 {_scanned[0]}/{len(TICKERS)} 檔）')
+          f'（真的掃到 {_scanned[0]}/{len(TICKERS)} 檔）')
+    if _too_short[0]:
+        print(f'   另有 {_too_short[0]} 檔歷史不足 65 根（新上市），算不了 60MA。'
+              '這是正常的，不計入失敗。')
     if errors:
-        print(f'⚠️ 有 {errors} 檔在篩選過程中丟出例外（不等於沒過篩）：')
+        print(f'⚠️ 有 {errors} 檔沒有掃成（不等於沒過篩）：')
         for name, n in SCREEN_ERRORS.most_common():
             print(f'     {name:<28} {n:>5} 檔')
         for s in SCREEN_ERROR_SAMPLES:
@@ -1647,11 +1695,19 @@ def run(
         'results': RESULTS,
         'count': len(RESULTS),
         # `scanned` 原本回 len(TICKERS)——那是母體大小，不是真的掃到幾檔。
-        # 1,800 檔下載失敗跟 0 檔失敗會印出一模一樣的摘要。現在分成三個數字：
-        # universe（母體）、scanned（真的跑完的）、errors（丟例外的）。
+        # 1,800 檔下載失敗跟 0 檔失敗會印出一模一樣的摘要。現在分成四個數字：
+        #
+        #   universe   母體
+        #   scanned    真的掃到的（拿到資料、長度夠、算完了）
+        #   errors     沒掃成的（下載失敗 + 中途丟例外）
+        #   too_short  拿到了但歷史不足 65 根（新上市，正常，不算失敗）
+        #
+        # scanned + errors + too_short 應該等於 universe。不等於的話，
+        # 就是有一條路沒有記帳——而沒有記帳的那條路正是上一版的 bug。
         'universe': len(TICKERS),
         'scanned': _scanned[0],
         'errors': errors,
+        'too_short': _too_short[0],
         'error_kinds': dict(SCREEN_ERRORS),
         'date': today_str,
         'xlsx': OUTPUT_FILE,

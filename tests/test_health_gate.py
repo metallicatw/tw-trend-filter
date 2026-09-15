@@ -1,0 +1,253 @@
+"""這一趟到底算不算數——健康門檻。
+
+## 為什麼這一支要單獨存在
+
+`__main__` 裡那道門檻的下一步是 `git push -f origin report`，而 `report` 是一條
+**只有一個 commit 的孤兒分支**。門檻放行一次，昨天那份好的報告就永久消失。
+
+而這道門檻寫好之後有一段時間是**完全沒有作用的**，外表完全看不出來：
+
+    _scanned[0] += 1        # 在呼叫端，無條件
+
+`screen_stock` 有三種回 `None` 的方式（下載失敗／歷史不足／今天沒過篩），呼叫端
+一種都分不出來，所以 `scanned` 恆等於母體大小，`ok_ratio` 恆為 100%。Yahoo 整天
+不給資料 → 1,900 檔全部下載失敗 → `healthy=yes` → force push → 昨天那份被蓋成
+一份「今天 0 檔通過」。
+
+**而「0 檔通過」在台股是一個合理的日子。** 所以 job 全綠、摘要正常、Excel 附件
+也在，沒有任何一個地方看起來不對。這是整個專案裡唯一一個「壞掉會弄丟東西、而且
+永遠不會被發現」的地方。
+
+## 這裡守的是什麼
+
+不是「那個公式算得對不對」——公式很短，看一眼就知道。守的是**那幾個數字的意思
+有沒有被改掉**。上一版的 bug 不在公式裡，在「`scanned` 到底數的是什麼」。所以
+最重要的是 `test_每一檔都要記到帳上`：它不檢查任何門檻，只檢查
+`scanned + errors + too_short == universe`。將來有人在 `screen_stock` 裡加第四種
+`return None` 而忘了記帳，這一條會先紅。
+"""
+
+import pandas as pd
+import pytest
+
+import tw_trend_filter.pipeline as pl
+from tw_trend_filter.__main__ import main
+
+
+def _good_frame(days=150):
+    """一檔資料完整、算得動的假股票。過不過篩不重要，重要的是「掃得到」。"""
+    closes = [100.0 + i * 0.05 for i in range(days)]
+    idx = pd.bdate_range('2025-01-01', periods=days)
+    return pd.DataFrame(
+        {
+            'Open': closes,
+            'High': [c * 1.01 for c in closes],
+            'Low': [c * 0.99 for c in closes],
+            'Close': closes,
+            'Volume': [600_000] * days,
+        },
+        index=idx,
+    )
+
+
+def _run_with(tmp_path, universe, download):
+    """跑一趟 `pipeline.run`，母體與下載行為都由呼叫端決定。"""
+    orig_universe, orig_download = pl.load_tw_stock_universe, pl.yf.download
+    try:
+        pl.load_tw_stock_universe = lambda *a, **k: (
+            [f'{c}.TW' for c in universe],
+            {f'{c}.TW': f'測試{c}' for c in universe},
+            {c: '測試業' for c in universe},
+        )
+        pl.yf.download = download
+        return pl.run(str(tmp_path), make_excel=False, workers=2,
+                      open_when_done=False, plotly_cdn=False)
+    finally:
+        pl.load_tw_stock_universe = orig_universe
+        pl.yf.download = orig_download
+
+
+def _main_with(tmp_path, universe, download, monkeypatch):
+    """同上，但走完整的 `main()`，拿到的是**結束碼**。
+
+    直接測 `pipeline.run` 的回傳值不夠：上一版的 bug 在 run 回傳的數字裡就已經
+    是錯的了，但真正造成損害的是 `main` 拿那些數字算出來的 `healthy`，而那一段
+    當時一條測試都沒有。
+    """
+    monkeypatch.setattr(pl, 'load_tw_stock_universe', lambda *a, **k: (
+        [f'{c}.TW' for c in universe],
+        {f'{c}.TW': f'測試{c}' for c in universe},
+        {c: '測試業' for c in universe},
+    ))
+    monkeypatch.setattr(pl.yf, 'download', download)
+    return main(['--output-dir', str(tmp_path), '--no-excel',
+                 '--workers', '2', '--offline-plotly'])
+
+
+# ---------------------------------------------------------------------------
+# 迴歸：上一版在這一條上是綠的，而它不該是
+
+
+def test_全市場下載失敗不可以判定成健康(tmp_path, monkeypatch):
+    """這就是那個 bug。
+
+    上一版跑這一條會得到 `scanned=5, universe=5, errors=0, healthy=yes`——
+    也就是「五檔全部沒問到」和「五檔全部問到、只是都沒過篩」在門檻眼裡一模一樣。
+    """
+    def dead(*a, **k):
+        raise RuntimeError('Yahoo 今天不給資料')
+
+    code = _main_with(tmp_path, ['1101', '1102', '1103', '1104', '1105'],
+                      dead, monkeypatch)
+    assert code == 2, (
+        '全市場下載失敗卻判定成健康。下一步是 `git push -f origin report`，'
+        '而那條分支只有一個 commit——昨天那份好的報告會被一份「今天 0 檔通過」'
+        '永久蓋掉，而且沒有任何症狀。'
+    )
+
+
+def test_一成以內的零星失敗仍然算數(tmp_path, monkeypatch):
+    """yfinance 偶爾漏一兩檔是常態。門檻擋的是系統性失敗，不是雜訊。
+
+    這一條和上面那一條要一起看：只有上面那條的話，把門檻寫成「有任何一檔失敗
+    就 return 2」也會過，而那種門檻每天都紅，紅到沒有人看為止。
+    """
+    frame = _good_frame()
+    calls = {'n': 0}
+
+    def flaky(*a, **k):
+        calls['n'] += 1
+        if calls['n'] == 1:          # 二十檔裡漏第一檔
+            raise RuntimeError('偶發')
+        return frame.copy()
+
+    code = _main_with(tmp_path, [str(1101 + i) for i in range(20)],
+                      flaky, monkeypatch)
+    assert code == 0, '漏掉一檔（5%）就判定不健康，這個門檻會紅到沒有人看'
+
+
+def test_一切正常就是結束碼_0(tmp_path, monkeypatch):
+    frame = _good_frame()
+    code = _main_with(tmp_path, ['1101', '1102', '1103'],
+                      lambda *a, **k: frame.copy(), monkeypatch)
+    assert code == 0
+
+
+# ---------------------------------------------------------------------------
+# 新上市不是失敗
+
+
+def test_歷史不足的新上市不算失敗(tmp_path, monkeypatch):
+    """60MA 要 60 根，所以不足 65 根的直接跳過——那是「沒得掃」不是「沒掃到」。
+
+    把它們算進分母的話，掛牌潮那幾週門檻會在一個和資料品質完全無關的理由上誤觸。
+    而誤觸一次之後，就沒有人再相信這個門檻了——這比沒有門檻更糟，因為它看起來
+    還在那裡。
+    """
+    short, full = _good_frame(days=30), _good_frame(days=150)
+
+    def mixed(ticker, *a, **k):
+        return short.copy() if str(ticker).startswith('99') else full.copy()
+
+    # 十檔裡四檔是新上市：ok_ratio 若用母體當分母只有 60%，會誤判成不健康。
+    universe = ['1101', '1102', '1103', '1104', '1105', '1106',
+                '9901', '9902', '9903', '9904']
+    code = _main_with(tmp_path, universe, mixed, monkeypatch)
+    assert code == 0, '新上市被算成失敗了——分母要扣掉 too_short'
+
+
+# ---------------------------------------------------------------------------
+# 結構守門：這一條比上面任何一條都重要
+
+
+def test_每一檔都要記到帳上(tmp_path):
+    """`scanned + errors + too_short` 必須等於 `universe`。
+
+    上一版的 bug 不在公式裡，在「有一條路沒有記帳」——下載失敗那條路既不加
+    `scanned` 也不加 `errors`，於是它從帳上消失了，而消失的方式剛好讓門檻恆真。
+
+    這一條不檢查任何門檻，只檢查記帳。將來有人在 `screen_stock` 裡加第四種
+    `return None`（例如「這檔停牌」「這檔是 ETF」）而忘了計數，這裡會先紅——
+    而那時候門檻還是綠的，因為少記的那一檔正好也不算進分母。
+    """
+    good, short = _good_frame(150), _good_frame(30)
+
+    def mixed(ticker, *a, **k):
+        t = str(ticker)
+        if t.startswith('99'):
+            return short.copy()
+        if t.startswith('88'):
+            raise RuntimeError('下載失敗')
+        return good.copy()
+
+    universe = ['1101', '1102', '9901', '9902', '8801', '8802', '8803']
+    r = _run_with(tmp_path, universe, mixed)
+
+    total = r['scanned'] + r['errors'] + r['too_short']
+    assert total == r['universe'], (
+        f"有 {r['universe'] - total} 檔沒有記到帳上："
+        f"scanned={r['scanned']} errors={r['errors']} "
+        f"too_short={r['too_short']} universe={r['universe']}。"
+        '每一條 return None 的路都要進其中一格，否則門檻的分母是錯的。'
+    )
+    assert r['scanned'] == 2
+    assert r['too_short'] == 2
+    assert r['errors'] == 3
+    assert r['error_kinds'].get('DownloadFailed') == 3, (
+        '下載失敗要記成 DownloadFailed，不要和程式的例外混在一起——'
+        '兩者的處置完全不同：一個去看 Yahoo，一個去看程式。'
+    )
+
+
+def test_scanned_不是母體大小(tmp_path):
+    """直接釘住「`scanned` 數的是什麼」。
+
+    這是上一版唯一錯的那件事，而它錯得很自然：`_screen_and_collect` 跑完了，
+    看起來就是掃過一檔。所以這裡用一個**一定不等於母體**的場景把它釘死。
+    """
+    good = _good_frame(150)
+
+    def half(ticker, *a, **k):
+        if str(ticker).startswith('88'):
+            raise RuntimeError('下載失敗')
+        return good.copy()
+
+    r = _run_with(tmp_path, ['1101', '1102', '8801', '8802'], half)
+    assert r['universe'] == 4
+    assert r['scanned'] == 2, (
+        f"scanned={r['scanned']}，母體是 4——兩檔下載失敗卻照樣算進 scanned。"
+        '這正是上一版：scanned 在呼叫端無條件遞增，所以它恆等於母體大小，'
+        '而門檻拿 scanned/universe 當健康指標，於是那道門檻恆為 100%。'
+    )
+
+
+# ---------------------------------------------------------------------------
+# workflow 讀得到的那幾個值
+
+
+def test_摘要要寫出_healthy_和拆解過的數字(tmp_path, monkeypatch):
+    """`daily.yml` 用 `healthy != 'no'` 決定要不要 push，所以這幾行寫錯＝門檻失效。"""
+    out = tmp_path / 'gh_output'
+    out.write_text('', encoding='utf-8')
+    monkeypatch.setenv('GITHUB_OUTPUT', str(out))
+
+    def dead(*a, **k):
+        raise RuntimeError('boom')
+
+    code = _main_with(tmp_path, ['1101', '1102', '1103'], dead, monkeypatch)
+    assert code == 2
+
+    written = dict(
+        line.split('=', 1) for line in out.read_text('utf-8').splitlines() if '=' in line
+    )
+    assert written['healthy'] == 'no'
+    assert written['scanned'] == '0'
+    assert written['universe'] == '3'
+    assert written['errors'] == '3'
+    assert 'too_short' in written, 'workflow 摘要看不到新上市那幾檔，會以為是漏抓'
+
+
+# 備註給以後抄這一支的人：這個 repo 用 pytest（`ci.yml` 是 `pytest tests -q`），
+# 所以 parametrize 可以用。隔壁的 tw-six-metrics **不行**——那邊的
+# `scripts/run_tests.py` 是自製 runner，只收「零參數的 test_ 函式」，
+# parametrize 的那一個會以 TypeError 收場，而那個錯誤看起來像測試寫壞了。

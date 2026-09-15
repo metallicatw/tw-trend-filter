@@ -219,11 +219,22 @@ jobs:
       # 用 orphan + force push 而不是一般 commit：一般 commit 的話歷史照樣會長，
       # 只是長在別的分支上。
       #
-      # `healthy != 'no'` 是這條分支唯一的安全帶：force push 到一條只有一個
+      # `healthy == 'yes'` 是這條分支唯一的安全帶：force push 到一條只有一個
       # commit 的孤兒分支，覆蓋掉就沒有第二份。母體只掃到一小部分的那天，
       # 寧可讓網站繼續顯示昨天那份好的。
+      #
+      # 寫 `== 'yes'` 而不是 `!= 'no'`，差別在**輸出根本沒寫出來**的時候：
+      # 篩選那一步若在寫 GITHUB_OUTPUT 之前就死掉（OOM、runner 被砍），
+      # `healthy` 是空字串，而空字串 `!= 'no'` 成立。安全帶要往「不推」那一邊
+      # 倒。（目前 Actions 會對不含狀態函式的 if 自動補 success()，所以那一步
+      # 失敗時本來就會跳過——但這條分支覆蓋掉就沒有第二份，不值得押在一個
+      # 「目前的預設行為」上。）
+      #
+      # 而 `healthy` 本身怎麼算出來的，見 `__main__` 與 `pipeline.screen_stock`：
+      # 這道門檻曾經有一段時間是完全沒有作用的，因為 `scanned` 數的是「跑完
+      # 幾檔」而不是「真的掃到幾檔」。
       - name: 發布報告到 report 分支
-        if: steps.screen.outputs.healthy != 'no'
+        if: steps.screen.outputs.healthy == 'yes'
         run: |
           test -s index.html || { echo "::error::沒有產生 index.html"; exit 1; }
           cp index.html /tmp/report.html
@@ -260,7 +271,7 @@ jobs:
       #
       # 兩個站都在 metallicatw.github.io 之下，同源，沒有 CORS 問題。
       - name: 準備 Pages 內容
-        if: steps.screen.outputs.healthy != 'no'
+        if: steps.screen.outputs.healthy == 'yes'
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -287,19 +298,19 @@ jobs:
       # `enablement: true`：第一次跑的時候順手把 Pages 打開（權限是上面那個
       # `pages: write`），省掉一次「去 Settings 按一下」而且沒有人記得要按。
       - uses: actions/configure-pages@v5
-        if: steps.screen.outputs.healthy != 'no'
+        if: steps.screen.outputs.healthy == 'yes'
         continue-on-error: true
         with:
           enablement: true
 
       - uses: actions/upload-pages-artifact@v3
-        if: steps.screen.outputs.healthy != 'no'
+        if: steps.screen.outputs.healthy == 'yes'
         continue-on-error: true
         with:
           path: pages
 
       - name: 發布 Pages
-        if: steps.screen.outputs.healthy != 'no'
+        if: steps.screen.outputs.healthy == 'yes'
         continue-on-error: true
         id: pages
         uses: actions/deploy-pages@v4
@@ -310,7 +321,13 @@ jobs:
           {
             echo "### 台股順勢交易篩選 ${{ steps.screen.outputs.date }}"
             echo ""
-            echo "* 掃描：${{ steps.screen.outputs.scanned }} 檔"
+            # 四個數字一起寫。只寫「掃描 N 檔」的話，N 是母體大小還是真的掃到
+            # 的，從摘要上看不出來——而那正是這道門檻失效那段時間唯一看得到的
+            # 東西。分母（母體 − 新上市）和失敗數擺在旁邊，一眼就知道今天是
+            # 「市場沒有標的」還是「我們沒問到」。
+            echo "* 母體：${{ steps.screen.outputs.universe }} 檔（其中 ${{ steps.screen.outputs.too_short || 0 }} 檔新上市、歷史不足，算不了 60MA）"
+            echo "* 真的掃到：${{ steps.screen.outputs.scanned }} 檔 ｜ 沒掃成：${{ steps.screen.outputs.errors || 0 }} 檔"
+            echo "* 這一趟算不算數：**${{ steps.screen.outputs.healthy || '不明' }}**"
             echo "* 通過：**${{ steps.screen.outputs.count }}** 檔"
             # 「今天只有 3 檔通過」和「今天有人把量比調到 3 倍」不該長得一樣。
             echo "* 門檻：${{ steps.screen.outputs.rules || 'default' }}"

@@ -171,9 +171,25 @@ def main(argv: list[str] | None = None) -> int:
     # 綠燈加 force push 等於「壞掉的那天會把好的那天蓋掉，而且沒有人會知道」。
     #
     # 門檻放在 90%：yfinance 偶爾漏個幾檔是常態，漏掉十分之一就不是了。
-    universe = result.get('universe') or result['scanned'] or 1
-    ok_ratio = result['scanned'] / universe
-    healthy  = ok_ratio >= 0.90 and result.get('errors', 0) <= universe * 0.10
+    #
+    # ⚠️ 這道門檻寫好之後有一段時間是**完全沒有作用的**，而外表看不出來：
+    # `scanned` 當時由呼叫端無條件遞增，所以它恆等於母體大小，`ok_ratio` 恆為
+    # 100%，全市場下載失敗照樣 healthy=yes 然後 force push 蓋掉昨天。修法在
+    # `pipeline.screen_stock`（那裡有完整說明）。這裡留一句是因為：**這個數字
+    # 的意思比這個公式重要**。要動這一段之前，先確認 `scanned` 還是「真的掃到
+    # 幾檔」，不是「跑完幾檔」。
+    #
+    # 分母扣掉「歷史不足 65 根」的那幾檔：它們不是沒掃到，是沒得掃（新上市，
+    # 算不了 60MA）。把它們算進分母，掛牌潮那幾週就會在一個和資料品質無關的
+    # 理由上誤觸門檻——而誤觸一次之後，就沒有人再相信這個門檻了。
+    universe  = result.get('universe') or 0
+    too_short = result.get('too_short', 0)
+    errors    = result.get('errors', 0)
+    scannable = max(universe - too_short, 0)
+    ok_ratio  = (result['scanned'] / scannable) if scannable else 0.0
+    healthy   = (scannable > 0
+                 and ok_ratio >= 0.90
+                 and errors <= scannable * 0.10)
 
     # 讓 workflow 的後續步驟拿得到「今天通過幾檔」，不必去 parse 上面那堆輸出。
     summary = os.environ.get('GITHUB_OUTPUT')
@@ -182,7 +198,8 @@ def main(argv: list[str] | None = None) -> int:
             fh.write(f"count={result['count']}\n")
             fh.write(f"scanned={result['scanned']}\n")
             fh.write(f"universe={universe}\n")
-            fh.write(f"errors={result.get('errors', 0)}\n")
+            fh.write(f"errors={errors}\n")
+            fh.write(f"too_short={too_short}\n")
             fh.write(f"healthy={'yes' if healthy else 'no'}\n")
             fh.write(f"date={result['date']}\n")
             fh.write(f"xlsx={result['xlsx']}\n")
@@ -194,9 +211,20 @@ def main(argv: list[str] | None = None) -> int:
                 if changed else 'default') + '\n')
 
     if not healthy:
-        print(f"::error::這一趟只跑完 {result['scanned']}/{universe} 檔"
-              f"（{ok_ratio:.0%}），例外 {result.get('errors', 0)} 檔。"
-              "報告仍然產出來了，但不應該拿它覆蓋昨天那份。")
+        kinds = result.get('error_kinds') or {}
+        # 「沒下載到」和「算到一半炸了」是兩種完全不同的故障，處置也不同：
+        # 前者去看 Yahoo／網路，後者去看程式。摘要上分開寫，不要讓人自己猜。
+        dl = kinds.get('DownloadFailed', 0)
+        other = {k: v for k, v in kinds.items() if k != 'DownloadFailed'}
+        detail = f"下載失敗 {dl} 檔" if dl else ""
+        if other:
+            detail += ("，" if detail else "") + "例外：" + "、".join(
+                f'{k} {v} 檔' for k, v in sorted(other.items(), key=lambda x: -x[1]))
+        print(f"::error::這一趟只真的掃到 {result['scanned']}/{scannable} 檔"
+              f"（{ok_ratio:.0%}）"
+              + (f"，{detail}" if detail else "")
+              + (f"（另有 {too_short} 檔歷史不足，已排除）" if too_short else "")
+              + "。報告仍然產出來了，但不應該拿它覆蓋昨天那份。")
         return 2
     return 0
 

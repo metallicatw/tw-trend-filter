@@ -128,6 +128,13 @@ class Rules:
     vol_ratio: float = 1.2           # 當日量 ÷ 20 日均量的下限
     #: 停損
     atr_stop: float = 3.0            # 停損 = 收盤 − 這個倍數 × ATR(14)
+    #: ∩ 六大與估值。**預設 0 ＝ 這一關不啟用**——〔台股趨勢選股〕講的是四部曲，
+    #: 多兩個門檻在那一頁上不該改變它篩出什麼。〔趨勢∩六大∩報酬〕那個入口把
+    #: 它們設成 3 和 2（見 `CROSS_DEFAULTS`）。
+    #:
+    #: 它們不在 `describe()` 裡，理由同上：那四行說的是四部曲。
+    min_six: float = 0.0             # 六大綜合評分下限（滿分約 3.83）
+    min_rr: float = 0.0              # 報酬風險比下限
 
     def describe(self) -> tuple[tuple[str, str], ...]:
         """Excel 第一分頁那四行「四部曲篩選機制說明」，照實際生效的門檻寫。"""
@@ -176,6 +183,12 @@ SNAPSHOT_COLUMNS: tuple[str, ...] = (
     'trend_ok', 'brk_boll', 'brk_don',    # ②④ 的判定結果，見下面那段說明
     'atr14',                          # 停損
     'chg', 'chg_pct',                 # 側欄卡片上的漲跌（判定用不到）
+    # 〔趨勢∩六大∩報酬〕那一頁用的三格，來自 tw-six-metrics 的 cross.json。
+    # 和四部曲完全無關：`passes()` 不看它們、`tfPass()` 也不看。多一道關卡是
+    # 多一道關卡，不是把四部曲改掉。見 `cross_passes`。
+    'six',                            # 六大財務指標最新綜合評分（沒有就是 None）
+    'rr',                             # 報酬風險比（算不出來就是 None）
+    'rr_free',                        # 股價已低於下檔價：沒有下檔風險
 )
 
 #: 快照裡每一個數字存到小數第幾位。
@@ -221,6 +234,8 @@ SNAPSHOT_PRECISION: dict[str, int] = {
     'donchian': 2,     # 只給畫面看
     'vol_ratio': 6,    # ④ 和 vol_ratio 比（1.1951 那個例子）
     'atr14': 2,        # 只給畫面看（停損價另外算）
+    'six': 4,          # ∩ 和 min_six 比。六大是六個整數的平均，n/6 四位就夠
+    'rr': 6,           # ∩ 和 min_rr 比。門檻來自數字框（step 0.1），六位保險
 }
 
 
@@ -302,6 +317,88 @@ def passes(snap: dict, rules: Rules) -> tuple[bool, list[str]]:
     if brk_don:
         triggers.append('突破20日高點')
     return True, triggers
+
+
+# ===============================================================
+# 〔趨勢∩六大∩報酬〕：第五道關卡
+# ===============================================================
+#
+# 四部曲講的是「今天技術面在動」。這一關問的是另一件事：**這家公司的體質與
+# 價位值不值得**。兩者互不相干，所以它是另外一道關卡，不是把四部曲改掉——
+# `passes()` 與 `tfPass()` 一行都沒有為它動過。
+
+
+def reward_risk(target, downside, close):
+    """報酬風險比，以及「沒有下檔風險」。回 `(rr, risk_free)`。
+
+    ## 為什麼這一步在這裡算，不是由 tw-six-metrics 算好送過來
+
+    報酬風險比拆開來是
+
+        目標價 ＝ 歷年本益比高 × 預估EPS      ← 和今天的股價無關
+        下檔價 ＝ 歷年本益比低 × 預估EPS      ← 和今天的股價無關
+        報酬風險比 ＝ |(目標價/股價 − 1) ÷ (下檔價/股價 − 1)|
+
+    只有最後一步要股價，而**這支程式手上就有今天的收盤**——它為了畫線圖把全
+    市場的 OHLCV 都抓下來了。對面發前兩個、這邊算最後一步，兩邊用的就是同一
+    天的同一個價格。
+
+    由對面算好再送過來的話，這支程式得排在它後面才拿得到當天的值，而它目前跑
+    在前面 34 分鐘（07:07 UTC vs 07:41 UTC）。要對齊就得整條排程往後推。
+
+    而且同一天不只是好看：四部曲挑的是「今天突破、今天放量」的股票，也就是
+    **今天剛漲上去**的那一批。用昨天的價格算，分母偏低、報酬被高估、報酬風險
+    比系統性偏高——偏差的方向剛好倒向「看起來更該買」。那不是雜訊，是有方向的。
+
+    ## 三種答案
+
+        (rr, False)    一般情況。
+        (None, True)   股價已經低於下檔價：**沒有下檔風險**，四段裡最好的那種。
+        (None, False)  算不出來（對面沒有這一檔的目標價，多半是缺〔年度交易
+                       資訊〕所以沒有本益比區間）。
+
+    中間那個和最後一個都沒有數字，意思卻正好相反。拿 `>= 門檻` 去篩會把最好的
+    那一批和沒資料的一起丟掉——而丟掉的方式是「它們不在名單上」，沒有徵兆。
+
+    `0.0` 是第四種：股價已經高過目標價，沒有上檔可分。那是一個**算得出來的
+    答案**（答案是不要買），不是缺資料。
+    """
+    if target is None or downside is None or not close or close <= 0:
+        return None, False
+    if close <= downside:
+        return None, True
+    ret = target / close - 1
+    if ret <= 0:
+        # `abs(ret / risk)` 在這裡會把兩個負號約掉，給出一個很漂亮的大數字。
+        # tw-six-metrics 那邊實測有 4 檔這樣來的（南俊國際 582 倍配 −100% 的
+        # 預期報酬）。四個判斷準則從頭到尾預設報酬是正的。
+        return 0.0, False
+    risk = downside / close - 1
+    if not risk:
+        return None, False
+    return abs(ret / risk), False
+
+
+def cross_passes(snap: dict, min_six: float, min_rr: float) -> bool:
+    """六大評分與報酬風險比這一關過不過。
+
+    網頁上那一份 `tfCross` 是這個函式的逐行翻譯，`tests/test_snapshot.py` 拿
+    真的資料兩邊對過——和 `passes()`／`tfPass()` 同一個約定。
+
+    門檻是 0 就等於這一關不啟用：〔台股趨勢選股〕那一頁的預設值是 0，
+    〔趨勢∩六大∩報酬〕是 3 和 2。同一份報告、同一段程式，兩個入口。
+    """
+    if min_six > 0:
+        six = snap.get('six')
+        if six is None or six <= min_six:
+            return False
+    if min_rr > 0:
+        if snap.get('rr_free'):
+            return True          # 沒有下檔風險，比任何門檻都好
+        rr = snap.get('rr')
+        if rr is None or rr <= min_rr:
+            return False
+    return True
 
 
 # ===============================================================
@@ -863,6 +960,49 @@ def compute_bollinger(close, period=20, k=2):
     return ma, up, dn, bw
 
 
+#: tw-six-metrics 發布的那一份，預設位置。
+CROSS_URL = 'https://metallicatw.github.io/tw-six-metrics/cross.json'
+
+
+def load_cross_feed(url: str = '') -> dict:
+    """抓 `cross.json`：{代號: [六大, 目標價, 下檔價]}，外加 `as_of` 與 `quarter`。
+
+    ## 抓不到不是失敗
+
+    這份報告的主體是四部曲，而四部曲一個位元組都不需要對面。抓不到就是
+    〔趨勢∩六大∩報酬〕那一頁今天沒有東西可比——那一頁會自己說出來，而
+    〔台股趨勢選股〕完全不受影響。
+
+    所以這裡吞掉所有例外，只留一行訊息。反過來做的話，對面的 Pages 掛五分鐘
+    就會讓今天整份趨勢報告不見，而那兩件事的重要性差很多。
+
+    ## 為什麼不是抓 valuations.csv
+
+    對面的 `data/valuations.csv` 有 1,958 列 × 29 欄、四百多 KB，而這裡要的
+    只有三欄。`cross.json` 是對面專門為這件事發的，52 KB，而且**不含股價**
+    ——含了股價就等於含了報酬風險比，見 `reward_risk` 的說明。
+    """
+    import json
+    import urllib.request
+
+    # `'-'` ＝ 這次不要抓。空字串是「用預設那一份」——兩者要分得開，否則
+    # 「我不想連網」和「我沒有特別指定」會變成同一件事。
+    if url == '-':
+        return {}
+    target = url or CROSS_URL
+    try:
+        with urllib.request.urlopen(target, timeout=30) as resp:
+            payload = json.loads(resp.read().decode('utf-8'))
+    except Exception as exc:                      # noqa: BLE001
+        print(f'⚠️ 六大與估值抓不到（{exc}）——〔趨勢∩六大∩報酬〕今天沒有資料可比，'
+              f'四部曲不受影響')
+        return {}
+    rows = payload.get('rows') or {}
+    print(f'✅ 六大與估值：{len(rows)} 檔　財報 {payload.get("quarter", "?")}'
+          f'　估值基準 {payload.get("as_of", "?")}')
+    return payload
+
+
 def run(
     output_dir: str,
     *,
@@ -880,6 +1020,7 @@ def run(
     rules: Rules = DEFAULT_RULES,
     data_dir: str = '',
     data_base: str = '',
+    cross_url: str = '',
 ) -> dict:
     """跑完一次全市場篩選，回傳 ``{'results', 'xlsx', 'html', 'index'}``。
 
@@ -910,6 +1051,7 @@ def run(
         TICKERS = TICKERS[:limit]
         print(f'   （--limit {limit}：只掃前 {len(TICKERS)} 檔）')
     print(f'✅ 股票池：{len(TICKERS)} 檔  |  ISIN 產業別：{len(ISIN_INDUSTRY)} 筆')
+    CROSS = load_cross_feed(cross_url)
     print()
 
     # ===============================================================
@@ -1074,6 +1216,14 @@ def run(
                 'chg': chg,
                 'chg_pct': chg_pct,
             }
+            # 六大與估值。`price` 就是上面那個收盤價——報酬風險比因此和四部曲
+            # 用的是同一天的同一個數字，見 `reward_risk` 的說明。
+            six, target_price, floor_price = (CROSS.get('rows') or {}).get(
+                code, (None, None, None))
+            rr_value, rr_free = reward_risk(target_price, floor_price, price)
+            snap['six'] = None if six is None else _snap_round('six', float(six))
+            snap['rr'] = None if rr_value is None else _snap_round('rr', rr_value)
+            snap['rr_free'] = rr_free
             with _snap_lock:
                 SNAPSHOTS.append(snap)
 
@@ -1744,6 +1894,7 @@ def run(
         # 網頁用 `data_base` 組出網址，點下去才抓。`data_dir` 空的時候整段
         # 不做——本機自己跑一份不需要多那 1,900 個檔案。
         extra_charts=CHARTS, data_dir=data_dir, data_base=data_base,
+        cross=CROSS,
     )
 
     # 排程要的是一個固定的檔名（`index.html`），因為下游——tw-six-metrics 的建站
@@ -1831,11 +1982,20 @@ LIVE_FIELDS: tuple[tuple[str, str, str, str, str], ...] = (
     ('squeeze',    '壓縮門檻',   '',      '0.01', ''),
     ('vol_ratio',  '量比下限',   '倍',    '0.1',  ''),
     ('atr_stop',   '停損倍數',   '×ATR',  '0.5',  ''),
+    ('min_six',    '六大評分',   '分以上', '0.1',  ''),
+    ('min_rr',     '報酬風險比', '倍以上', '0.1',  ''),
 )
+
+#: 〔趨勢∩六大∩報酬〕那個入口的預設門檻。
+#:
+#: 同一份報告、同一段 JS，兩個入口：網址帶 `#cross` 就套這一組，不帶就是
+#: `Rules` 的 0（等於這一關不啟用）。兩份 HTML 的話，趨勢圖、卡片、圖表資料
+#: 那一整套都要維護兩次，而它們沒有任何一處該不一樣。
+CROSS_DEFAULTS: dict[str, float] = {'min_six': 3.0, 'min_rr': 2.0}
 
 
 def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
-                data_ver=''):
+                data_ver='', cross=None):
     """頁首那一塊〔調整篩選條件〕，以及驅動左邊那排卡片的那段 JS。
 
     ## 這一塊是這一頁的控制器，不是附註
@@ -1911,6 +2071,9 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
     link_js = json.dumps((link_base or '').rstrip('/'))
     data_js = json.dumps((data_base or '').rstrip('/'))
     ver_js = json.dumps(str(data_ver or ''))
+    cross_js = json.dumps({'as_of': (cross or {}).get('as_of', ''),
+                           'quarter': (cross or {}).get('quarter', '')},
+                          ensure_ascii=False)
     cols = json.dumps({k: i for i, k in enumerate(SNAPSHOT_COLUMNS)})
     return f"""
       <div id="live">
@@ -1929,6 +2092,11 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
       const TF_DAYS = {SNAPSHOT_DAYS};
       const TF_KEYS = {json.dumps([f[0] for f in LIVE_FIELDS])};
       const TF_DEFAULT = {json.dumps({f[0]: _live_default(rules, f[0]) for f in LIVE_FIELDS})};
+      // 〔趨勢∩六大∩報酬〕那個入口的門檻。網址帶 #cross 才套用。
+      const TF_CROSS_DEFAULT = {json.dumps(CROSS_DEFAULTS)};
+      // 六大與估值是哪一天的——一份沒有日期的估值，和一份標錯日期的估值，
+      // 後者比較糟。
+      const TF_CROSS_AS_OF = {cross_js};
       // 欄位名 → 在那一列裡的位置。寫成名字而不是數字，是因為 `row[12]` 這種
       // 東西在 SNAPSHOT_COLUMNS 中間插一欄之後會安靜地變成另一個指標。
       const C = {cols};
@@ -1955,6 +2123,7 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
       const TF_CACHE = {{}};        // 抓過就不再抓第二次
       let TF_ROWS = [];
       let TF_HITS = [];
+      let TF_SHORT = [];
 
       function tfRules() {{
         const r = {{}};
@@ -2003,9 +2172,54 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
         }});
       }}
 
+      // 第五道關卡：六大評分與報酬風險比。`cross_passes()` 的逐行翻譯，
+      // tests/test_snapshot.py 兩邊對過。門檻 0 等於這一關不啟用。
+      //
+      // 刻意**不寫在 tfPass 裡**：tfPass 是四部曲，而四部曲和這一關講的是兩件
+      // 事。混在一起的話，〔台股趨勢選股〕那一頁篩出什麼就會取決於另一個 repo
+      // 今天有沒有把檔案發出來。
+      function tfCross(row, r) {{
+        if (r.min_six > 0) {{
+          const six = row[C.six];
+          if (six === null || six === undefined || six <= r.min_six) return false;
+        }}
+        if (r.min_rr > 0) {{
+          if (row[C.rr_free]) return true;   // 沒有下檔風險，比任何門檻都好
+          const rr = row[C.rr];
+          if (rr === null || rr === undefined || rr <= r.min_rr) return false;
+        }}
+        return true;
+      }}
+
+      // 「它不是被門檻刷掉的，是根本沒有數字可比」。
+      //
+      // 這兩種要分開，因為它們該給讀者的動作不一樣：被刷掉的是「看過了，不
+      // 合格」，沒有數字的是「還不知道」——而 6770 力積電那種六大 3.0、只差
+      // 一張〔年度交易資訊〕的，混在一起就會無聲消失。
+      function tfCrossUnknown(row, r) {{
+        const six = row[C.six], rr = row[C.rr];
+        if (r.min_six > 0 && (six === null || six === undefined)) return true;
+        if (r.min_rr > 0 && !row[C.rr_free] && (rr === null || rr === undefined)) return true;
+        return false;
+      }}
+
+      function tfCrossWhy(row, r) {{
+        if (r.min_six > 0 && (row[C.six] === null || row[C.six] === undefined)) {{
+          return '沒有六大評分';
+        }}
+        return '沒有報酬風險比（多半是缺〔年度交易資訊〕，算不出本益比區間）';
+      }}
+
+      // 「這一檔為什麼沒有報酬風險比」——只有兩種，而它們的意思正好相反。
+      function tfRrText(row) {{
+        if (row[C.rr_free]) return '∞';
+        const rr = row[C.rr];
+        return (rr === null || rr === undefined) ? '—' : rr.toFixed(2);
+      }}
+
       // 一張側欄卡片。這是**唯一**一份實作——Python 那一份拿掉了。
       // 台股慣例：漲紅、跌綠。
-      function tfCard(row, triggers, i) {{
+      function tfCard(row, triggers, i, shortWhy) {{
         const code = row[C.code], chg = row[C.chg], pct = row[C.chg_pct];
         const cls = chg > 0 ? 'up' : (chg < 0 ? 'dn' : 'fl');
         const sign = chg > 0 ? '▲ ' : (chg < 0 ? '▼ ' : '');
@@ -2022,7 +2236,8 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
         const tags = triggers.map(function (t) {{
           return '<span class="nb-tag">' + tfEsc(t) + '</span>';
         }}).join('');
-        return '<div class="nb' + (drawn ? '' : ' nochart') + '" id="sb-' + i +
+        return '<div class="nb' + (drawn ? '' : ' nochart') +
+          (shortWhy ? ' nbshort' : '') + '" id="sb-' + i +
           '" data-code="' + tfEsc(code) + '" onclick="tfOpen(\\'' + tfEsc(code) + '\\')">' +
           '<div class="nb-top"><span class="nb-code">' + tfEsc(code) + '</span>' +
           '<span class="nb-close ' + cls + '">' + row[C.close].toFixed(2) + '</span></div>' +
@@ -2030,15 +2245,33 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
           '<span class="nb-pct ' + cls + '">' + sign + Math.abs(chg).toFixed(2) +
           ' (' + pct.toFixed(2) + '%)</span></div>' +
           '<div class="nb-ind">' + tfEsc(row[C.industry] || '') + '</div>' +
+          // 六大與報酬風險比。**永遠顯示**，不只在 #cross 那個入口——一檔技術面
+          // 在動的股票，下一個問題本來就是體質和價位，而那兩個數字已經在手上。
+          // 對面沒發資料的時候整列不出現，而不是印兩個破折號佔一行。
+          (row[C.six] !== null && row[C.six] !== undefined ||
+           row[C.rr] !== null && row[C.rr] !== undefined || row[C.rr_free]
+            ? '<div class="nb-cross"><span title="六大財務指標最新綜合評分">六大 ' +
+              (row[C.six] === null || row[C.six] === undefined
+                ? '—' : row[C.six].toFixed(2)) +
+              '</span><span title="報酬風險比（∞ ＝ 股價已低於下檔價，沒有下檔風險）">' +
+              '報酬/風險 ' + tfRrText(row) + '</span></div>'
+            : '') +
+          (shortWhy
+            ? '<div class="nb-why">' + tfEsc(shortWhy) + '</div>' : '') +
           '<div class="nb-tagrow">' + tags + ext + '</div></div>';
       }}
 
       function tfApply() {{
         const r = tfRules();
         TF_HITS = [];
+        TF_SHORT = [];
         for (const row of TF_ROWS) {{
           const t = tfPass(row, r);
-          if (t) TF_HITS.push([row, t]);
+          if (!t) continue;
+          if (tfCross(row, r)) TF_HITS.push([row, t]);
+          // 四部曲過了、第五關因為**沒有資料**沒過的那幾檔。門檻是 0 的時候
+          // 這一籃一定是空的（tfCross 直接回 true）。
+          else if (tfCrossUnknown(row, r)) TF_SHORT.push([row, t]);
         }}
         // 量比高的排前面，同量比照代號。和 Excel 那一份同一個排法。
         TF_HITS.sort(function (a, b) {{
@@ -2050,11 +2283,31 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
         n.className = TF_HITS.length ? 'hit' : 'miss';
         const list = document.getElementById('sb-list');
         // 只畫前 300 張：再多就不是拿來讀的了，而 DOM 會開始卡。
-        list.innerHTML = TF_HITS.slice(0, 300).map(function (h, i) {{
+        let html = TF_HITS.slice(0, 300).map(function (h, i) {{
           return tfCard(h[0], h[1], i);
         }}).join('') + (TF_HITS.length > 300
           ? '<div class="sb-more">還有 ' + (TF_HITS.length - 300) +
             ' 檔沒列出來——把門檻收緊一點。</div>' : '');
+        if (!TF_HITS.length) {{
+          html += '<div class="sb-more">今天沒有一檔同時過這幾關。' +
+                  '把門檻調鬆一點，或看下面那幾檔還缺什麼。</div>';
+        }}
+        // 資料不足的那幾檔列在名單**下方**，標示原因。
+        //
+        // 不列的話它們會無聲消失，而「消失」和「不合格」在畫面上長得一模一樣
+        // ——6770 力積電六大 3.0，只差一張〔年度交易資訊〕。
+        if (TF_SHORT.length) {{
+          TF_SHORT.sort(function (a, b) {{
+            return (b[0][C.six] || -1) - (a[0][C.six] || -1) ||
+                   (a[0][C.code] < b[0][C.code] ? -1 : 1);
+          }});
+          html += '<div class="sb-sep">資料不足，沒有納入交集（' +
+                  TF_SHORT.length + ' 檔）</div>' +
+                  TF_SHORT.slice(0, 60).map(function (h, i) {{
+                    return tfCard(h[0], h[1], TF_HITS.length + i, tfCrossWhy(h[0], r));
+                  }}).join('');
+        }}
+        list.innerHTML = html;
         // 門檻改過之後，原本選中的那一檔可能已經不在名單上了。還在就留著，
         // 不在就跳到新名單的第一張——空著一張圖停在畫面上比切走更難懂。
         const still = TF_HITS.findIndex(function (h) {{ return h[0][C.code] === TF_CUR; }});
@@ -2220,10 +2473,24 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
         el.innerHTML = head + six;
       }}
 
+      // 「回到預設」回到的是**這個入口的**預設。從 #cross 進來的話那是 3 和 2，
+      // 不是 0——否則按一下就從〔趨勢∩六大∩報酬〕變回〔台股趨勢選股〕，而網址
+      // 和標題都還寫著交集。
+      function tfDefaults() {{
+        const d = Object.assign({{}}, TF_DEFAULT);
+        if (tfCrossMode()) Object.assign(d, TF_CROSS_DEFAULT);
+        return d;
+      }}
+
+      function tfCrossMode() {{
+        return (location.hash || '').toLowerCase().indexOf('cross') >= 0;
+      }}
+
       function tfReset() {{
+        const d = tfDefaults();
         for (const k of TF_KEYS) {{
           const el = document.getElementById('f_' + k);
-          if (el) el.value = TF_DEFAULT[k];
+          if (el) el.value = d[k];
         }}
         tfApply();
       }}
@@ -2231,6 +2498,18 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
       document.addEventListener('DOMContentLoaded', function () {{
         try {{ TF_ROWS = JSON.parse(document.getElementById('tf-snap').textContent); }}
         catch (e) {{ TF_ROWS = []; }}
+        // 同一份報告，兩個入口。`#cross` 把第五關的兩個門檻預先填成 3 和 2；
+        // 不帶就是 0，也就是這一關不啟用，〔台股趨勢選股〕篩出什麼完全不變。
+        //
+        // 做成兩份 HTML 的話，趨勢圖、卡片、圖表資料那一整套都要維護兩次，
+        // 而它們沒有任何一處該不一樣。
+        if (tfCrossMode()) {{
+          for (const k in TF_CROSS_DEFAULT) {{
+            const el = document.getElementById('f_' + k);
+            if (el) el.value = TF_CROSS_DEFAULT[k];
+          }}
+          document.body.classList.add('crossmode');
+        }}
         // 改門檻**不會**馬上重篩——要按〔篩選〕（或在任何一格按 Enter）。
         //
         // 邊打邊篩那一版試過：打「1200」的過程中會先用 1、12、120 各篩一次，
@@ -2616,7 +2895,8 @@ def chart_template():
 def build_interactive_html(results, today_str, output_dir, now=None, *,
                            link_base='', plotly_cdn=True, chart_years=2.0,
                            excel_url='', rules=None, snapshots=None,
-                           extra_charts=None, data_dir='', data_base=''):
+                           extra_charts=None, data_dir='', data_base='',
+                           cross=None):
     """產生互動線圖那一份 HTML，回傳檔案路徑。
 
     和本機版的三個差別，全都是因為這一份要放上網、給手機開：
@@ -2864,6 +3144,15 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         # 換行，不是擠成一排。門檻放寬之後一檔可以同時觸發四個訊號，而四顆
         # 徽章塞進 300px 的側欄裡，每一顆都會被截成「黃…」「布…」——四個
         # 都認不出來，等於那一列不存在。寧可高一點。
+        # 六大與報酬風險比。**手機上不收**——`.nb-tagrow` 在窄螢幕是收起來的
+        # （觸發訊號在圖表區上方還看得到），但這兩個數字別的地方沒有，收掉
+        # 就等於手機上這個功能不存在。所以它只有一行、字更小。
+        '.nb-cross{display:flex;justify-content:space-between;gap:6px;margin-top:3px;'
+            'font-size:10.5px;color:#a9b4c0;font-variant-numeric:tabular-nums}'
+        '.nbshort{opacity:.72}'
+        '.nb-why{font-size:10px;color:#d9a441;margin-top:3px;white-space:normal;line-height:1.35}'
+        '.sb-sep{margin:14px 6px 6px;padding-top:10px;border-top:1px solid #30363d;'
+            'color:#8b949e;font-size:11px}'
         '.nb-tagrow{display:flex;flex-wrap:wrap;align-items:center;gap:5px;margin-top:6px}'
         # `flex:0 0 auto` 是那條換行規則的另一半：不加的話，flex 仍然會先把每一
         # 顆壓到最小寬度、壓不下去才換行，於是四顆一樣被截成「黃…」。
@@ -3021,6 +3310,14 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
             # 上方仍然看得到。產業留著，那是一行字。
             '.nb-tagrow{display:none}'
             '.nb-ind{font-size:10px;margin-top:2px}'
+            '.nb-cross{font-size:10px;margin-top:2px}'
+            '.nb-why{font-size:9.5px}'
+            # 手機上側欄是一條**橫向**滑動的列，所以那條分隔不能是一條橫線
+            # ——橫線在橫向的列裡等於把兩區疊在一起。改成一塊窄的直立分隔，
+            # 左邊一條線，讀起來才是「這裡以後是另一區」。
+            '.sb-sep{flex:0 0 auto;min-width:92px;max-width:92px;margin:0 2px;'
+                'padding:6px 8px 6px 10px;border-top:none;border-left:1px solid #30363d;'
+                'white-space:normal;line-height:1.4;display:flex;align-items:center}'
             '#chartcol{flex:1 1 auto;height:auto;min-height:0;overflow-y:auto}'
             '.plot{flex:1 1 auto;min-height:260px}'
             '.badge{font-size:11.5px;padding:4px 10px}'
@@ -3530,7 +3827,8 @@ document.addEventListener('DOMContentLoaded', function() { syncHdHeight(); });
         # 點到的會是隔壁那一檔，而且不會報錯。
         _live_block(rules, snapshots=snapshots,
                     drawn={s['code']: i for i, s in enumerate(stock_infos)},
-                    link_base=link_base, data_base=data_base, data_ver=ts),
+                    link_base=link_base, data_base=data_base, data_ver=ts,
+                    cross=cross),
         # 「滑鼠移入圖表 → 顯示指標｜左鍵拖曳｜滾輪縮放」那一行拿掉了。
         # 它教的是三件**試一次就知道**的事，而它每天出現在每一位讀者眼前，
         # 佔的還是頁首最寬的那一段。手機上更沒有滑鼠也沒有滾輪。

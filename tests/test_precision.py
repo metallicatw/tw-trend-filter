@@ -53,6 +53,9 @@ def _snap(**kw):
         'boll_up': close * 0.98, 'donchian': close * 0.99,
         'vol_ratio': 1.5, 'atr14': 2.0, 'chg': 1.0, 'chg_pct': 1.0,
         'trend_ok': True, 'brk_boll': True, 'brk_don': True,
+        # 第五關的三格。`passes()` 不看它們（那是 `cross_passes` 的工作），
+        # 但快照的欄位是介面的一部分，少一格就不是一份真的快照。
+        'six': None, 'rr': None, 'rr_free': False,
     }
     s.update(kw)
     assert set(s) == set(SNAPSHOT_COLUMNS)

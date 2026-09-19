@@ -146,6 +146,7 @@ jobs:
             --link-base "https://metallicatw.github.io/tw-six-metrics/stock" \
             --data-dir pages/trend-d \
             --data-base "https://metallicatw.github.io/tw-trend-filter/trend-d" \
+            --cross-url "https://metallicatw.github.io/tw-six-metrics/cross.json" \
             --limit "$LIMIT" \
             "${flags[@]}"
           code=$?

@@ -161,6 +161,11 @@ def _snap(close=100.0, **kw):
     s.setdefault('brk_boll', s['close'] > s['boll_up'])
     s.setdefault('brk_don',
                  s['donchian'] is not None and s['close'] > s['donchian'])
+    # 第五關的三格。預設 None／False ＝「對面今天沒有這一檔的資料」，而預設
+    # 門檻是 0，所以 `cross_passes` 一律放行——四部曲的測資因此完全不受影響。
+    s.setdefault('six', None)
+    s.setdefault('rr', None)
+    s.setdefault('rr_free', False)
     assert set(s) == set(SNAPSHOT_COLUMNS), '快照欄位和 SNAPSHOT_COLUMNS 對不上'
     return s
 

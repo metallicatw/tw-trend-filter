@@ -56,7 +56,8 @@ def _fake_snap(code='2330', name='台積電'):
     側欄那排卡片是前端從快照畫的，所以**沒有快照就沒有側欄**——這個 helper 存在
     是為了讓每一條報告測試都拿到一份完整的頁面，而不是一份沒有側欄的。
     """
-    from tw_trend_filter.pipeline import SNAPSHOT_COLUMNS, SNAPSHOT_DAYS
+    from tw_trend_filter.pipeline import (
+        SNAPSHOT_COLUMNS, SNAPSHOT_DAYS, reward_risk)
 
     snap = {
         'code': code, 'name': name, 'industry': '半導體業',
@@ -72,6 +73,12 @@ def _fake_snap(code='2330', name='台積電'):
     snap['trend_ok'] = snap['close'] > snap['ma60'] and snap['ma20'] > snap['ma60']
     snap['brk_boll'] = snap['close'] > snap['boll_up']
     snap['brk_don'] = snap['donchian'] is not None and snap['close'] > snap['donchian']
+    # 第五關的三格。六大與目標價／下檔價來自 tw-six-metrics，報酬風險比在這邊
+    # 用**同一個收盤價**算出來——所以這裡也從 `close` 推，不寫死一個數字。
+    snap['six'] = 3.5
+    rr, free = reward_risk(320.0, 150.0, snap['close'])
+    snap['rr'] = rr if rr is None else round(rr, 6)
+    snap['rr_free'] = free
     assert set(snap) == set(SNAPSHOT_COLUMNS), '快照欄位和 SNAPSHOT_COLUMNS 對不上'
     return snap
 

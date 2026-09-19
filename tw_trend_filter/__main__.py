@@ -60,6 +60,7 @@ def _run(args, rules):
         index_copy=args.index,
         data_dir=args.data_dir,
         data_base=args.data_base,
+        cross_url=args.cross_url,
         open_when_done=args.local,
         rules=rules,
     )
@@ -92,6 +93,14 @@ def main(argv: list[str] | None = None) -> int:
                     help='把每一檔的圖表資料寫到這個目錄（不給就不寫）')
     ap.add_argument('--data-base', default='',
                     help='網頁抓圖表資料的路徑或網址（例如 trend-d）')
+    # 六大財務指標評等與估值（目標價／下檔價），從 tw-six-metrics 的 Pages 抓。
+    # 報酬風險比的最後一步要今天的收盤，而那個數字這支程式手上就有——所以對面
+    # 發的是和股價無關的那兩個價位，這邊自己算。見 `pipeline.reward_risk`。
+    #
+    # 抓不到只是一行訊息：四部曲一個位元組都不需要它。
+    ap.add_argument('--cross-url', default='',
+                    help='六大評分與估值的來源（預設是 tw-six-metrics 的 '
+                         'cross.json；填 "-" 代表不抓）')
     ap.add_argument('--link-base', default='',
                     help='個股頁連結的前綴，例如 '
                          'https://metallicatw.github.io/tw-six-metrics/stock')

@@ -169,13 +169,73 @@ SNAPSHOT_DAYS = 20
 #: 有任何錯誤訊息。`test_快照的欄位順序是介面的一部分` 釘住它。
 SNAPSHOT_COLUMNS: tuple[str, ...] = (
     'code', 'name', 'industry',
-    'close', 'vol20', 'amt20',        # ① 流動性
-    'ma20', 'ma60',                   # ② 趨勢
+    'close', 'vol20', 'amt20',        # ① 流動性（和門檻比）
+    'ma20', 'ma60',                   # ② 只給畫面看，判定用 trend_ok
     'cross_ago', 'bw',                # ③ 發動：幾天前交叉、最近 N 天的頻寬
-    'boll_up', 'donchian', 'vol_ratio',   # ④ 突破＋爆量
+    'boll_up', 'donchian', 'vol_ratio',   # ④ 前兩個只給畫面看，判定用 brk_*
+    'trend_ok', 'brk_boll', 'brk_don',    # ②④ 的判定結果，見下面那段說明
     'atr14',                          # 停損
     'chg', 'chg_pct',                 # 側欄卡片上的漲跌（判定用不到）
 )
+
+#: 快照裡每一個數字存到小數第幾位。
+#:
+#: ## 為什麼要有這張表（而不是全部 round(x, 2)）
+#:
+#: 快照存的是**拿去和門檻比大小**的數字，所以存進去的精度就是判定的精度。
+#: 原本一律 round(…, 2)，於是桌機版和這裡會在邊界上給出不同的答案——實測：
+#:
+#:     量比原值 1.1951   桌機版 1.1951 < 1.2 → 淘汰
+#:                       這裡   round(…,2)=1.2 → 1.2 < 1.2 為假 → 通過
+#:
+#:     20日均量 1000.4   桌機版 1000.4 <= 1000 為假 → 通過
+#:                       這裡   round(…)=1000 → 1000 <= 1000 → 淘汰
+#:
+#: 兩個方向都會錯，所以不是「寬一點」或「嚴一點」，是**對不起來**。
+#:
+#: ## 為什麼不是「全部存全精度」就好
+#:
+#: 量過：1,900 檔全精度，gzip 之後這一份快照從 146 KB 變成 494 KB。那是使用者
+#: 手機上真的要下載的東西，而這一段的目的只是讓邊界判定正確，不是把 float64
+#: 的每一位都送到瀏覽器。
+#:
+#: 所以分兩種情形處理：
+#:
+#: * **和使用者設定的門檻比**（close/vol20/amt20/bw/vol_ratio）——門檻是從畫面
+#:   上的數字框來的，最細也只到小數第二位。存到第六位，要翻轉就得有人把門檻
+#:   打到小數第七位，那個輸入框打不出來。
+#: * **兩個算出來的數字互比**（close vs ma60、ma20 vs ma60、close vs 布林上軌
+#:   ／Donchian）——這種**沒有門檻可言**，兩邊可以任意接近，多存幾位都不保險。
+#:   這幾個判定沒有任何一個規則參數在調它們，所以直接在 Python 這邊用完整的
+#:   float64 算完，存成布林值（trend_ok / brk_boll / brk_don）。判定不再經過
+#:   四捨五入，而 ma20/ma60/boll_up/donchian 就退回純顯示用，兩位小數綽綽有餘。
+#:
+#: 結果是：判定和桌機版逐位相同，而快照只大了幾十 KB（三個布林值壓縮得很好）。
+SNAPSHOT_PRECISION: dict[str, int] = {
+    'close': 6,        # ① 和 min_price 比
+    'vol20': 2,        # ① 和 min_vol20 比（1000.4 那個例子）
+    'amt20': 0,        # ① 和 min_amount 比：門檻 5,000 萬，1 元是它的 2e-8
+    'ma20': 2,         # 只給畫面看
+    'ma60': 2,         # 只給畫面看
+    'boll_up': 2,      # 只給畫面看
+    'donchian': 2,     # 只給畫面看
+    'vol_ratio': 6,    # ④ 和 vol_ratio 比（1.1951 那個例子）
+    'atr14': 2,        # 只給畫面看（停損價另外算）
+}
+
+
+def _snap_round(key: str, value: float) -> float:
+    """照 `SNAPSHOT_PRECISION` 存一個數字。
+
+    寫成函式而不是在每一行寫 `round(x, 6)`，是因為「這一格存幾位」是一個要跟
+    門檻對齊的決定，不是隨手選的常數——寫在同一張表裡才看得出它和門檻的關係。
+    0 位就存整數，免得 JSON 裡多出一堆沒有意義的 `.0`。
+
+    `KeyError` 是故意不接的：新增一個快照欄位卻忘了決定它要存幾位，應該當場
+    壞掉，而不是安靜地沿用某個預設值。
+    """
+    digits = SNAPSHOT_PRECISION[key]
+    return round(value) if digits == 0 else round(value, digits)
 
 
 def snapshot_row(snap: dict) -> list:
@@ -200,7 +260,15 @@ def passes(snap: dict, rules: Rules) -> tuple[bool, list[str]]:
         return False, []
     if snap['vol20'] <= rules.min_vol20 or snap['amt20'] <= rules.min_amount:
         return False, []
-    if snap['close'] <= snap['ma60'] or snap['ma20'] <= snap['ma60']:
+    # ② 讀的是 `trend_ok`，不是自己拿 ma60 再比一次。
+    #
+    # 這一行以前是 `snap['close'] <= snap['ma60'] or snap['ma20'] <= snap['ma60']`，
+    # 而快照裡那三個數字是四捨五入過的——close 和 ma60 差在小數第三位的時候，
+    # 兩邊會被捨到同一個值，`<=` 於是成立，那一檔就被判成「沒站上季線」。
+    # 桌機版拿的是完整的 float64，所以同一檔在那邊是通過的。
+    #
+    # ② 沒有任何門檻可調，所以這個答案在算指標的當下就定了。見 SNAPSHOT_PRECISION。
+    if not snap['trend_ok']:
         return False, []
 
     # ③ 「過去 N 天內」——回看天數不能超過快照存了幾天。
@@ -216,9 +284,9 @@ def passes(snap: dict, rules: Rules) -> tuple[bool, list[str]]:
     if not (golden or squeeze):
         return False, []
 
-    up, don = snap['boll_up'], snap['donchian']
-    brk_boll = snap['close'] > up
-    brk_don = don is not None and snap['close'] > don
+    # ④ 的兩個突破同樣讀快照裡算好的布林值，理由和 ② 一樣：收盤價和布林上軌
+    # ／Donchian 上緣可以差在小數第十位，而它們也沒有門檻可調。
+    brk_boll, brk_don = snap['brk_boll'], snap['brk_don']
     if not (brk_boll or brk_don):
         return False, []
     if snap['vol_ratio'] < rules.vol_ratio:
@@ -967,21 +1035,42 @@ def run(
             prev = float(close.iloc[-2]) if len(close) > 1 else price
             chg = round(price - prev, 2)
             chg_pct = round(chg / prev * 100, 2) if prev else 0.0
+            # ②④ 的「兩個算出來的數字互比」在這裡就用完整的 float64 判掉。
+            #
+            # 這幾個判定沒有任何規則參數在調它們（`Rules` 裡沒有對應欄位），
+            # 所以答案今天算完就不會再變——而它們正是**多存幾位小數也不保險**
+            # 的那一種：close 和 ma60 可以差在小數第十位，四捨五入到哪一位都
+            # 可能把答案翻過來。存成布林值，判定就和桌機版逐位相同。
+            #
+            # ma20/ma60/boll_up/donchian 因此退回純顯示用（見 SNAPSHOT_PRECISION）。
+            ma20_last = float(ma20.iloc[-1])
+            ma60_last = float(ma60.iloc[-1])
+            boll_up_last = float(boll_up.iloc[-1])
+            don_raw = None if pd.isna(donchian.iloc[-1]) else float(donchian.iloc[-1])
+            trend_ok = price > ma60_last and ma20_last > ma60_last
+            brk_boll = price > boll_up_last
+            brk_don = don_raw is not None and price > don_raw
+
             snap = {
                 'code': code, 'name': NAME_MAP.get(code, code),
                 'industry': lookup_industry(code, ISIN_INDUSTRY),
-                'close': round(price, 2),
-                'vol20': round(vol20),
-                'amt20': round(amt20),
-                'ma20': round(float(ma20.iloc[-1]), 2),
-                'ma60': round(float(ma60.iloc[-1]), 2),
+                'close': _snap_round('close', price),
+                'vol20': _snap_round('vol20', vol20),
+                'amt20': _snap_round('amt20', amt20),
+                'ma20': _snap_round('ma20', ma20_last),
+                'ma60': _snap_round('ma60', ma60_last),
                 'cross_ago': cross_ago,
-                'bw': [round(float(v), 4) if not pd.isna(v) else 9.0
+                # bw 是拿去和 squeeze 門檻比的，而門檻來自畫面上的數字框
+                # （step 0.01）。存到小數第六位，要翻轉得有人打到第七位。
+                'bw': [round(float(v), 6) if not pd.isna(v) else 9.0
                        for v in bw.iloc[-SNAPSHOT_DAYS:]],
-                'boll_up': round(float(boll_up.iloc[-1]), 2),
+                'boll_up': _snap_round('boll_up', boll_up_last),
                 'donchian': don_last,
-                'vol_ratio': round(vol_ratio, 2),
-                'atr14': round(atr_val, 2),
+                'vol_ratio': _snap_round('vol_ratio', vol_ratio),
+                'trend_ok': trend_ok,
+                'brk_boll': brk_boll,
+                'brk_don': brk_don,
+                'atr14': _snap_round('atr14', atr_val),
                 'chg': chg,
                 'chg_pct': chg_pct,
             }
@@ -1882,20 +1971,22 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
       // 同一組比較符號——`<=` 和 `<` 在邊界上是不同的答案。
       function tfPass(row, r) {{
         const close = row[C.close], vol20 = row[C.vol20], amt20 = row[C.amt20];
-        const ma20 = row[C.ma20], ma60 = row[C.ma60];
         const crossAgo = row[C.cross_ago], bw = row[C.bw];
-        const up = row[C.boll_up], don = row[C.donchian], volRatio = row[C.vol_ratio];
+        const volRatio = row[C.vol_ratio];
         if (close <= r.min_price) return null;
         if (vol20 <= r.min_vol20 || amt20 <= r.min_amount) return null;
-        if (close <= ma60 || ma20 <= ma60) return null;
+        // ② 讀快照裡算好的布林值，不再自己拿 ma20/ma60 比一次——那兩個數字
+        // 是四捨五入過的，差在小數第三位的時候會被捨成同一個值。ma20/ma60
+        // 現在只給畫面看。（Python 那邊是 `if not snap['trend_ok']`。）
+        if (!row[C.trend_ok]) return null;
         // 夾住上下界、再取整——和 passes() 那一行的 min(max(int(…),0),DAYS) 同義。
         const look = Math.min(Math.max(Math.floor(r.lookback), 0), TF_DAYS);
         const golden = crossAgo > 0 && crossAgo <= look;
         let squeeze = false;
         for (const v of bw.slice(bw.length - look)) {{ if (v <= r.squeeze) {{ squeeze = true; break; }} }}
         if (!golden && !squeeze) return null;
-        const brkBoll = close > up;
-        const brkDon  = don !== null && close > don;
+        // ④ 的兩個突破同理，見上面那一段。
+        const brkBoll = row[C.brk_boll], brkDon = row[C.brk_don];
         if (!brkBoll && !brkDon) return null;
         if (volRatio < r.vol_ratio) return null;
         const t = [];

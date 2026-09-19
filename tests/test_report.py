@@ -67,6 +67,11 @@ def _fake_snap(code='2330', name='台積電'):
         'vol_ratio': 1.35, 'atr14': 4.2,
         'chg': 1.0, 'chg_pct': 0.5,
     }
+    # ②④ 的判定結果，和 `screen_stock` 一樣**從價格推出來**。
+    # 寫死 True 的話，改了上面那幾個價格卻忘了改這裡，快照就自相矛盾了。
+    snap['trend_ok'] = snap['close'] > snap['ma60'] and snap['ma20'] > snap['ma60']
+    snap['brk_boll'] = snap['close'] > snap['boll_up']
+    snap['brk_don'] = snap['donchian'] is not None and snap['close'] > snap['donchian']
     assert set(snap) == set(SNAPSHOT_COLUMNS), '快照欄位和 SNAPSHOT_COLUMNS 對不上'
     return snap
 

@@ -148,6 +148,19 @@ def _snap(close=100.0, **kw):
         'chg': 1.0, 'chg_pct': 1.0,
     }
     s.update(kw)
+    # ②④ 那三個布林值**從上面那幾個價格推出來**，和 `screen_stock` 裡那幾行
+    # 一模一樣。
+    #
+    # 不讓呼叫端自己填一個固定值，是為了讓既有的邊界測資繼續守住它原本守的
+    # 東西：「收盤對60MA」那一列設的是 `ma60=close`，它要驗的是那一關會不會
+    # 擋——要是 `trend_ok` 另外給一個固定的 True，那一列會通過，而測試照樣綠。
+    # 推導出來，設了 `ma60=close` 就自動得到 `trend_ok=False`。
+    #
+    # 真要單獨指定（例如驗「判定只看布林值、不看那幾個 float」）就用 kw 蓋掉。
+    s.setdefault('trend_ok', s['close'] > s['ma60'] and s['ma20'] > s['ma60'])
+    s.setdefault('brk_boll', s['close'] > s['boll_up'])
+    s.setdefault('brk_don',
+                 s['donchian'] is not None and s['close'] > s['donchian'])
     assert set(s) == set(SNAPSHOT_COLUMNS), '快照欄位和 SNAPSHOT_COLUMNS 對不上'
     return s
 
@@ -186,6 +199,20 @@ def _boundary_rows():
         # 兩個訊號同時觸發、兩個突破同時成立——訊號的**順序**也要一樣。
         _snap(cross_ago=2, bw=[0.05] * SNAPSHOT_DAYS,
               boll_up=98.0, donchian=98.5),
+        # ②④ 的判定讀的是布林值，**不是**旁邊那幾個 float。
+        #
+        # 這三列故意讓兩者互相矛盾：float 說「過」而布林說「沒過」。任何一邊
+        # （Python 或 JS）偷看 float 的話，兩邊就會對這三列給出不同的答案，
+        # 而 `test_同一份快照兩邊篩出同一份名單` 會紅。
+        #
+        # 矛盾是刻意造出來的，但它對應的是真實情況：快照裡的 ma60 只存到小數
+        # 第二位，而判定用的是完整的 float64——收盤 100.001、ma60 100.0004 的
+        # 那一檔，存進去會變成 100.0 對 100.0，float 看起來是「沒站上」，而
+        # 真正的答案是「站上了」。這裡把方向反過來寫，是因為反過來才驗得到
+        # 「有沒有真的讀布林值」（順著寫的話，讀錯也會得到同一個答案）。
+        _snap(trend_ok=False),                     # float 說過、布林說沒過
+        _snap(brk_boll=False, brk_don=False),      # 兩個突破都被布林值否掉
+        _snap(boll_up=101.0, donchian=101.0, brk_boll=True),  # float 說沒突破、布林說有
     ]
     for i, s in enumerate(rows):
         s['code'] = f'{1000 + i}'

@@ -270,7 +270,11 @@ process.stdout.write(JSON.stringify({
     assert narrow["y1"] == "" and narrow["y2"] == "", (
         f"手機版還留著縱軸標題：{narrow['y1']!r} / {narrow['y2']!r}"
     )
-    assert narrow["left"] == 34, f"拿掉標題之後左留白應該縮到 34，現在是 {narrow['left']}"
+    # 34 → 36：手機上縱軸改成固定五個刻度（見 tests/test_mobile_chart.py），
+    # 而「145.5」這種四位數的刻度在 34px 裡會被切掉最後一位。要的是「比桌機的
+    # 46 小」，不是那個數字本身。
+    assert narrow["left"] < 46, f"左留白沒有縮：{narrow['left']}"
+    assert narrow["left"] == 36, f"左留白是 {narrow['left']}"
     # 桌機不受影響——那一格有四百多像素高，標題該留著。
     assert wide["y1"] and wide["y2"], (
         f"桌機版的縱軸標題被一起拿掉了：{wide['y1']!r} / {wide['y2']!r}"

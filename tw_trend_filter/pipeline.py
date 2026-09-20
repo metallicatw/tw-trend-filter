@@ -2600,8 +2600,10 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
     cols = json.dumps({k: i for i, k in enumerate(SNAPSHOT_COLUMNS)})
     return f"""
       <div id="live">
-        <div class="live-fields">{fields}</div>
+        <div class="live-fields" id="tf-fields">{fields}</div>
         <div class="live-bar">
+          <button type="button" class="tf-fold" id="tf-fold" aria-expanded="true"
+                  aria-controls="tf-fields" onclick="tfFoldToggle()">調整門檻</button>
           <button type="button" class="go" onclick="tfApply()">篩選</button>
           <button type="button" onclick="tfReset()">回到預設</button>
           <span id="live-count"></span>
@@ -3024,6 +3026,28 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
         tfApply();
       }}
 
+      // 〔調整門檻〕的開關。手機上預設收起來（見 CSS 的 .tf-fold）。
+      //
+      // 收合本身是 CSS 的事（`#live.folded .live-fields{{display:none}}`），這裡
+      // 只負責那個 class、無障礙屬性、按鈕上的字，以及**收合之後重新量一次圖**
+      // ——頁首高度變了，`--hd-h` 和 plotly 的畫布都要跟著改，否則圖會停在
+      // 它上一次被量到的尺寸。
+      function tfFoldToggle() {{
+        const box = document.getElementById('live');
+        const btn = document.getElementById('tf-fold');
+        if (!box) return;
+        const folded = box.classList.toggle('folded');
+        if (btn) {{
+          btn.setAttribute('aria-expanded', folded ? 'false' : 'true');
+          btn.textContent = folded ? '調整門檻' : '收起門檻';
+        }}
+        if (typeof syncHdHeight === 'function') syncHdHeight();
+        const a = document.getElementById('tf-plot');
+        if (a && typeof fitPlotSize === 'function') {{
+          requestAnimationFrame(function () {{ fitPlotSize(a); }});
+        }}
+      }}
+
       document.addEventListener('DOMContentLoaded', function () {{
         try {{ TF_ROWS = JSON.parse(document.getElementById('tf-snap').textContent); }}
         catch (e) {{ TF_ROWS = []; }}
@@ -3040,6 +3064,17 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
             if (el) el.value = TF_CROSS_DEFAULT[k];
           }}
           document.body.classList.add('crossmode');
+        }}
+        // 手機上輸入框預設收起來。收起來的是輸入框，不是功能——〔篩選〕、
+        // 〔回到預設〕、〔幾檔符合〕和那顆燈泡都留在同一列上。
+        //
+        // 門檻本身照樣生效：收合只是 `display:none`，`f_*` 那些 input 還在
+        // DOM 裡，`tfApply()` 讀得到它們的值（包括 #cross 預先填進去的那組）。
+        if (window.matchMedia('(max-width:760px)').matches) {{
+          const box = document.getElementById('live');
+          const btn = document.getElementById('tf-fold');
+          if (box) box.classList.add('folded');
+          if (btn) btn.setAttribute('aria-expanded', 'false');
         }}
         // 改門檻**不會**馬上重篩——要按〔篩選〕（或在任何一格按 Enter）。
         //
@@ -3732,6 +3767,15 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
             'border:1px solid #30363d;border-radius:5px;padding:3px 10px;'
             'font-family:inherit;font-size:11.5px;cursor:pointer}'
         '#live .live-bar button:hover{background:#30363d;border-color:#8b949e}'
+        # 〔調整門檻〕：**只在手機上出現**的收合鈕。
+        #
+        # 桌機上那排輸入框是這一頁的控制器，攤開來一直看得到是對的。手機上
+        # 同一排輸入框折成五、六列，量出來 195px 高——佔掉 iframe 內 658px
+        # 的三成，而使用者一進來要看的是圖，不是輸入框。
+        #
+        # 收起來的是**輸入框**，不是功能：〔篩選〕〔回到預設〕〔幾檔符合〕和
+        # 那顆燈泡全部留在同一列上，要調門檻按一下就開。
+        '.tf-fold{display:none}'
         '#live #live-count{font-size:11.5px;font-weight:600}'
         '#live #live-count.hit{color:#7ee787}'
         '#live #live-count.miss{color:#8b949e}'
@@ -3855,11 +3899,31 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         #   * 頁首留著但壓扁。它上面有篩選日期和 Excel 的連結，第一版整個
         #     `display:none` 等於手機上永遠拿不到那兩個東西。
         '@media(max-width:760px){'
-            'html,body{overflow:hidden}'
+            # ⚠️ **手機上不要再拿「視窗高度減頁首」去算圖的高度。**
+            #
+            # 那個算法在桌機上對（頁首 122px、視窗 702px，圖拿到 431px），在
+            # 手機上是把圖當成剩菜。實測嵌在〔六大〕網站的 iframe 裡
+            # （iframe 高 78vh）：
+            #
+            #     390x844  iframe 內 366x658  頁首 195  →  圖 334x213
+            #     360x640  iframe 內 336x499  頁首 219  →  圖 336x  0
+            #
+            # 213px 的圖扣掉 68px 上留白、再讓成交量那一格分掉三成，價格那一格
+            # 只剩六十幾像素——五條線疊在一起、縱軸刻度互相壓字。使用者說的
+            # 「手機上的趨勢圖完全不行」就是這個數字。360 那一台更直接：0。
+            #
+            # 改成**圖先拿到它該有的高度，頁面再去捲**。圖高由寬度決定
+            # （118vw，約 4:5 的直式比例），上下夾在 320~520 之間：每一台手機
+            # 上都是同一個形狀，而不是「看頁首今天多長」。
+            'html,body{overflow:visible;height:auto}'
             ':root{--hd-h:auto}'
             '#hd{flex-wrap:wrap;gap:6px;padding:8px 10px}'
             '#hd .meta{font-size:11px}'
-            '#main{flex-direction:column;height:calc(100vh - var(--hd-h,86px))}'
+            # 頁首不再 sticky：它在手機上有兩百多像素高，釘住等於永遠遮掉
+            # 三分之一個螢幕。max-height 那條保險絲也不需要了——沒有人再拿
+            # 頁首的高度去減。
+            '#topbar{position:static;max-height:none;overflow:visible}'
+            '#main{flex-direction:column;height:auto}'
             # 側欄變成一條橫向滑動的籌碼列。
             '#sidebar{width:100%;flex:0 0 auto;height:auto;max-height:none;'
                 'border-right:none;border-bottom:1px solid #30363d;'
@@ -3873,7 +3937,12 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
             # 上方仍然看得到。產業留著，那是一行字。
             '.nb-tagrow{display:none}'
             '.nb-ind{font-size:10px;margin-top:2px}'
-            '.nb-cross{font-size:10px;margin-top:2px}'
+            # 132px 寬的卡片上，「六大 0.83」和「報酬/風險 —」並排放不下，
+            # 於是「報酬/風險」被折成「報酬/風」＋「險」——一個被切斷的欄位名
+            # 比沒有那個欄位更糟。改成上下兩行，每一行自己不折。
+            '.nb-cross{font-size:10px;margin-top:2px;flex-direction:column;gap:0;'
+                'justify-content:flex-start}'
+            '.nb-cross>span{white-space:nowrap}'
             '.nb-why{font-size:9.5px}'
             # 手機上側欄是一條**橫向**滑動的列，所以那條分隔不能是一條橫線
             # ——橫線在橫向的列裡等於把兩區疊在一起。改成一塊窄的直立分隔，
@@ -3881,8 +3950,16 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
             '.sb-sep{flex:0 0 auto;min-width:92px;max-width:92px;margin:0 2px;'
                 'padding:6px 8px 6px 10px;border-top:none;border-left:1px solid #30363d;'
                 'white-space:normal;line-height:1.4;display:flex;align-items:center}'
-            '#chartcol{flex:1 1 auto;height:auto;min-height:0;overflow-y:auto}'
-            '.plot{flex:1 1 auto;min-height:260px}'
+            '#chartcol{flex:1 1 auto;height:auto;min-height:0;overflow:visible}'
+            # 高度由**寬度**決定，不是由剩下多少決定。實測 366px 寬 → 432px 高。
+            '.plot{flex:0 0 auto;height:clamp(320px,118vw,520px)}'
+            '.tf-fold{display:inline-flex;align-items:center}'
+            # 用 class 開關，不是 `hidden`。`[hidden]{display:none}` 是 (0,1,0)，
+            # 上面 `#live .live-fields{display:flex}` 是 (1,1,0)——`hidden` 會輸，
+            # 輸入框照樣攤在那裡。這個坑這個專案踩過兩次。
+            '#live.folded .live-fields{display:none}'
+            '#live .live-bar{flex-wrap:wrap;gap:8px;margin-top:0}'
+            '#live .live-bar button{min-height:34px;padding:6px 14px}'
             '.badge{font-size:11.5px;padding:4px 10px}'
             '.trig-line{font-size:12px;margin:2px 0 6px}'
             '.rbtn{padding:6px 14px;font-size:12px}'   # 手指按得到
@@ -3945,16 +4022,26 @@ function tuneForNarrow(fig) {
   });
   fig.layout.legend = Object.assign({}, fig.layout.legend, {font: {size: 10}});
   fig.layout.margin = Object.assign({}, fig.layout.margin,
-                                    {t: 68, l: 34, r: 10, b: 20});
+                                    {t: 62, l: 36, r: 8, b: 22});
   fig.layout.font = Object.assign({}, fig.layout.font, {size: 10});
+  /* 刻度數。
+     plotly 是按**像素**決定要標幾個刻度的，而它算的是「桌機上這麼寬要標幾個」。
+     手機上同一條軸只有三百出頭的寬度、價格那一格只有兩百多的高度，於是它標出
+     來的刻度會互相壓字——實測縱軸的「20」和「50」直接疊成一團（使用者那張截圖
+     上就是這個）。
+     四個日期、五個價位、三個量的刻度，是在 366px 寬上量出來不重疊的組合。 */
+  fig.layout.xaxis = Object.assign({}, fig.layout.xaxis, {nticks: 4});
+  fig.layout.xaxis2 = Object.assign({}, fig.layout.xaxis2, {nticks: 4});
+  fig.layout.yaxis = Object.assign({}, fig.layout.yaxis,
+                                   {title: {text: ''}, nticks: 5});
+  fig.layout.yaxis2 = Object.assign({}, fig.layout.yaxis2,
+                                    {title: {text: ''}, nticks: 3});
   /* 兩個縱軸標題拿掉。
      它們是**直排**的，各佔 43px 與 51px 的高度，而手機上兩個子圖加起來只有
      一百多像素——於是「價格 (元)」的下緣和「成交量(張)」的上緣疊在一起
      （實測 464–507 對 506–557，真的重疊）。
-     拿掉之後左留白從 46 縮到 34，繪圖區橫向多出 12px。
+     拿掉之後左留白從 46 縮到 36，繪圖區橫向多出 10px。
      單位沒有消失：刻度是 55/50/45 和 4000/2000，而圖例上就寫著 20MA、60MA。 */
-  fig.layout.yaxis = Object.assign({}, fig.layout.yaxis, {title: {text: ''}});
-  fig.layout.yaxis2 = Object.assign({}, fig.layout.yaxis2, {title: {text: ''}});
   return fig;
 }
 

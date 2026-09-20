@@ -16,8 +16,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+from dataclasses import replace
+
 import numpy as np
 import pandas as pd
+import pytest
+from test_snapshot import PRELUDE
 
 from tw_trend_filter.pipeline import build_interactive_html, compute_bollinger
 
@@ -56,8 +60,7 @@ def _fake_snap(code='2330', name='台積電'):
     側欄那排卡片是前端從快照畫的，所以**沒有快照就沒有側欄**——這個 helper 存在
     是為了讓每一條報告測試都拿到一份完整的頁面，而不是一份沒有側欄的。
     """
-    from tw_trend_filter.pipeline import (
-        SNAPSHOT_COLUMNS, SNAPSHOT_DAYS, reward_risk)
+    from tw_trend_filter.pipeline import SNAPSHOT_COLUMNS, SNAPSHOT_DAYS, reward_risk
 
     snap = {
         'code': code, 'name': name, 'industry': '半導體業',
@@ -83,16 +86,26 @@ def _fake_snap(code='2330', name='台積電'):
     return snap
 
 
-def _build(tmp_path, **kw):
+#: 報告上印的那個時間。固定一個值，產出才可重現。
+_WHEN = datetime.datetime(2026, 9, 4, 15, 30)  # noqa: DTZ001（沒有時區的測試固定值）
+
+
+def _page_path(tmp_path, results=None, **kw):
+    """產一份報告，回傳**檔案路徑**。"""
     from tw_trend_filter.pipeline import DEFAULT_RULES
 
     kw.setdefault('rules', DEFAULT_RULES)
     kw.setdefault('snapshots', [_fake_snap()])
     path = build_interactive_html(
-        [_fake_result()], '2026-09-04', str(tmp_path),
-        datetime.datetime(2026, 9, 4, 15, 30), **kw)
+        [_fake_result()] if results is None else results,
+        '2026-09-04', str(tmp_path), _WHEN, **kw)
+    return path
+
+
+def _build(tmp_path, **kw):
+    path = _page_path(tmp_path, **kw)
     assert path, 'build_interactive_html 回傳 None'
-    return open(path, encoding='utf-8').read()
+    return Path(path).read_text(encoding='utf-8')
 
 
 #: 圖表區那顆是前端畫的，所以 JS 樣板一定在 HTML 裡；真正決定畫不畫的是
@@ -162,7 +175,7 @@ def test_裁切之後_60ma_仍然是完整的一條線(tmp_path):
     # 要守的事情一個字都沒變——指標仍然是在**完整**歷史上算完才裁。
     html = _build(tmp_path, chart_years=1)
     ser = re.search(r'<script type="application/json" id="tf-series">(.*?)</script>',
-                    html, re.S)
+                    html, re.DOTALL)
     assert ser, '找不到數列'
     assert 'null' not in ser.group(1), '裁切後出現 null，指標是在裁切之後才算的'
 
@@ -198,7 +211,6 @@ def test_連結指的是_releases_列表頁(monkeypatch=None):
     也不能用 `/releases/latest`：一個 release 都還沒有的時候它會 404，而那正是
     第一次跑的時候。
     """
-    import os
 
     from tw_trend_filter.__main__ import _env_excel_url
 
@@ -247,8 +259,97 @@ def test_走過的死路要寫在原始碼裡():
     assert 'artifact' in doc
 
 
-def test_沒有任何標的時不產生檔案(tmp_path):
-    assert build_interactive_html([], '2026-09-04', str(tmp_path)) is None
+def test_零檔過篩照樣要產出報告(tmp_path):
+    """「今天沒有標的」是一個**正常的交易日**，不是一個錯誤。
+
+    ## 這一條為什麼從「不產生檔案」翻過來
+
+    以前這裡斷言的是 `build_interactive_html([], …) is None`，理由是「沒有標的
+    就沒有線圖可看」。那句話在側欄還是 Python 畫的時候是對的。
+
+    現在側欄是**前端從快照畫的**（今天沒過篩的每一檔也在裡面），而這一頁最重要
+    的功能就是當場調門檻重篩。零檔過篩的日子，正是最需要打開它、把門檻放寬、
+    看看大家卡在哪一關的那一天——舊的那一行剛好讓那一天連頁面都沒有。
+
+    而且它會讓整條排程紅掉：0 檔 → 不產 index.html → 發布那一步的
+    `test -s index.html` 失敗 → 網站當天整個不更新。實際發生過一次（0 檔通過、
+    1,969/1,988 檔掃到，資料完全健康，只是今天沒有人過關）。
+    """
+    from tw_trend_filter.pipeline import DEFAULT_RULES
+
+    path = _page_path(tmp_path, results=[], rules=DEFAULT_RULES)
+    assert path, '零檔過篩就不產報告了——那一天網站會整個不更新'
+    html = Path(path).read_text(encoding='utf-8')
+    # 頁面要**還能用**：快照、門檻輸入框、重篩的那段 JS 都得在。
+    # 只確認「檔案有產出來」是不夠的——一份打得開但什麼都調不了的頁面，
+    # 在零檔的那一天等於沒有。
+    assert 'id="tf-snap"' in html, '沒有快照，側欄畫不出任何東西'
+    assert 'id="live"' in html and 'function tfPass' in html, '調門檻那一整塊不見了'
+    assert '0' in html.split('預設門檻共')[1][:40]
+
+
+def _live_js(html):
+    """把報告頁上判定那一段 `<script>` 挖出來。
+
+    要的是**這一份頁面**裡的那一段，不是另外組一份——這條測試要證明的正是
+    「零檔的那一天產出來的這一頁還能用」。
+    """
+    # 頁面上有好幾個 `<script>`：plotly 的 CDN 標籤、判定那一段、以及最後的
+    # 主程式。要的是**判定**那一段，所以照內容挑，不是照位置挑——拿最後一個
+    # 會拿到主程式（裡面沒有 tfPass），而那個錯誤訊息看起來像「頁面壞了」。
+    # `<script>` 帶屬性的（application/json）不會被這個樣式配到。
+    for body in re.findall(r'<script>(.*?)</script>', html, re.DOTALL):
+        if 'function tfPass' in body:
+            return body
+    raise AssertionError('報告裡找不到含 tfPass 的那一段 <script>')
+
+
+def test_零檔的那一天_調鬆門檻還是找得到股票(tmp_path):
+    """這就是上面那一條的理由：頁面在零檔的日子仍然是**有用**的。
+
+    快照裡有今天掃到的每一檔，所以把門檻放寬就會有東西出現。用 node 跑真正
+    送到瀏覽器的 `tfPass()`，而不是 Python 那一份——要證明的是**那一頁**能用。
+    """
+    import json as _json
+    import os as _os
+    import shutil as _shutil
+    import subprocess as _subprocess
+    import tempfile as _tempfile
+
+    from tw_trend_filter.pipeline import DEFAULT_RULES, LIVE_FIELDS, snapshot_row
+
+    node = _shutil.which('node')
+    if node is None:
+        pytest.skip('本機沒有 node；CI 的 ubuntu runner 有')
+
+    # 一檔會過四關的股票，但今天的門檻把股價下限拉到 99999——所以預設 0 檔。
+    snaps = [_fake_snap(code='2330')]
+    path = _page_path(tmp_path, results=[], snapshots=snaps,
+                      rules=replace(DEFAULT_RULES, min_price=99999))
+    html = Path(path).read_text(encoding='utf-8')
+
+    driver = (
+        "const rows = " + _json.dumps([snapshot_row(s) for s in snaps]) + ";\n"
+        "const strict = " + _json.dumps(
+            {k: (99999 if k == 'min_price' else getattr(DEFAULT_RULES, k))
+             for k, *_ in LIVE_FIELDS}) + ";\n"
+        "const loose = Object.assign({}, strict, {min_price: 1});\n"
+        "process.stdout.write(JSON.stringify({\n"
+        "  strict: rows.filter(function (r) { return tfPass(r, strict); }).length,\n"
+        "  loose:  rows.filter(function (r) { return tfPass(r, loose); }).length}));\n"
+    )
+    with _tempfile.TemporaryDirectory() as d:
+        src = _os.path.join(d, 'z.js')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write(PRELUDE + '\n' + _live_js(html) + '\n' + driver)
+        r = _subprocess.run([node, src], capture_output=True, text=True, check=False)
+    assert r.returncode == 0, r.stderr[-2000:]
+    got = _json.loads(r.stdout)
+    assert got['strict'] == 0, '這個 fixture 在預設門檻下應該一檔都不過'
+    assert got['loose'] >= 1, (
+        '調鬆門檻之後還是零檔——那這一頁在零檔的日子確實沒有用，'
+        '上面那條測試的理由就不成立了'
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -279,7 +380,7 @@ def test_預設視窗和它的_y_軸範圍一開始就是對的(tmp_path):
 
     html = _build(tmp_path)
     ser = json.loads(
-        re.search(r'id="tf-series">(.*?)</script>', html, re.S)
+        re.search(r'id="tf-series">(.*?)</script>', html, re.DOTALL)
         .group(1).replace(r"<\/", "</")
     )
     (s,) = ser.values()
@@ -467,7 +568,7 @@ def test_missing_bars_become_null_not_zero():
     src = (Path(__file__).resolve().parents[1]
            / "tw_trend_filter" / "pipeline.py").read_text(encoding="utf-8")
     body = re.search(r"    def sf\(v, d=2\):.*?\n        return round\(f, d\)",
-                     src, re.S)
+                     src, re.DOTALL)
     assert body, "找不到 sf()，它被改名或改寫了"
     ns = {"_math": _math}
     exec("def _w():\n" + body.group(0) + "\n    return sf\nsf = _w()", ns)  # noqa: S102

@@ -3110,7 +3110,18 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         import json as _json, math as _math
     except ImportError:
         print('plotly 未安裝，跳過互動線圖'); return None
-    if not results: return None
+    # 這裡以前是 `if not results: return None`——「沒有標的就沒有線圖可看」。
+    #
+    # 那句話在側欄還是 Python 畫的時候是對的。現在不是了：側欄是**前端從快照
+    # 畫的**（今天沒過篩的每一檔也在裡面），而這一頁最重要的功能就是當場調門檻
+    # 重篩。零檔過篩的日子，正是最需要打開它、把門檻放寬、看看大家卡在哪一關
+    # 的那一天——而舊的那一行剛好讓那一天連頁面都沒有。
+    #
+    # 它還會讓整條排程紅掉：0 檔 → 不產 index.html → 發布那一步的
+    # `test -s index.html` 失敗 → 網站當天整個不更新。實際發生過一次
+    # （0 檔通過、1,969/1,988 檔掃到，資料完全健康，只是今天沒有人過關）。
+    #
+    # 「今天沒有標的」是一個**正常的交易日**，不是一個錯誤。
     # `rules` 與 `snapshots` 現在是**必要的**，而不是「沒有就不畫那一塊」。
     #
     # 側欄那排卡片改由前端從快照畫（見 `_live_block`），所以少了任何一個，產出

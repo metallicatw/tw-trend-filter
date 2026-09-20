@@ -468,8 +468,10 @@ def test_停損倍數也真的寫進_Excel_的進出場策略(tmp_path):
 def _report_html(rules, tmp_path):
     """跑一趟真的（合成資料、一檔通過、不產 Excel），回傳報告網頁的內容。
 
-    不直接叫 `build_interactive_html([], ...)`：沒有任何一檔通過的時候它根本不產
-    檔案（回 None），那是設計好的行為——沒有標的就沒有線圖可看。
+    不直接叫 `build_interactive_html([], ...)`：這一條要看的是**報告上印出來的
+    門檻**，而那幾行是從 `rules` 算出來的，所以得走一趟真的 `run()` 才會帶上
+    今天這一組。（零檔過篩現在照樣會產出報告，見
+    tests/test_report.py::test_零檔過篩照樣要產出報告。）
     """
     import tw_trend_filter.pipeline as pl
 

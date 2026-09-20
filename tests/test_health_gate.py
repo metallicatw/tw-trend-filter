@@ -27,6 +27,9 @@
 `return None` 而忘了記帳，這一條會先紅。
 """
 
+import json
+import os
+
 import pandas as pd
 
 import tw_trend_filter.pipeline as pl
@@ -369,6 +372,71 @@ def test_煙霧測試的小母體不受底線影響(tmp_path, monkeypatch):
         return short.copy() if str(ticker).startswith('99') else full.copy()
 
     assert _main_with(tmp_path, universe, mixed, monkeypatch) == 0
+
+
+# ── 零檔過篩的那一天 ───────────────────────────────────────────────────
+
+def test_零檔過篩照樣要寫出_index_html(tmp_path):
+    """排程發布那一步就是 `test -s index.html`——沒有這個檔案，整條紅掉。
+
+    這一條守的是那一整串的最後一環：資料抓得好好的（全部掃到、沒有失敗），
+    只是今天沒有任何一檔同時過四關——那是一個**正常的交易日**，網站不該因此
+    停止更新一天。
+
+    實際發生過一次：0 檔通過、1,969/1,988 檔掃到，而發布那一步紅在
+    「沒有產生 index.html」。
+    """
+    def fine(*a, **k):
+        return _good_frame(days=150)      # 一條直線，過不了「突破」那一關
+
+    out = tmp_path / "site"
+    out.mkdir(parents=True, exist_ok=True)
+    orig_cwd = os.getcwd()
+    orig_universe, orig_download = pl.load_tw_stock_universe, pl.yf.download
+    try:
+        os.chdir(out)
+        pl.load_tw_stock_universe = lambda *a, **k: (
+            [f'{c}.TW' for c in ('1101', '1102', '1103')],
+            {f'{c}.TW': f'測試{c}' for c in ('1101', '1102', '1103')},
+            {c: '測試業' for c in ('1101', '1102', '1103')},
+        )
+        pl.yf.download = fine
+        res = pl.run(str(out), make_excel=False, workers=2, retry_rounds=(),
+                     open_when_done=False, plotly_cdn=False,
+                     index_copy='index.html')
+    finally:
+        pl.load_tw_stock_universe, pl.yf.download = orig_universe, orig_download
+        os.chdir(orig_cwd)
+
+    assert len(res['results']) == 0, '這個 fixture 應該一檔都不過'
+    idx = out / 'index.html'
+    assert idx.exists() and idx.stat().st_size > 0, (
+        '零檔過篩就沒有 index.html——排程發布那一步會紅，網站當天不更新'
+    )
+    # 產出來還不夠，還要**能用**。零檔那一天頁面的全部價值就在「當場調門檻
+    # 重篩」，而那件事吃的是快照——快照是空的話，這一頁打得開、什麼都調不出來，
+    # 而那和沒有這一頁的差別，只有排程那一步看得出來。
+    html = idx.read_text(encoding='utf-8')
+    snap = html.split('id="tf-snap">')[1].split('</script>')[0]
+    assert len(json.loads(snap)) == 3, (
+        f'零檔的那一天快照裡只有 {len(json.loads(snap))} 檔——'
+        '側欄畫不出東西，調門檻也篩不出東西'
+    )
+
+
+def test_零檔過篩不等於不健康(tmp_path, monkeypatch):
+    """全部掃到、零檔通過 → 結束碼 0。
+
+    「今天沒有標的」和「今天沒抓到資料」是兩件完全不同的事，而健康門檻只該
+    管後者。把前者也算成失敗的話，空頭走勢裡連著幾天都會是紅的，而紅到後來
+    就沒有人看那個燈號了。
+    """
+    def fine(*a, **k):
+        return _good_frame(days=150)
+
+    code = _main_with(tmp_path, ['1101', '1102', '1103'], fine, monkeypatch)
+    assert code == 0, f'零檔過篩被當成失敗了（結束碼 {code}）'
+
 
 
 # ---------------------------------------------------------------------------

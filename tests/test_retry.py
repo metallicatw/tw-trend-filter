@@ -102,11 +102,15 @@ def _frame(days=150):
     )
 
 
-def _run(tmp_path, monkeypatch, download, codes, retry_rounds=((0, 2),)):
+def _run(tmp_path, monkeypatch, download, codes, retry_rounds=((0, 2),),
+         breaker=None):
     """跑一趟 `pipeline.run`，下載行為由呼叫端決定。
 
     `retry_rounds` 預設等 0 秒——等待本身不是這裡要測的（那是 `_time.sleep`
     的事），要測的是「有沒有真的再問一次、問到了算不算數」。
+
+    `breaker` 預設換成一個**不會真的睡**的：煞車有自己一整組測試（見下面
+    「連續被限流就整批停一下」那一節），這裡不該為了它等一分鐘。
     """
     monkeypatch.setattr(pl, "load_tw_stock_universe", lambda *a, **k: (
         [f"{c}.TW" for c in codes],
@@ -116,6 +120,7 @@ def _run(tmp_path, monkeypatch, download, codes, retry_rounds=((0, 2),)):
     monkeypatch.setattr(pl.yf, "download", download)
     return pl.run(str(tmp_path), make_excel=False, workers=2,
                   retry_rounds=retry_rounds,
+                  breaker=breaker or pl.RateLimitBreaker(sleep=lambda s: None),
                   open_when_done=False, plotly_cdn=False)
 
 
@@ -349,3 +354,207 @@ def test_命令列關得掉(tmp_path, monkeypatch):
         assert seen.get("retry_rounds") == want, (
             f"{argv or '預設'} 應該是 {want}，實際傳進去的是 {seen.get('retry_rounds')!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 連續被限流就整批停一下
+#
+# ## 使用者看到的症狀
+#
+#     真的掃到 1676 / 1984 檔（84%）
+#     沒掃成   308 檔，全部是 YFRateLimitError('Too Many Requests')
+#
+# 而那 308 檔不是散在母體各處，是**全部擠在清單的尾巴**：
+# 8941 / 8942 / 9949 / 9950 / 9951 / 9960 / 9962 `.TWO`。
+#
+# 這個形狀說明限流不只按時間窗，還帶著一個**累計的額度**：前面一千六百多個
+# 請求把額度用完，從某一檔開始，後面每一檔都是同一句拒絕。原本的程式對此
+# 的反應是繼續送——308 個註定被拒絕的請求一個不漏地送完。
+#
+# 後果不是隨機的：清單是排序的，所以被餓死的永遠是同一批高號碼的上櫃股票。
+
+
+class _Clock:
+    """假時鐘：睡多久，時間就往前多久。
+
+    真的 `sleep` 沒辦法測「停了多久」而不真的等那麼久，而這裡要測的是
+    **算出來的秒數**，不是作業系統的排程。
+    """
+
+    def __init__(self):
+        self.t = 0.0
+        self.slept = []
+
+    def now(self):
+        return self.t
+
+    def sleep(self, s):
+        self.slept.append(s)
+        self.t += s
+
+
+def _breaker(**kw):
+    c = _Clock()
+    b = pl.RateLimitBreaker(sleep=c.sleep, clock=c.now, **kw)
+    return b, c
+
+
+def test_連續被限流才踩煞車():
+    """差一檔都不踩。
+
+    煞車要擋的是「額度用完了還繼續硬打」，不是「剛好有一檔被擋」——後者
+    每天都有，為它停一分鐘就是每天平白多一分鐘。
+    """
+    b, c = _breaker(streak=5, cooldown=60)
+    for _ in range(4):
+        b.note_failure(RATE_LIMIT)
+    assert b.trips == 0, "才 4 檔就踩了煞車"
+    assert b.wait_if_cooling() == 0
+    b.note_failure(RATE_LIMIT)
+    assert b.trips == 1, "連續 5 檔被限流卻沒有踩煞車"
+    assert b.wait_if_cooling() == 60
+    assert c.slept == [60]
+
+
+def test_中間問到一檔就重新數():
+    """成功 ＝ 額度回來了。沒有理由再慢下來。"""
+    b, _ = _breaker(streak=3)
+    b.note_failure(RATE_LIMIT)
+    b.note_failure(RATE_LIMIT)
+    b.note_ok()
+    b.note_failure(RATE_LIMIT)
+    b.note_failure(RATE_LIMIT)
+    assert b.trips == 0, "成功之後沒有重新數，兩段不連續的失敗被接在一起"
+
+
+def test_別種失敗既不算也不清空():
+    """連線被中斷、查無此股——這些和額度無關。
+
+    不算數是因為停下來不會讓它們變好；**也不清空**是因為失敗名單裡夾雜
+    幾檔別種錯誤，就能把煞車永遠擋在門檻前一步。
+    """
+    b, _ = _breaker(streak=3)
+    b.note_failure(RATE_LIMIT)
+    b.note_failure(pl.NO_DATA)
+    b.note_failure("ConnectionError: Connection reset by peer")
+    assert b.trips == 0
+    b.note_failure(RATE_LIMIT)
+    b.note_failure(RATE_LIMIT)
+    assert b.trips == 1, "夾在中間的別種錯誤把連續計數清掉了"
+
+
+def test_停的是整批不是每一條連線各停一次():
+    """記的是「停到什麼時候」，不是「要睡多久」。
+
+    這兩種寫法在單執行緒下一模一樣，在八條連線下差八倍——而八倍的暫停
+    會讓整趟篩選跑不完，跑不完和被擋掉一樣是沒有報告。
+    """
+    b, c = _breaker(streak=1, cooldown=60)
+    b.note_failure(RATE_LIMIT)
+    # 有一條連線手上那個請求還沒回來，20 秒之後才走到這裡。它要補的是**剩下
+    # 的 40 秒**——記成「要睡 60 秒」的話，它會從 20 秒的地方再睡滿一輪。
+    c.t += 20
+    assert b.wait_if_cooling() == 40, "記的是「要睡多久」，不是「停到什麼時候」"
+    waits = [b.wait_if_cooling() for _ in range(8)]
+    assert waits == [0] * 8, f"後面八條連線又各停了一次：{waits}"
+    assert c.slept == [40]
+
+
+def test_連踩連停會加倍_但有上限():
+    """停完還是連續被限流，代表窗比猜的長。
+
+    上限是因為排程有時間：等到整趟跑不完，和被擋掉是同一個結果。
+    """
+    b, c = _breaker(streak=1, cooldown=60, max_cooldown=240)
+    waited = []
+    for _ in range(5):
+        b.note_failure(RATE_LIMIT)
+        waited.append(b.wait_if_cooling())
+    assert waited == [60, 120, 240, 240, 240], waited
+
+
+def test_停完之後問到了就從頭算起():
+    b, _ = _breaker(streak=1, cooldown=60, max_cooldown=240)
+    b.note_failure(RATE_LIMIT)
+    assert b.wait_if_cooling() == 60
+    b.note_ok()
+    b.note_failure(RATE_LIMIT)
+    assert b.wait_if_cooling() == 60, "額度回來過了，下一次卻還是用加倍後的秒數"
+
+
+def test_順利的時候一秒都不停():
+    """成本是零。沒有連續限流就不會有任何一次等待。"""
+    b, c = _breaker(streak=5)
+    for _ in range(100):
+        b.note_ok()
+        assert b.wait_if_cooling() == 0
+    assert c.slept == []
+    assert b.trips == 0
+
+
+# ---------------------------------------------------------------------------
+# 接到 run() 上
+
+
+def test_尾巴被限流的時候真的會踩煞車(tmp_path, monkeypatch):
+    """這一條是 2026-09-20 那一趟的形狀：前面順利，後面整段被限流。"""
+    def tail_limited(ticker, *a, **k):
+        if MANY.index(ticker.split(".")[0]) >= 100:
+            raise RuntimeError("Too Many Requests. Rate limited. Try after a while.")
+        return _frame()
+
+    b, c = _breaker(streak=5, cooldown=60)
+    _run(tmp_path, monkeypatch, tail_limited, MANY, retry_rounds=(), breaker=b)
+    assert b.trips >= 1, "後面 100 檔全部被限流，卻一次煞車都沒踩——還在硬打"
+    assert c.slept, "踩了煞車卻沒有真的停"
+
+
+def test_煞車沒有拖慢順利的那一趟(tmp_path, monkeypatch):
+    b, c = _breaker(streak=5)
+    _run(tmp_path, monkeypatch, lambda *a, **k: _frame(), MANY,
+         retry_rounds=(), breaker=b)
+    assert b.trips == 0 and c.slept == [], f"一檔都沒漏卻停了 {c.slept}"
+
+
+def test_零星的限流不會踩煞車(tmp_path, monkeypatch):
+    """每天都有幾檔被擋。為那幾檔停一分鐘，是每天平白多一分鐘。"""
+    def a_few(ticker, *a, **k):
+        idx = MANY.index(ticker.split(".")[0])
+        if idx in (7, 40, 133):
+            raise RuntimeError("Too Many Requests. Rate limited.")
+        return _frame()
+
+    b, c = _breaker(streak=5)
+    _run(tmp_path, monkeypatch, a_few, MANY, retry_rounds=(), breaker=b)
+    assert b.trips == 0 and c.slept == [], f"三檔零星限流卻停了 {c.slept}"
+
+
+def test_每送一個請求之前都會先問煞車(tmp_path, monkeypatch):
+    """煞車不是只在失敗的那條路上問。
+
+    最常見的壞法是把 `wait_if_cooling()` 放在例外處理裡——那時候請求已經
+    送出去了，而煞車要擋的正是那個請求。
+    """
+    class Counting(pl.RateLimitBreaker):
+        asked = 0
+
+        def wait_if_cooling(self):
+            Counting.asked += 1
+            return super().wait_if_cooling()
+
+    b = Counting(sleep=lambda s: None)
+    _run(tmp_path, monkeypatch, lambda *a, **k: _frame(), CODES,
+         retry_rounds=(), breaker=b)
+    assert Counting.asked >= len(CODES), (
+        f"{len(CODES)} 檔只問了煞車 {Counting.asked} 次——有請求沒有經過它"
+    )
+
+
+def test_煞車預設是開著的():
+    """排程走的是預設值。預設沒有煞車的話，這整段對排程等於不存在。"""
+    import inspect
+    sig = inspect.signature(pl.run)
+    assert sig.parameters["breaker"].default is None, "預設值不該是共用的同一顆"
+    assert pl.RATE_LIMIT_STREAK >= 2, "連續 1 檔就停的話，每天都會停"
+    assert pl.RATE_LIMIT_COOLDOWN > 0, "停 0 秒等於沒停——限流是按時間窗算的"
+    assert pl.RATE_LIMIT_MAX_COOLDOWN >= pl.RATE_LIMIT_COOLDOWN

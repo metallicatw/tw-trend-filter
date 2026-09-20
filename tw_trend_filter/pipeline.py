@@ -175,6 +175,123 @@ def _mass_empty(n_empty: int, universe: int) -> bool:
     return universe > 0 and n_empty > universe * MASS_EMPTY_RATIO
 
 
+#: 連續幾檔被限流，就讓整批停下來。
+#:
+#: 5 是刻意壓低的。限流不是零星現象——它一旦開始，後面每一個請求都是同一個
+#: 答案，所以「再多看幾檔確認一下」買不到任何確定性，只買到更多被拒絕的請求。
+RATE_LIMIT_STREAK = 5
+
+#: 第一次踩煞車停多久（秒）。
+RATE_LIMIT_COOLDOWN = 60.0
+
+#: 停到最久不超過這麼久（秒）。連踩連停會翻倍，但封頂在這裡——再久下去，
+#: 整趟篩選就會超過排程給的時間，而「跑不完」和「被擋掉」一樣是沒有報告。
+RATE_LIMIT_MAX_COOLDOWN = 240.0
+
+
+class RateLimitBreaker:
+    """連續被限流就讓**整批**停一下，而不是繼續一檔一檔去撞牆。
+
+    ## 為什麼需要這個東西
+
+    2026-09-20 壞掉的那一趟，失敗的 308 檔不是散在母體各處，而是**全部擠在
+    清單的尾巴**：8941 / 8942 / 9949 / 9950 / 9951 / 9960 / 9962 `.TWO`。
+
+        真的掃到 1676 / 1984 檔（84%）
+        沒掃成   308 檔，全部是 YFRateLimitError('Too Many Requests')
+
+    這個形狀說明限流不只是「按時間窗」，還帶著一個**累計的額度**：前面
+    一千六百多個請求把額度用完，從某一檔開始，後面每一檔都是同一句拒絕。
+
+    而原本的程式對此的反應是——繼續送。308 個註定被拒絕的請求，一個不漏地
+    送完，每一個都讓那個額度更難恢復。補問輪也因此更容易接著失敗。
+
+    後果不是隨機的：清單是排序的，所以被餓死的永遠是**同一批高號碼的上櫃
+    股票**。它們不是偶爾少掉，是每一趟壞掉的跑都少掉。
+
+    ## 做法
+
+    連續 `streak` 檔都是限流 → 停 `cooldown` 秒，讓時間窗過去。停完還是連續
+    被限流 → 這次的窗比猜的長，時間加倍（封頂在 `RATE_LIMIT_MAX_COOLDOWN`）。
+    任何一檔成功就整個歸零——額度回來了，沒有理由繼續慢下來。
+
+    **停的是整批，不是每一條執行緒各停一次。** 內部記的是一個「停到什麼時候」
+    的時間點，不是「要睡多久」：五條執行緒同時撞上同一個時間點，它們一起醒，
+    總共只停了一次的時間。
+
+    **順利的日子成本是零**：沒有連續限流就不會有任何一次等待，
+    `wait_if_cooling()` 只是讀一個數字然後回去。
+
+    `sleep` 與 `clock` 可以換掉，測試才不用真的等一分鐘。
+    """
+
+    def __init__(self, streak: int = RATE_LIMIT_STREAK,
+                 cooldown: float = RATE_LIMIT_COOLDOWN,
+                 max_cooldown: float = RATE_LIMIT_MAX_COOLDOWN,
+                 sleep=None, clock=None):
+        import threading as _threading
+        self.streak_limit = streak
+        self.cooldown = cooldown
+        self.max_cooldown = max_cooldown
+        self._sleep = sleep or _time.sleep
+        self._clock = clock or _time.monotonic
+        self._lock = _threading.Lock()
+        self._streak = 0
+        self._level = 0          # 連踩第幾次（決定這次停多久）
+        self._cool_until = None  # None ＝ 現在沒有在停
+        self.trips = 0           # 總共踩了幾次煞車（寫進 log）
+        self.slept = 0.0         # 總共真的停了幾秒
+
+    def note_ok(self) -> None:
+        """這一檔問到了。額度回來了，連續計數與加倍都歸零。"""
+        with self._lock:
+            self._streak = 0
+            self._level = 0
+
+    def note_failure(self, why: str) -> None:
+        """這一檔沒問到。只有**限流**算數。
+
+        連線被中斷、DNS 抽風、那個代號沒有資料——這些和額度無關，停下來也
+        不會變好，所以它們既不累加、也不清空計數（清空的話，失敗名單裡夾雜
+        幾檔別種錯誤就能把煞車永遠擋掉）。
+        """
+        if not _is_rate_limited(why):
+            return
+        with self._lock:
+            self._streak += 1
+            if self._streak < self.streak_limit:
+                return
+            self._streak = 0
+            wait = min(self.cooldown * (2 ** self._level), self.max_cooldown)
+            self._level += 1
+            self.trips += 1
+            now = self._clock()
+            until = now + wait
+            # 已經在停、而且停得比這次還久的話，不要縮短它。
+            if self._cool_until is None or until > self._cool_until:
+                self._cool_until = until
+            print(f'🧯 連續 {self.streak_limit} 檔被 Yahoo 限流，'
+                  f'整批先停 {wait:.0f} 秒讓額度回來'
+                  f'（第 {self.trips} 次）…')
+
+    def wait_if_cooling(self) -> float:
+        """要停就停完再回來，回傳這一次實際停了幾秒（沒停就是 0）。"""
+        with self._lock:
+            if self._cool_until is None:
+                return 0.0
+            remain = self._cool_until - self._clock()
+            if remain <= 0:
+                self._cool_until = None
+                return 0.0
+        self._sleep(remain)
+        with self._lock:
+            self.slept += remain
+            # 睡醒之後如果沒有人把它往後推，就把旗子收起來。
+            if self._cool_until is not None and self._cool_until <= self._clock():
+                self._cool_until = None
+        return remain
+
+
 #: 這支程式版本號。出現在 Excel 抬頭、HTML 標題與 CLI 的 `--version`。
 VERSION = 'V3.1'
 
@@ -1127,6 +1244,7 @@ def run(
     data_dir: str = '',
     data_base: str = '',
     cross_url: str = '',
+    breaker: 'RateLimitBreaker | None' = None,
 ) -> dict:
     """跑完一次全市場篩選，回傳 ``{'results', 'xlsx', 'html', 'index'}``。
 
@@ -1193,6 +1311,9 @@ def run(
     #: 這一輪沒問到的：``{ticker: 為什麼}``。補問成功就從這裡拿掉，
     #: 全部補完才結算進 SCREEN_ERRORS（見 `_settle_failures`）。
     _failed: dict[str, str] = {}
+    #: 連續被限流就讓整批停一下（見 `RateLimitBreaker`）。可以從外面換掉，
+    #: 測試才不用真的等一分鐘。
+    _breaker = breaker if breaker is not None else RateLimitBreaker()
     # 每一檔的指標快照（**包含今天沒過篩的**）。網頁上的即時重篩讀這一份。
     SNAPSHOTS: list[dict] = []
     _snap_lock = _threading.Lock()
@@ -1225,6 +1346,9 @@ def run(
         """
         last = ''
         for kw in ({'session': _YF_SESSION}, {}):
+            # 整批正在停的話，先停完再送（見 `RateLimitBreaker`）。額度已經
+            # 用完的時候，這一行是「不要再送 308 個註定被拒絕的請求」。
+            _breaker.wait_if_cooling()
             try:
                 df = yf.download(ticker, period=period, interval='1d',
                                  auto_adjust=True, progress=False, threads=False, **kw)
@@ -1232,8 +1356,11 @@ def run(
                 last = f'{type(e).__name__}: {e}'
                 df = None
             if df is not None and len(df):
+                _breaker.note_ok()
                 return df, ''
-        return df, (last or NO_DATA)
+        why = last or NO_DATA
+        _breaker.note_failure(why)
+        return df, why
 
     def screen_stock(ticker):
         try:
@@ -1708,6 +1835,9 @@ def run(
             print(f'     ↑ 其中 {SCREEN_ERRORS["RateLimited"]} 檔連補問都還被 Yahoo'
                   ' 限流（限流是按 IP 算的，而 runner 的出口 IP 和別人共用）。'
                   '這幾檔沒有進入今天的篩選母體。')
+    if _breaker.trips:
+        print(f'🧯 期間踩了 {_breaker.trips} 次煞車，總共停了 {_breaker.slept:.0f} 秒'
+              '（連續被限流就整批停一下，不要繼續去撞已經用完的額度）。')
     print('='*60)
 
     # ===============================================================

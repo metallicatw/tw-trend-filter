@@ -2086,14 +2086,23 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
     )
     # 〔預設篩選條件〕：右邊那顆燈泡。它是一把查一次就記得的尺，而輸入框是每次
     # 都要用的——兩者的使用頻率差一個數量級，所以只有它收起來。
+    #
+    # 用 <dialog> 而不是 <details>。理由見 `rulesOpen()` 上面那一段：內嵌展開的
+    # 內容會被 `#topbar` 那個捲動容器裁掉，而且是在**每一個**視窗寬度上。
     tip = (
-        '<details id="rules"><summary title="預設篩選條件">'
+        '<button type="button" id="rules-btn" class="rules-btn"'
+        ' aria-haspopup="dialog" aria-controls="rules" title="預設篩選條件">'
         '<span aria-hidden="true">\U0001F4A1</span>'
-        '<span class="tiplabel">預設篩選條件</span></summary>'
+        '<span class="tiplabel">預設篩選條件</span></button>'
+        '<dialog id="rules" class="rules-dlg" aria-labelledby="rules-h">'
+        '<div class="rules-hd"><b id="rules-h">'
+        '<span aria-hidden="true">\U0001F4A1</span> 預設篩選條件</b>'
+        '<button type="button" class="rules-x" aria-label="關閉">✕</button>'
+        '</div>'
         f'<div class="tipbox"><ol>{items}</ol>'
         '<p class="stop">停損：進場後設在 <b>'
         f'收盤 − {rules.atr_stop:g} × ATR(14)</b>，'
-        '固定不放寬；收盤跌破 20MA 考慮出場。</p></div></details>'
+        '固定不放寬；收盤跌破 20MA 考慮出場。</p></div></dialog>'
     )
     if not snapshots:
         return tip
@@ -3239,27 +3248,48 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         '#live #live-count.stale{color:#f0c27f}'
         # ── 〔預設篩選條件〕：那顆燈泡 ────────────────────────
         #
-        # 用 <details> 而不是 hover 提示：手機上沒有 hover，而這一頁一半的時間
-        # 是在手機上看的。展開的內容絕對定位，所以按一下不會把底下的圖擠下去。
-        '#rules{position:relative;font-size:12px;color:#8b949e;margin-left:auto}'
-        '#rules>summary{cursor:pointer;list-style:none;color:#8b949e;'
-            'display:inline-flex;align-items:center;gap:5px;padding:3px 10px;'
-            'border:1px solid #30363d;border-radius:12px;font-size:11.5px;'
-            'white-space:nowrap}'
-        '#rules>summary:hover{color:#e6edf3;border-color:#58a6ff}'
-        '#rules[open]>summary{color:#e6edf3;border-color:#58a6ff}'
-        '#rules>summary::-webkit-details-marker{display:none}'
-        '#rules .tipbox{position:absolute;right:0;top:calc(100% + 6px);z-index:60;'
-            'width:min(560px,86vw);background:#161b22;border:1px solid #30363d;'
-            'border-left:3px solid #58a6ff;border-radius:6px;padding:10px 13px;'
-            'box-shadow:0 8px 24px rgba(0,0,0,.45);text-align:left;'
-            'line-height:1.6}'
-        '#rules ol{margin:0;padding-left:0;list-style:none;display:grid;gap:4px}'
-        '#rules li{display:grid;grid-template-columns:auto 1fr;gap:8px;'
+        # 彈出視窗，不是內嵌展開。內嵌那一版在**每一個**寬度上都被 `#topbar`
+        # 的 `overflow-y:auto` 裁掉（那是保險絲，見上面），按下去像沒反應。
+        # 完整的量測寫在 `rulesOpen()` 上面。
+        #
+        # `position:fixed` 寫死在這裡而不是靠 `showModal()` 的 top layer：
+        # 拿不到 `<dialog>` 的舊瀏覽器走 `open` 屬性那條路，而那時候它是
+        # `position:absolute`——又會被裁一次。
+        '.rules-btn{margin-left:auto;cursor:pointer;background:transparent;'
+            'color:#8b949e;display:inline-flex;align-items:center;gap:5px;'
+            'padding:4px 12px;min-height:30px;'      # 手指按得到
+            'border:1px solid #30363d;border-radius:12px;'
+            'font-family:inherit;font-size:11.5px;white-space:nowrap}'
+        '.rules-btn:hover{color:#e6edf3;border-color:#58a6ff}'
+        # `max-width` 一定要自己寫。瀏覽器的預設樣式表給 `<dialog>` 的是
+        # `max-width:calc(100% - 6px - 2em)`，而那條是**另一個屬性**——只寫
+        # `width` 蓋不掉它，它會回頭把 width 夾住。實測 390px 的螢幕上量到 360
+        # （390 − 6 − 2×12），右邊白白少一條。
+        '.rules-dlg{position:fixed;z-index:200;inset:0;margin:auto;padding:0;'
+            'width:min(560px,calc(100vw - 32px));max-width:none;'
+            'max-height:min(78vh,520px);overflow:auto;overscroll-behavior:contain;'
+            'background:#161b22;color:#8b949e;border:1px solid #30363d;'
+            'border-left:3px solid #58a6ff;border-radius:10px;'
+            'box-shadow:0 14px 44px rgba(0,0,0,.6);text-align:left;'
+            'font-family:inherit;font-size:12px;line-height:1.6}'
+        '.rules-dlg::backdrop{background:rgba(1,4,9,.66)}'
+        # 標題列黏在頂端：內容比視窗長的時候，捲到一半還看得到〔✕〕。
+        '.rules-hd{position:sticky;top:0;z-index:1;display:flex;'
+            'align-items:center;gap:8px;padding:9px 10px 9px 13px;'
+            'background:#161b22;border-bottom:1px solid #21262d}'
+        '.rules-hd b{flex:1;color:#e6edf3;font-size:13px}'
+        '.rules-x{background:transparent;border:1px solid #30363d;'
+            'border-radius:7px;color:#8b949e;cursor:pointer;'
+            'font-family:inherit;font-size:14px;line-height:1;'
+            'min-width:36px;min-height:36px}'      # 手指按得到
+        '.rules-x:hover{color:#e6edf3;border-color:#58a6ff}'
+        '.rules-dlg .tipbox{padding:11px 13px 14px}'
+        '.rules-dlg ol{margin:0;padding-left:0;list-style:none;display:grid;gap:4px}'
+        '.rules-dlg li{display:grid;grid-template-columns:auto 1fr;gap:8px;'
             'align-items:baseline;line-height:1.55}'
-        '#rules b{color:#e6edf3;font-weight:600;white-space:nowrap}'
-        '#rules .stop{margin:8px 0 0;color:#8b949e}'
-        '#rules .stop b{color:#ff7b72}'
+        '.rules-dlg li b{color:#e6edf3;font-weight:600;white-space:nowrap}'
+        '.rules-dlg .stop{margin:9px 0 0;color:#8b949e}'
+        '.rules-dlg .stop b{color:#ff7b72}'
         # ── 側欄：沒有圖的那幾檔 ─────────────────────────────
         #
         # 「沒有圖」不是錯誤，是這一頁的邊界：放寬門檻多出來的股票，排程當天沒有
@@ -3366,6 +3396,19 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
             '.badge{font-size:11.5px;padding:4px 10px}'
             '.trig-line{font-size:12px;margin:2px 0 6px}'
             '.rbtn{padding:6px 14px;font-size:12px}'   # 手指按得到
+            # 〔預設篩選條件〕在手機上改成貼著底的抽屜。
+            #
+            # 置中的視窗在直式螢幕上有兩個毛病：上下各留一大塊死白，而視窗本身
+            # 離拇指最遠。貼著底就沒有這兩件事——它從最近的那一邊長出來，而且
+            # 不管內容多長，第一行永遠在可視範圍裡。
+            # 高度寫兩次，後面那一次用 dvh：手機瀏覽器的網址列會收合，而 `vh`
+            # 量的是**網址列收起來之後**那個比較大的高度，所以只寫 vh 的抽屜在
+            # 網址列還在的時候底部有一截在畫面外。不認得 dvh 的瀏覽器會把第二行
+            # 整條丟掉，剛好退回第一行。
+            '.rules-dlg{inset:auto 0 0 0;margin:0;width:100%;max-width:none;'
+                'max-height:78vh;max-height:78dvh;'
+                'border-left:1px solid #30363d;border-top:3px solid #58a6ff;'
+                'border-radius:14px 14px 0 0}'
         '}'
     )
 
@@ -3430,6 +3473,65 @@ function syncHdHeight() {
   var hd = document.getElementById('topbar');
   var h = hd ? hd.offsetHeight : 0;
   document.documentElement.style.setProperty('--hd-h', h + 'px');
+}
+
+/* ── 〔預設篩選條件〕：彈出視窗 ──────────────────────────────
+
+   ## 為什麼不是 <details>
+
+   原本它是一個 `<details>`，展開的內容 `position:absolute` 掛在按鈕底下。那在
+   **每一個**視窗寬度上都是壞的，而且壞得很安靜——按下去看起來像沒反應。
+
+   原因是 `#topbar` 有 `max-height:66vh;overflow-y:auto`（那是保險絲：頁首長高
+   會把 `#main` 的高度算成負數）。而一個 `overflow` 不是 visible 的祖先，會把
+   絕對定位的子孫裁掉。實測（無頭瀏覽器量 2026-09-20 那份報告）：
+
+       桌機 1400×900   盒子 y 111–247，#topbar 只到 116  → 看得見 5px
+       手機  390×844   盒子 y 186–415，#topbar 只到 189  → 看得見 3px
+       小手機 360×640  盒子 y 186–434，#topbar 只到 189  → 看得見 3px
+
+   把 `#topbar` 的 overflow 拿掉不是選項——那條保險絲在守一個更糟的症狀
+   （圖表區整個消失而且捲不回來）。
+
+   ## 為什麼是 <dialog>
+
+   `showModal()` 把元素放進瀏覽器的 **top layer**。那一層不在任何祖先的裁切
+   範圍裡，所以這個問題從根上不存在；順便 Esc 關閉、焦點鎖在視窗內、背景遮罩
+   三件事都由瀏覽器做，不必自己寫。
+
+   舊瀏覽器（沒有 `showModal`）退回 `open` 屬性那條路。那時候 `<dialog>` 是
+   `position:absolute`，所以 CSS 裡把 `position:fixed` 寫死——否則會被裁第二次。
+   那條路沒有原生的 Esc 與遮罩，兩者都在下面補上。 */
+function rulesDlg() { return document.getElementById('rules'); }
+
+function rulesOpen() {
+  var d = rulesDlg();
+  if (!d || d.open) return;
+  if (typeof d.showModal === 'function') d.showModal();
+  else d.setAttribute('open', '');
+}
+
+function rulesClose() {
+  var d = rulesDlg();
+  if (!d || !d.open) return;
+  if (typeof d.close === 'function') d.close();
+  else d.removeAttribute('open');
+}
+
+function bindRules() {
+  var btn = document.getElementById('rules-btn');
+  if (btn) btn.addEventListener('click', rulesOpen);
+  var d = rulesDlg();
+  if (!d) return;
+  var x = d.querySelector('.rules-x');
+  if (x) x.addEventListener('click', rulesClose);
+  /* 點遮罩關掉。遮罩的點擊事件 target 就是 `<dialog>` 自己——內容全都包在
+     子元素裡，所以點到內容時 target 是那個子元素，不會誤關。 */
+  d.addEventListener('click', function (e) { if (e.target === d) rulesClose(); });
+  /* 退回 `open` 屬性的那條路沒有原生 Esc，補一個。 */
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && d.open && typeof d.showModal !== 'function') rulesClose();
+  });
 }
 
 /* ── 讓圖表填滿 .plot 容器的實際像素高度（而非寫死的 760）────
@@ -3874,7 +3976,10 @@ window.addEventListener('resize', function() {
    兩邊都做的症狀很安靜：側欄亮著 2317，右邊畫的是 2330。這一頁的 DOMContentLoaded
    有兩個監聽器（〔調整篩選條件〕那段在文件裡比較前面，所以先跑），後跑的這一個
    會把前一個開好的圖蓋掉，但蓋不掉側欄上的那個亮框。 */
-document.addEventListener('DOMContentLoaded', function() { syncHdHeight(); });
+document.addEventListener('DOMContentLoaded', function() {
+  syncHdHeight();
+  bindRules();
+});
 """
     js = js.replace('INFO_JS_PLACEHOLDER', info_js)\
            .replace('TS_PH', ts.replace('_', ''))

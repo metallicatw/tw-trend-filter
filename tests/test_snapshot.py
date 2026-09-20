@@ -429,9 +429,10 @@ def test_快照傳得到報告頁上(tmp_path):
     assert 'id="tf-snap"' in html
     assert 'function tfPass' in html
     # 〔調整篩選條件〕不收合：它是這一頁的控制器，改了就換掉左邊那排卡片。
-    # 收起來的是右邊那顆燈泡裡的〔預設篩選條件〕。
+    # 收起來的是右邊那顆燈泡裡的〔預設篩選條件〕——它是一個彈出視窗
+    # （為什麼不是 <details>，見 tests/test_rules_dialog.py）。
     assert '<div id="live">' in html
-    assert '<details id="rules">' in html
+    assert '<dialog id="rules"' in html
     assert '預設篩選條件' in html
 
 

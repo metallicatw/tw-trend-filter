@@ -2398,10 +2398,15 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
       }}
 
       // 「這一檔為什麼沒有報酬風險比」——只有兩種，而它們的意思正好相反。
+      //
+      // 三種非數字的值都寫成字，不用符號：∞ 要先知道它代表什麼才看得懂，而
+      // 0.00 看起來像「算出來剛好是零」，真正的意思是往下。隔壁
+      // 〔台股評等清單〕那一欄用的是同一套字，兩邊對得起來。
       function tfRrText(row) {{
-        if (row[C.rr_free]) return '∞';
+        if (row[C.rr_free]) return '無風險';
         const rr = row[C.rr];
-        return (rr === null || rr === undefined) ? '—' : rr.toFixed(2);
+        if (rr === null || rr === undefined) return '—';
+        return rr <= 0 ? '空頭' : rr.toFixed(2);
       }}
 
       // 一張側欄卡片。這是**唯一**一份實作——Python 那一份拿掉了。
@@ -2440,7 +2445,7 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
             ? '<div class="nb-cross"><span title="六大財務指標最新綜合評分">六大 ' +
               (row[C.six] === null || row[C.six] === undefined
                 ? '—' : row[C.six].toFixed(2)) +
-              '</span><span title="報酬風險比（∞ ＝ 股價已低於下檔價，沒有下檔風險）">' +
+              '</span><span title="報酬風險比（無風險 ＝ 股價已低於下檔價；空頭 ＝ 預期報酬為負）">' +
               '報酬/風險 ' + tfRrText(row) + '</span></div>'
             : '') +
           (shortWhy

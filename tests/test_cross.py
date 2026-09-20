@@ -164,6 +164,62 @@ def test_零報酬不算過():
     assert not cross_passes(_cross(six=3.5, rr=0.0, rr_free=False), 3.0, 2.0)
 
 
+# ── 側欄卡片上那一行字 ────────────────────────────────────────────
+
+RRTEXT_DRIVER = """
+const rows = JSON.parse(require('fs').readFileSync(process.argv[2], 'utf8'));
+console.log(JSON.stringify(rows.map(tfRrText)));
+"""
+
+
+def _js_rr_text(rows):
+    node = shutil.which('node')
+    if node is None:
+        if os.environ.get('CI'):
+            pytest.fail('CI 上找不到 node，這一支守不住卡片上那一行字')
+        pytest.skip('本機沒有 node；這一支會在 CI 上跑')
+    with tempfile.TemporaryDirectory() as d:
+        src, arg = os.path.join(d, 'c.js'), os.path.join(d, 'p.json')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write(PRELUDE + '\n' + _page_js() + '\n' + RRTEXT_DRIVER)
+        with open(arg, 'w', encoding='utf-8') as f:
+            json.dump([snapshot_row(r) for r in rows], f, ensure_ascii=False)
+        r = subprocess.run([node, src, arg], capture_output=True,
+                           text=True, check=False)
+    assert r.returncode == 0, f'node 跑不起來：{r.stderr}'
+    return json.loads(r.stdout)
+
+
+def test_三種非數字的值都寫成字():
+    """∞ 要先知道它代表什麼才看得懂，而 0.00 看起來像「算出來剛好是零」。
+
+    這三種在資料裡長得很像（`rr` 是 None 或 0），意思卻差很遠：
+
+        無風險   股價已低於下檔價，沒有下檔風險——四種裡最好的
+        空頭     預期報酬是負的（目標價低於現價），估價那一層把它夾成 0
+        —        算不出來（沒有本益比區間，或預估 EPS 為負）
+
+    隔壁〔台股評等清單〕那一欄用的是同一套字（tw-six-metrics 的 `reward()`）。
+    兩邊不一樣的話，同一檔在兩個分頁上會顯示成兩件不同的事。
+    """
+    got = _js_rr_text([
+        _cross(six=3.5, rr=None, rr_free=True),     # 無風險
+        _cross(six=3.5, rr=0.0, rr_free=False),     # 空頭
+        _cross(six=3.5, rr=None, rr_free=False),    # 算不出來
+        _cross(six=3.5, rr=2.5, rr_free=False),     # 一般數字
+    ])
+    assert got == ['無風險', '空頭', '—', '2.50'], got
+
+
+def test_無風險先判定_不會被空頭或破折號蓋掉():
+    """`rr_free` 那一檔的 `rr` 也是 None——和「算不出來」長得一模一樣。
+
+    判斷的順序寫反的話，全市場最好的那一批會顯示成「算不出來」，
+    而那個症狀在畫面上是一個很合理的破折號。
+    """
+    assert _js_rr_text([_cross(six=3.5, rr=None, rr_free=True)]) == ['無風險']
+
+
 # ── 兩邊要篩出同一份名單（Python 與瀏覽器） ──────────────────────
 
 CROSS_DRIVER = """

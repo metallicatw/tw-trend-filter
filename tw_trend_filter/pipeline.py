@@ -3402,11 +3402,26 @@ function tuneForNarrow(fig) {
     if (t.showlegend && !/20MA|60MA|建議停損/.test(t.name || '')) {
       t.showlegend = false;
     }
+    /* 線細一點。
+       桌機上價格那一格有四百多像素高，2.0 的線是一條線；手機上同一格只有
+       一百多像素，同樣粗細的兩條均線加上停損線、布林上下軌，五條線疊起來
+       會把 K 棒蓋掉——「解析度不足」看起來就是這樣來的，而它其實是線太粗。 */
+    if (t.line && typeof t.line.width === 'number' && t.line.width > 1.2) {
+      t.line = Object.assign({}, t.line, {width: 1.2});
+    }
   });
   fig.layout.legend = Object.assign({}, fig.layout.legend, {font: {size: 10}});
   fig.layout.margin = Object.assign({}, fig.layout.margin,
-                                    {t: 68, l: 46, r: 10, b: 20});
+                                    {t: 68, l: 34, r: 10, b: 20});
   fig.layout.font = Object.assign({}, fig.layout.font, {size: 10});
+  /* 兩個縱軸標題拿掉。
+     它們是**直排**的，各佔 43px 與 51px 的高度，而手機上兩個子圖加起來只有
+     一百多像素——於是「價格 (元)」的下緣和「成交量(張)」的上緣疊在一起
+     （實測 464–507 對 506–557，真的重疊）。
+     拿掉之後左留白從 46 縮到 34，繪圖區橫向多出 12px。
+     單位沒有消失：刻度是 55/50/45 和 4000/2000，而圖例上就寫著 20MA、60MA。 */
+  fig.layout.yaxis = Object.assign({}, fig.layout.yaxis, {title: {text: ''}});
+  fig.layout.yaxis2 = Object.assign({}, fig.layout.yaxis2, {title: {text: ''}});
   return fig;
 }
 
@@ -3429,6 +3444,26 @@ function fitPlotSize(div) {
   if (div._twW === w && div._twH === h) return;
   div._twW = w; div._twH = h;
   Plotly.relayout(div, {width: w, height: h});
+}
+
+/* 容器一變大小就重新量一次。
+   ## 為什麼只掛 window.resize 不夠
+   這件事原本只掛在 `window.resize` 上，而**視窗大小沒變**的那些時刻才是問題：
+   字型載入完、側欄那排卡片畫出來、外層網站按下「切換手機版」（那會把 iframe
+   的寬度釘成 430px）——每一次容器的高度都變了，視窗卻一次都沒有 resize。
+   於是圖表停在它第一次被量到的那個尺寸，而 `_twW/_twH` 那個快取讓它**永久**
+   停在那裡。
+   ## 實測（2026-09-20 那份報告）
+       桌機 1400×900   容器 659px，圖 755px  → 高出 96px，蓋住下面那排〔時間範圍〕
+       手機  390×844   容器 405px，圖 181px  → 只用了 45%，價格那一格剩一百出頭
+   同一個原因，兩個相反的症狀：使用者說的「圖蓋到時間範圍」和「手機上看不清楚」
+   是同一件事。
+   ResizeObserver 只在**真的**變了的時候才響，而 `fitPlotSize` 自己還有一層
+   尺寸相同就跳過的守門，所以不會多畫一次那五百根 K 棒。 */
+function observePlotSize(div) {
+  if (!div || div._twObs || typeof ResizeObserver === 'undefined') return;
+  div._twObs = new ResizeObserver(function () { fitPlotSize(div); });
+  div._twObs.observe(div);
 }
 
 /* ── 台灣時間（UTC+8）─────────────────────────────────────── */
@@ -3810,13 +3845,20 @@ function tfDraw(code, s) {
   }
   Plotly.react(wrap, fig.data, fig.layout, PLY_CFG)
     .then(function () {
+      /* 畫完**之後**才量得到容器真正的高度。畫之前量到的是還沒排好的版面，
+         而那正是圖表停在 181px（手機）或 755px（桌機）的原因。
+         兩層 rAF：第一層等這一次的樣式套用，第二層等版面真的排完。 */
+      requestAnimationFrame(function () {
+        requestAnimationFrame(function () { fitPlotSize(wrap); });
+      });
       if (wrap._twBound) return;
       wrap._twBound = true;
+      observePlotSize(wrap);
       attachHover(wrap);
       attachAutoY(wrap);
     })
     .catch(function (e) {
-      wrap.innerHTML = '<p class="ld" style="color:#f85149">⚠ Plotly 畳譜失敗: ' + e.message + '</p>';
+      wrap.innerHTML = '<p class="ld" style="color:#f85149">⚠ Plotly 繪製失敗: ' + e.message + '</p>';
     });
 }
 

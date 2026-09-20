@@ -292,6 +292,108 @@ class RateLimitBreaker:
         return remain
 
 
+# ===============================================================
+# 還沒開盤的那一根「佔位棒」
+# ===============================================================
+#
+# ## 使用者看到的症狀
+#
+#     好慘~1檔都撈不到???
+#
+# ## 抓到的東西（2026-09-20 星期日 21:58 台北時間實測）
+#
+#     2330.TW
+#     2026-09-17  收 2425.0  開 2405.0  高 2445.0  低 2400.0  量 16,009,127
+#     2026-09-18  收 2460.0  開 2460.0  高 2460.0  低 2435.0  量 35,352,856
+#     2026-09-20  收 2460.0  開 2460.0  高 2705.0  低 2435.0  量  5,242,511   ← 星期日
+#
+# 八檔一起看，這一根的長相完全一致：
+#
+#   * **收盤和前一根一模一樣**（8/8 檔），**開盤也和前一根一模一樣**（8/8 檔）。
+#   * 量只有二十日均量的 3%~29%。
+#   * 最高／最低是一團亂：2330 的 2705 剛好是漲停價（2460×1.1 ＝ 2706 跳一檔），
+#     但它的最低 2435 是**前一根的最低**；2412 的 147.0／138.5 兩邊都不是。
+#     所以最高最低**不能拿來判**——這一點是實測推翻掉的第一版猜測。
+#
+# 而兩年的歷史裡，週末的列只有這一天——所以它不是 Yahoo 的歷史髒資料，是**當下
+# 那一根還在跳的即時報價**，隔天就會被正式的那一根蓋掉（或整根消失）。
+#
+# ## 為什麼這一根會讓整份報告變成 0 檔
+#
+# 第四關是「當日量 ≥ 20 日均量 × 1.2」。而這一根的量是均量的 3%~29%。
+# 實測 40 檔大型股：
+#
+#     照現在的程式（吃到佔位棒）   量比中位數 0.094   ≥1.2 的 2/40   通過 0 檔
+#     把佔位棒拿掉（用 9/18 收盤） 量比中位數 1.268   ≥1.2 的 22/40  通過 2 檔
+#
+# 一關全滅。而且收盤是停在前一天的，所以第二關、第四關的突破判定也全部是用
+# 昨天的價格在回答今天的問題——報告上卻寫著今天的日期。
+#
+# ## 怎麼分辨
+#
+# 逐檔認太脆弱（真的有股票整天不動）。所以**整個市場一起投票**：開盤前／收盤後
+# 問幾檔最大的權值股，多數說「我這一根是佔位棒」，就代表今天根本還沒有那一場
+# 交易，整批一律砍到前一個交易日。少數幾檔今天沒成交是市場常態，它們的量比
+# 自然過不了第四關，不需要特別處理。
+
+#: 佔位棒的量，最多只會是二十日均量的這個比例。實測那一根是 3%~29%。
+STUB_VOLUME_RATIO = 0.5
+
+#: 投票用的權值股。挑最大的幾檔，是因為它們**每一個交易日都會有成交**——
+#: 一檔冷門股「今天開平收平、量又小」是常態，台積電和鴻海不是。
+SESSION_PROBES = ('2330.TW', '2317.TW', '2412.TW', '2882.TW', '1301.TW')
+
+
+def _looks_like_stub(df) -> bool:
+    """最後一根是不是「今天還沒開盤」的佔位棒。
+
+    三個條件一起看，因為單獨任何一個都會誤判：
+
+      1. 收盤和前一根一模一樣。
+      2. 開盤也和前一根一模一樣——Yahoo 是把前一根的開盤原封不動搬過來。
+      3. 量不到二十日均量的一半。
+
+    ## 這三條有多準（40 檔權值股、兩年、18,599 個真實交易日實測）
+
+        今天那一根（星期日）        命中 38/40
+        歷史上真的收過盤的那些根    誤判 25 次 ＝ 0.134%
+        只用 1+2、不看量            誤判 151 次 ＝ 0.812%
+
+    0.134% 還不是零，所以**不能靠單一檔決定**——那是 `stub_vote()` 存在的理由。
+    """
+    if df is None or len(df) < 22:
+        return False
+    try:
+        cur, prev = df.iloc[-1], df.iloc[-2]
+        close, open_ = float(cur['Close']), float(cur['Open'])
+        vol = float(cur['Volume'])
+        pc, po = float(prev['Close']), float(prev['Open'])
+        vol20 = float(df['Volume'].iloc[-21:-1].mean())
+    except Exception:                                   # noqa: BLE001
+        return False
+    if pc <= 0 or close != pc or open_ != po:
+        return False
+    return vol20 > 0 and vol < vol20 * STUB_VOLUME_RATIO
+
+
+#: 幾成的權值股說「我這一根是佔位棒」，就當成今天還沒有那一場交易。
+STUB_VOTE_RATIO = 0.5
+
+
+def stub_vote(frames) -> bool:
+    """投票：這一批（權值股）的最後一根是不是佔位棒。
+
+    投不出來（一檔都沒問到）的時候回 False ＝ 照舊不動資料。這是刻意的：
+    這道防線的代價是「少算一天」，而在拿不到證據的情況下少算一天，比
+    在拿得到證據的情況下多算一根假的更難被發現。真的拿不到資料的那一趟，
+    有母體覆蓋率那道門擋著。
+    """
+    votes = [_looks_like_stub(df) for df in frames if df is not None and len(df)]
+    if not votes:
+        return False
+    return sum(votes) > len(votes) * STUB_VOTE_RATIO
+
+
 #: 這支程式版本號。出現在 Excel 抬頭、HTML 標題與 CLI 的 `--version`。
 VERSION = 'V3.1'
 
@@ -341,7 +443,12 @@ class Rules:
 
     #: ① 基礎流動性防禦
     min_price: float = 10.0          # 股價下限（元）
-    min_vol20: float = 1000.0        # 20 日均量下限（張）
+    #: ⚠️ 單位是**股**，不是張。yfinance 給的 Volume 是股數（實測 2330 的
+    #: 二十日均量是 18,089,518，＝約 18,000 張），而這個門檻直接和它比。
+    #: 1000 股 ＝ 1 張，所以這一關實際上幾乎不擋任何東西——真正在擋流動性
+    #: 的是下面那個「日均成交金額 5,000 萬」。這裡寫過「張」，那是一句謊話：
+    #: 報告上印著「> 1,000 張」，實際生效的是「> 1 張」。
+    min_vol20: float = 1000.0        # 20 日均量下限（股）
     min_amount: float = 50_000_000.0 # 20 日均成交金額下限（元）
     #: ③ 關鍵發動時機
     lookback: int = 10               # 往回看幾個交易日找黃金交叉／壓縮
@@ -362,7 +469,7 @@ class Rules:
         """Excel 第一分頁那四行「四部曲篩選機制說明」，照實際生效的門檻寫。"""
         return (
             ('① 基礎流動性防禦',
-             f'股價 > {self.min_price:g} 元 ｜ 20日均量 > {self.min_vol20:,.0f} 張 ｜ '
+             f'股價 > {self.min_price:g} 元 ｜ 20日均量 > {self.min_vol20:,.0f} 股 ｜ '
              f'日均成交金額 > {self.min_amount / 1e4:,.0f} 萬元'),
             ('② 趨勢多頭確認',
              '收盤站穩季線(60MA)之上，且月線(20MA) > 季線(60MA)'),
@@ -1245,6 +1352,7 @@ def run(
     data_base: str = '',
     cross_url: str = '',
     breaker: 'RateLimitBreaker | None' = None,
+    session_probes: tuple | None = None,
 ) -> dict:
     """跑完一次全市場篩選，回傳 ``{'results', 'xlsx', 'html', 'index'}``。
 
@@ -1314,6 +1422,10 @@ def run(
     #: 連續被限流就讓整批停一下（見 `RateLimitBreaker`）。可以從外面換掉，
     #: 測試才不用真的等一分鐘。
     _breaker = breaker if breaker is not None else RateLimitBreaker()
+    #: 「資料要算到哪一天為止」。None ＝ 不砍（今天那一場交易已經收了）。
+    #: 由開掃前的那一次投票決定，見 `stub_vote`。放進 list 是因為 `screen_stock`
+    #: 是巢狀函式，要讀的是**投完票之後**的值。
+    _asof = [None]
     # 每一檔的指標快照（**包含今天沒過篩的**）。網頁上的即時重篩讀這一份。
     SNAPSHOTS: list[dict] = []
     _snap_lock = _threading.Lock()
@@ -1406,6 +1518,21 @@ def run(
                 df.columns = df.columns.droplevel(1)
             df = df.dropna(subset=['Close','Volume'])
             df.index = pd.to_datetime(df.index).tz_localize(None)
+            # 今天那一場交易還沒發生的話，整批砍到最後一個真的收過盤的日子
+            # （見 `stub_vote`）。
+            #
+            # 用**日期**砍而不是「砍掉最後一根」：40 檔實測裡有一檔的最後一根
+            # 本來就停在 9/18（它今天沒有佔位棒），砍最後一根會把它真正的收盤
+            # 砍掉。按日期砍對兩種情形都對。
+            #
+            # 砍在這裡而不是在 `_download`：`_download` 會被補問輪重複呼叫，
+            # 而這裡是每一檔都一定會經過、而且只經過一次的地方。
+            if _asof[0] is not None:
+                df = df[df.index <= _asof[0]]
+                if len(df) < 65:
+                    with _scan_lock:
+                        _too_short[0] += 1
+                    return None
             close, volume = df['Close'], df['Volume']
             # 資料拿到了、長度夠、欄位讀得開——到這裡才算真的掃到這一檔。
             # 之後再丟例外的話，那是程式的問題，由 SCREEN_ERRORS 那一半負責。
@@ -1746,6 +1873,34 @@ def run(
 
     from concurrent.futures import ThreadPoolExecutor
     import threading
+
+    # ── 開掃之前先問一句：今天那一場交易發生了嗎 ────────────────
+    #
+    # 五個請求，換掉「整份報告 0 檔」。細節見 `stub_vote` 上面那一段。
+    probes = []
+    for tk in (SESSION_PROBES if session_probes is None else session_probes):
+        if tk not in TICKERS and TICKERS:
+            # 權值股被 `--limit` 切掉了（煙霧測試）。那一趟本來就不看結果，
+            # 不值得為它多送五個請求。
+            continue
+        d, _why = _download(tk)
+        if d is not None and len(d):
+            if isinstance(d.columns, pd.MultiIndex):
+                d = d.copy()
+                d.columns = d.columns.droplevel(1)
+            probes.append(d)
+    if probes and stub_vote(probes):
+        # 投到的那幾檔都停在同一天，取第一檔的倒數第二根即可。
+        idx = pd.to_datetime(probes[0].index).tz_localize(None)
+        _asof[0] = idx[-2]
+        print('⚠️ 權值股的最後一根是「還沒開盤」的佔位棒'
+              '（開盤收盤都和前一根一模一樣、量不到均量的一半）'
+              '——今天那一場交易還沒發生。')
+        print(f'   整批算到 {_asof[0]:%Y-%m-%d} 為止。'
+              '（吃到佔位棒的話，量比會變成均量的一成，第四關會全滅。）')
+    elif probes:
+        idx = pd.to_datetime(probes[0].index).tz_localize(None)
+        print(f'📅 資料基準：{idx[-1]:%Y-%m-%d}（權值股的最後一根是真的收過盤的）')
 
     _lock    = threading.Lock()
     RESULTS  = []
@@ -2294,6 +2449,9 @@ def run(
         # 這句話沒辦法回答「是限流還是查無此股」——而那兩個的處置完全不同。
         'error_samples': list(SCREEN_ERROR_SAMPLES),
         'date': today_str,
+        # 這一份報告**算到哪一天的收盤為止**。和 `date`（跑的日期）不一樣：
+        # 週末或開盤前跑的話，資料基準會是上一個交易日（見 `stub_vote`）。
+        'asof': None if _asof[0] is None else f'{_asof[0]:%Y-%m-%d}',
         'xlsx': OUTPUT_FILE,
         'html': html_path or '',
         'index': index_path,
@@ -2320,7 +2478,7 @@ def run(
 #: 頻寬可以看——輸入框擋住，比讓它靜靜地算出一個偏少的答案好。
 LIVE_FIELDS: tuple[tuple[str, str, str, str, str], ...] = (
     ('min_price',  '股價下限',   '元',    '1',    ''),
-    ('min_vol20',  '20日均量',   '張',    '100',  ''),
+    ('min_vol20',  '20日均量',   '股',    '100',  ''),
     ('min_amount', '20日均額',   '百萬',  '10',   ''),
     ('lookback',   '回看天數',   '日',    '1',    str(SNAPSHOT_DAYS)),  # 下界 0，見 passes()
     ('squeeze',    '壓縮門檻',   '',      '0.01', ''),
@@ -2843,9 +3001,10 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
         el.innerHTML = head + six;
       }}
 
-      // 「回到預設」回到的是**這個入口的**預設。從 #cross 進來的話那是 3 和 2，
-      // 不是 0——否則按一下就從〔趨勢∩六大∩報酬〕變回〔台股趨勢選股〕，而網址
-      // 和標題都還寫著交集。
+      // 「回到預設」回到的是**這個入口的**預設，也就是 TF_CROSS_DEFAULT。
+      // 那一組目前是 0 和 0（＝第五關不啟用，見 Python 的 CROSS_DEFAULTS），
+      // 所以現在兩個入口回到的是同一組；它留在這裡，是因為那一組隨時可能
+      // 再被調起來，而「回到預設」該回到的一直是**這個入口的**那一組。
       function tfDefaults() {{
         const d = Object.assign({{}}, TF_DEFAULT);
         if (tfCrossMode()) Object.assign(d, TF_CROSS_DEFAULT);
@@ -2868,8 +3027,10 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
       document.addEventListener('DOMContentLoaded', function () {{
         try {{ TF_ROWS = JSON.parse(document.getElementById('tf-snap').textContent); }}
         catch (e) {{ TF_ROWS = []; }}
-        // 同一份報告，兩個入口。`#cross` 把第五關的兩個門檻預先填成 3 和 2；
-        // 不帶就是 0，也就是這一關不啟用，〔台股趨勢選股〕篩出什麼完全不變。
+        // 同一份報告，兩個入口。`#cross` 把第五關的兩個門檻預先填成
+        // TF_CROSS_DEFAULT——**目前那一組是 0 和 0**，也就是這一關不啟用，
+        // 兩個入口篩出來的東西一模一樣。那一組很嚴（實測 25 檔趨勢入選裡只有
+        // 1 檔同時過另外兩關），所以預設先不啟用，要用的人把數字打上去。
         //
         // 做成兩份 HTML 的話，趨勢圖、卡片、圖表資料那一整套都要維護兩次，
         // 而它們沒有任何一處該不一樣。

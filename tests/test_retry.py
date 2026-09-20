@@ -121,6 +121,10 @@ def _run(tmp_path, monkeypatch, download, codes, retry_rounds=((0, 2),)):
 
 CODES = ["1101", "1102", "1103", "1104", "1105"]
 
+#: 「幾檔空表」要落在母體的 1% 以下才算常態（見 `pipeline._mass_empty`）。
+#: 五檔的母體裡一檔空表就是 20%，所以要測「常態」得用一個像樣的母體。
+MANY = [str(1101 + i) for i in range(200)]
+
 
 def test_第一輪被限流_補問拿得到就算掃到(tmp_path, monkeypatch):
     """這一條是那個症狀的直接迴歸：同樣的市場、同樣的門檻，第一輪被擋掉的那
@@ -170,23 +174,24 @@ def test_補問還是拿不到就記成限流(tmp_path, monkeypatch):
     assert res["scanned"] == 3
 
 
-def test_沒有資料的代號不記成限流_也不重問(tmp_path, monkeypatch):
-    """空表 ＝ 這個代號沒有資料。它要記成 DownloadFailed，而且不該被重問。"""
+def test_零星的空表不記成限流_也不重問(tmp_path, monkeypatch):
+    """空表 ＝ 這個代號沒有資料。它要記成 DownloadFailed，而且不該被重問。
+
+    母體 200 檔、一檔空表（0.5%）——那是每天都有的常態。
+    """
     calls = {}
 
-    def empty_for_two(ticker, *a, **k):
+    def one_empty(ticker, *a, **k):
         calls[ticker] = calls.get(ticker, 0) + 1
-        if ticker.startswith(("1104", "1105")):
-            return pd.DataFrame()
-        return _frame()
+        return pd.DataFrame() if ticker.startswith("1104") else _frame()
 
-    res = _run(tmp_path, monkeypatch, empty_for_two, CODES)
-    assert res["error_kinds"].get("DownloadFailed") == 2, res["error_kinds"]
+    res = _run(tmp_path, monkeypatch, one_empty, MANY)
+    assert res["error_kinds"].get("DownloadFailed") == 1, res["error_kinds"]
     assert "RateLimited" not in res["error_kinds"], res["error_kinds"]
     # `_download` 一檔試兩下（自訂 session ＋ 預設連線）。補問會變成四下。
     assert calls["1104.TW"] == 2, (
         f"沒有資料的代號被重問了（總共問了 {calls['1104.TW']} 次）——"
-        "那是每天幾十檔、注定拿不到的東西"
+        "那是每天十幾檔、注定拿不到的東西"
     )
 
 
@@ -229,16 +234,63 @@ def test_全部順利的日子一秒都不等(tmp_path, monkeypatch):
     assert slept == [], f"一檔都沒漏卻睡了 {slept}"
 
 
-def test_只有空表的日子也不等(tmp_path, monkeypatch):
-    """每天都有幾十檔是「沒有資料的正常代號」。為它們等 135 秒是純粹的浪費。"""
+def test_零星的空表不必等(tmp_path, monkeypatch):
+    """每天都有十幾檔是「沒有資料的正常代號」。為它們等好幾分鐘是純粹的浪費。"""
     slept = []
     monkeypatch.setattr(pl._time, "sleep", lambda s: slept.append(s))
 
-    def some_empty(ticker, *a, **k):
+    def one_empty(ticker, *a, **k):
         return pd.DataFrame() if ticker.startswith("1105") else _frame()
 
-    _run(tmp_path, monkeypatch, some_empty, CODES, retry_rounds=pl.RETRY_ROUNDS)
-    assert slept == [], f"只有空表卻睡了 {slept}"
+    _run(tmp_path, monkeypatch, one_empty, MANY, retry_rounds=pl.RETRY_ROUNDS)
+    assert slept == [], f"零星的空表卻睡了 {slept}"
+
+
+# ---------------------------------------------------------------------------
+# 一口氣幾百檔回空表 ＝ 被擋掉了，不是「查無此股」
+
+
+def test_空表多到不正常就要當成被擋掉重問(tmp_path, monkeypatch):
+    """yfinance **不是每次被限流都會丟例外**——它有時候好好地回一份空表。
+
+    那一份空表和「查無此股」在呼叫端看起來一模一樣，而分辨它們的不是單一檔，
+    是**數量**：
+
+        健康的那一趟   空表 15 檔 / 1,988    → 正常
+        壞掉的那一趟   沒掃成 308 檔 / 1,988 → 不正常
+
+    所以超過母體的 1%，連空表也一起排進補問。這一條守的就是那個轉折。
+    """
+    seen = {}
+
+    def empty_then_fine(ticker, *a, **k):
+        seen[ticker] = seen.get(ticker, 0) + 1
+        # 前 100 檔第一輪全部回空表（50%，遠超過 1%），補問時就正常了。
+        idx = MANY.index(ticker.split(".")[0])
+        if idx < 100 and seen[ticker] <= 2:
+            return pd.DataFrame()
+        return _frame()
+
+    res = _run(tmp_path, monkeypatch, empty_then_fine, MANY)
+    assert res["scanned"] == len(MANY), (
+        f"只掃到 {res['scanned']}/{len(MANY)}——幾百檔空表沒有被當成「被擋掉」，"
+        "所以一檔都沒有補問"
+    )
+    assert not res["error_kinds"], res["error_kinds"]
+
+
+def test_空表的數量門檻踩在邊界上():
+    """1%。母體 1,988 檔 ＝ 19.88，所以 19 檔還算常態、20 檔就不是。"""
+    assert not pl._mass_empty(19, 1988)
+    assert pl._mass_empty(20, 1988)
+    assert not pl._mass_empty(15, 1988), "健康那一趟的 15 檔不該觸發"
+    assert pl._mass_empty(308, 1988), "壞掉那一趟的 308 檔一定要觸發"
+    # 剛好踩在 1% 上算常態（`>` 不是 `>=`）。1,988 檔的 1% 是 19.88，
+    # 兩邊都不是整數，所以那一組比不出這件事——要一個整除的母體。
+    assert not pl._mass_empty(1, 100), "剛好 1% 就觸發的話，門檻實際上是 0.99%"
+    assert pl._mass_empty(2, 100)
+    # 母體是 0 的時候不要除以零，也不要說「異常」。
+    assert not pl._mass_empty(0, 0)
 
 
 def test_有限流才等_而且照著設定等(tmp_path, monkeypatch):
@@ -264,6 +316,14 @@ def test_預設就是會補問():
     assert waits == sorted(waits) and waits[0] > 0, (
         f"等的秒數要遞增而且大於零，現在是 {waits}——"
         "限流是按時間窗算的，等 0 秒等於沒等"
+    )
+    # 短、中、長各一輪。只有短的兩輪擋不住「runner 的 IP 今天很燙」那種日子
+    # ——實測有一趟補問完還是掉了 308/1,988 檔（覆蓋率 84%，健康門檻擋下沒發布）。
+    # 那一天的成本是整趟白跑，而多等幾分鐘是最便宜的一種補救。
+    assert len(pl.RETRY_ROUNDS) >= 3, f"只有 {len(pl.RETRY_ROUNDS)} 輪補問"
+    assert sum(waits) >= 300, (
+        f"三輪加起來只等 {sum(waits)} 秒。限流的時間窗比這長，"
+        "而等不夠的那一趟會整個白跑"
     )
 
 

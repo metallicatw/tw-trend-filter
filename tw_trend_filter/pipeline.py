@@ -112,7 +112,7 @@ DEFAULT_WORKERS = 4
 #: 45 秒與 90 秒是留給時間窗過去用的，連線數降到 2 再降到 1 是為了不要在剛解除
 #: 限流的當下又立刻撞上去。只有真的有檔數沒問到才會等——全部順利的日子，這整段
 #: 的成本是零。
-RETRY_ROUNDS = ((45, 2), (90, 1))
+RETRY_ROUNDS = ((45, 2), (90, 1), (180, 1))
 
 #: Yahoo 的限流長什麼樣。型別名（`YFRateLimitError`）和訊息都會變，所以兩種都認。
 _RATE_LIMIT_MARKS = ('ratelimit', 'too many requests', '429')
@@ -139,11 +139,40 @@ def _worth_retry(why: str) -> bool:
     不值得的是 Yahoo 好好地回了一份空表——那代表這個代號沒有資料（下市、
     剛掛牌還沒報價、代號打錯），等多久都一樣。
 
-    這個分界同時決定了「要不要付那 135 秒」。全市場每天都有幾十檔是沒有資料
-    的正常代號，如果連它們也等，那就變成每天無條件多花兩分鐘去問一批注定
+    這個分界同時決定了「要不要付那幾分鐘」。全市場每天都有十幾檔是沒有資料
+    的正常代號，如果連它們也等，那就變成每天無條件多花幾分鐘去問一批注定
     拿不到的東西。
+
+    ⚠️ **這條規則有一個例外，見 `_mass_empty()`。**
     """
     return bool(why) and why != NO_DATA
+
+
+#: 空表要多到什麼程度，才該把它們當成「被擋掉」而不是「沒有資料」。
+#:
+#: 母體的 1%。全市場 1,988 檔，也就是大約 20 檔。
+MASS_EMPTY_RATIO = 0.01
+
+
+def _mass_empty(n_empty: int, universe: int) -> bool:
+    """一口氣幾百檔「回空表」不是巧合，是被擋掉了。
+
+    ## 為什麼需要這一條
+
+    `_worth_retry()` 說空表不值得重問，因為那代表那個代號沒有資料。那對**個別**
+    的代號是對的——下市、剛掛牌、代號打錯，每天十幾檔，等多久都一樣。
+
+    但 yfinance 不是每次被限流都會丟例外。它有時候**好好地回一份空表**，而那
+    一份空表和「查無此股」在呼叫端看起來一模一樣。於是同一條規則在兩種情形下
+    給出相反的正確答案，而分辨它們的不是單一檔，是**數量**：
+
+        2026-09-20 健康的那一趟   空表 15 檔 / 1,988   → 正常，不必重問
+        同一天壞掉的那一趟        沒掃成 308 檔 / 1,988 → 不正常
+
+    十幾檔是市場的常態，幾百檔是對面在拒絕我們。所以超過母體的 1%，就連空表
+    也一起排進補問——那一天本來就已經要重跑了，多等幾分鐘是最便宜的一種補救。
+    """
+    return universe > 0 and n_empty > universe * MASS_EMPTY_RATIO
 
 
 #: 這支程式版本號。出現在 Excel 抬頭、HTML 標題與 CLI 的 `--version`。
@@ -206,7 +235,7 @@ class Rules:
     atr_stop: float = 3.0            # 停損 = 收盤 − 這個倍數 × ATR(14)
     #: ∩ 六大與估值。**預設 0 ＝ 這一關不啟用**——〔台股趨勢選股〕講的是四部曲，
     #: 多兩個門檻在那一頁上不該改變它篩出什麼。〔趨勢∩六大∩報酬〕那個入口把
-    #: 它們設成 3 和 2（見 `CROSS_DEFAULTS`）。
+    #: 它們的預設見 `CROSS_DEFAULTS`（目前兩個都是 0 ＝ 不啟用）。
     #:
     #: 它們不在 `describe()` 裡，理由同上：那四行說的是四部曲。
     min_six: float = 0.0             # 六大綜合評分下限（滿分約 3.83）
@@ -1634,11 +1663,18 @@ def run(
 
     for wait, rw in (retry_rounds or ()):
         todo = sorted(tk for tk, why in _failed.items() if _worth_retry(why))
+        # 空表平常不重問（見 `_worth_retry`），但一口氣幾百檔回空表不是巧合
+        # ——yfinance 被限流的時候有時候就是安靜地回一份空表。見 `_mass_empty`。
+        empty = sorted(tk for tk, why in _failed.items() if not _worth_retry(why))
+        mass = _mass_empty(len(empty), len(TICKERS))
+        if mass:
+            todo = sorted(todo + empty)
         if not todo:
             break
         limited = sum(1 for tk in todo if _is_rate_limited(_failed[tk]))
-        print(f'⏳ 有 {len(todo)} 檔出了例外沒問到（其中 {limited} 檔是被限流）。'
-              f'等 {wait} 秒，再用 {rw} 條連線補問一次…')
+        print(f'⏳ 有 {len(todo)} 檔沒問到（其中 {limited} 檔明確是被限流'
+              + (f'，{len(empty)} 檔回空表——數量異常，一併補問' if mass else '')
+              + f'）。等 {wait} 秒，再用 {rw} 條連線補問一次…')
         _time.sleep(wait)
         before = len(_failed)
         with ThreadPoolExecutor(max_workers=rw) as executor:
@@ -2164,12 +2200,24 @@ LIVE_FIELDS: tuple[tuple[str, str, str, str, str], ...] = (
     ('min_rr',     '報酬風險比', '倍以上', '0.1',  ''),
 )
 
-#: 〔趨勢∩六大∩報酬〕那個入口的預設門檻。
+#: 〔趨勢X六大X報酬〕那個入口的預設門檻。
 #:
-#: 同一份報告、同一段 JS，兩個入口：網址帶 `#cross` 就套這一組，不帶就是
-#: `Rules` 的 0（等於這一關不啟用）。兩份 HTML 的話，趨勢圖、卡片、圖表資料
-#: 那一整套都要維護兩次，而它們沒有任何一處該不一樣。
-CROSS_DEFAULTS: dict[str, float] = {'min_six': 3.0, 'min_rr': 2.0}
+#: 同一份報告、同一段 JS：網址帶 `#cross` 就套這一組，不帶就是 `Rules` 的 0。
+#: 兩份 HTML 的話，趨勢圖、卡片、圖表資料那一整套都要維護兩次，而它們沒有任何
+#: 一處該不一樣。
+#:
+#: ## 為什麼兩個都是 0
+#:
+#: 0 ＝ 這一關不啟用。也就是說**預設看到的是技術面四關的完整名單**，六大評分與
+#: 報酬風險比只在卡片上顯示、不拿來篩。
+#:
+#: 原本是 3 和 2。那一組很嚴：實測 2026/09/18，25 檔趨勢入選裡只有 1 檔同時過另外
+#: 兩關。而四關本身在弱勢的日子就可能是零檔——兩個嚴格條件疊起來，打開這一頁最常
+#: 看到的是一張空名單，而空名單沒辦法讓人判斷「今天是沒有標的，還是門檻太緊」。
+#:
+#: 想要那一組的人把兩個數字打上去就有了，而且畫面會當場重篩。反過來（預設很嚴、
+#: 要自己調鬆）比較難——你得先知道有那兩個框，而它們預設就擋掉了大部分的東西。
+CROSS_DEFAULTS: dict[str, float] = {'min_six': 0.0, 'min_rr': 0.0}
 
 
 def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',

@@ -10,7 +10,14 @@ import argparse
 import os
 import sys
 
-from .pipeline import DEFAULT_RULES, VERSION, Rules, UniverseIncomplete, run
+from .pipeline import (
+    DEFAULT_RULES,
+    DEFAULT_WORKERS,
+    VERSION,
+    Rules,
+    UniverseIncomplete,
+    run,
+)
 
 
 def _env_excel_url() -> str:
@@ -78,8 +85,11 @@ def main(argv: list[str] | None = None) -> int:
                     help='另外複製一份互動線圖到這個路徑（排程用 index.html）')
     ap.add_argument('--limit', type=int, default=0,
                     help='只掃前 N 檔。給煙霧測試用，0 = 全市場')
-    ap.add_argument('--workers', type=int, default=8,
-                    help='同時抓幾檔（預設 8）')
+    # 預設與理由都在 `pipeline.DEFAULT_WORKERS`——兩個地方各寫一個數字的話，
+    # 改了一邊就會出現「說明寫 A、實際跑 B」。
+    ap.add_argument('--workers', type=int, default=DEFAULT_WORKERS,
+                    help=f'同時抓幾檔（預設 {DEFAULT_WORKERS}；調高會被 Yahoo '
+                         f'靜靜地擋掉一部分，見 pipeline.DEFAULT_WORKERS）')
     ap.add_argument('--period', default='2y',
                     help='每一檔下載多長的歷史（yfinance 的 period，預設 2y）')
     ap.add_argument('--chart-years', type=float, default=2.0,
@@ -196,8 +206,28 @@ def main(argv: list[str] | None = None) -> int:
     errors    = result.get('errors', 0)
     scannable = max(universe - too_short, 0)
     ok_ratio  = (result['scanned'] / scannable) if scannable else 0.0
+    # **分母也要有底線。**
+    #
+    # 上面那個比例是「該掃的裡面掃到幾成」，而 `too_short` 會把分母縮小。那在
+    # 它真的是「新上市」的時候是對的，但只要有任何一種失敗被誤記成 too_short，
+    # 這個比例就會自己變成 100%——失敗的那幾百檔把分母一起帶走了。
+    #
+    # 那不是假設：`screen_stock` 曾經把每一檔沒抓到的股票都記成 too_short
+    # （`yf.download` 抓不到時回的是空的 DataFrame，不是 None），於是
+    # 2026-09-20 那份報告只有 543/891 檔上櫃，而門檻算出來是 100%，照常發布。
+    #
+    # 所以再加一條**不看分母**的底線：掃到的檔數對**整個母體**至少要有八成。
+    # 新上市永遠到不了兩成，所以這一條不會誤觸；而任何「失敗偽裝成別的東西」
+    # 的花樣都跨不過它——它問的是「這份報告蓋到多少個市場」，不是「我們自己
+    # 認為該掃的有多少」。
+    # 只在**真的在掃全市場**的時候套用。`--limit 10` 的煙霧測試母體只有十檔，
+    # 裡面兩三檔太新就跌破八成——而那一趟要證明的是「整條路走不走得通」，不是
+    # 「今天蓋到多少市場」。門檻誤觸一次就沒有人再相信它，這一條也不例外。
+    coverage  = (result['scanned'] / universe) if universe else 0.0
+    full_run  = universe >= 100
     healthy   = (scannable > 0
                  and ok_ratio >= 0.90
+                 and (coverage >= 0.80 or not full_run)
                  and errors <= scannable * 0.10)
 
     # 讓 workflow 的後續步驟拿得到「今天通過幾檔」，不必去 parse 上面那堆輸出。
@@ -209,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
             fh.write(f"universe={universe}\n")
             fh.write(f"errors={errors}\n")
             fh.write(f"too_short={too_short}\n")
+            fh.write(f"coverage={coverage:.3f}\n")
             fh.write(f"healthy={'yes' if healthy else 'no'}\n")
             fh.write(f"date={result['date']}\n")
             fh.write(f"xlsx={result['xlsx']}\n")
@@ -230,7 +261,7 @@ def main(argv: list[str] | None = None) -> int:
             detail += ("，" if detail else "") + "例外：" + "、".join(
                 f'{k} {v} 檔' for k, v in sorted(other.items(), key=lambda x: -x[1]))
         print(f"::error::這一趟只真的掃到 {result['scanned']}/{scannable} 檔"
-              f"（{ok_ratio:.0%}）"
+              f"（{ok_ratio:.0%}；對整個母體 {universe} 檔是 {coverage:.0%}）"
               + (f"，{detail}" if detail else "")
               + (f"（另有 {too_short} 檔歷史不足，已排除）" if too_short else "")
               + "。報告仍然產出來了，但不應該拿它覆蓋昨天那份。")

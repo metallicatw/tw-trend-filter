@@ -70,6 +70,27 @@ PLOTLY_CDN = "https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.35.3/plotly.min
 #: 症狀一模一樣，而且都不會有錯誤訊息，所以退路是必要的，不是保險。
 PLOTLY_CDN_FALLBACK = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 
+#: 同時抓幾檔。**4，不是 8。**
+#:
+#: Yahoo 對同一個來源 IP 有一個「同時問太快就不回」的限制，而它拒絕的方式是
+#: 回一個**空的 DataFrame**，不是錯誤——所以從呼叫端看不出來發生過任何事。
+#:
+#: 全市場 1,979 檔、同一台機器、同一份清單，實測：
+#:
+#:     8 workers   1.0～1.6 分   成功 1,276～1,607（64.5%～81.2%）
+#:     4 workers   1.7 分        成功 1,975（99.8%）
+#:
+#: 兩次 8 workers 的失敗**全部**落在上櫃（上市 1,086/1,088、上櫃 521/891）
+#: ——不是因為上櫃特別，是因為清單是上市在前、上櫃在後，額度被前面吃完了。
+#: 而生產環境的報告正是這個樣子：2026-09-20 那份上櫃只有 543/891。
+#:
+#: 慢那 0.1~0.7 分鐘換回三分之一個市場。排程整趟原本 2.4 分鐘，完全付得起。
+#:
+#: 為什麼不是「加大併發、失敗再重試」：失敗是**立刻**回來的（空的 DataFrame
+#: 不用等 timeout），所以跑得越快、失敗越多、看起來越快——8 workers 那一趟
+#: 1.0 分鐘跑完，正是因為它有 369 檔根本沒問到。
+DEFAULT_WORKERS = 4
+
 #: 這支程式版本號。出現在 Excel 抬頭、HTML 標題與 CLI 的 `--version`。
 VERSION = 'V3.1'
 
@@ -1007,7 +1028,7 @@ def run(
     output_dir: str,
     *,
     limit: int = 0,
-    workers: int = 8,
+    workers: int = DEFAULT_WORKERS,
     period: str = '2y',
     make_excel: bool = True,
     excel_charts: bool = True,
@@ -1106,18 +1127,38 @@ def run(
                                  session=_YF_SESSION)
             except Exception:
                 df = None
-            if df is None or len(df) < 65:
-                # 備援：某些環境下自訂 session 反而會失敗，改用預設連線再試一次
+            if df is None or len(df) == 0:
+                # 備援：某些環境下自訂 session 反而會失敗，改用預設連線再試一次。
+                #
+                # 條件是「一根都沒有」，不是「不到 65 根」。新上市的股票真的只有
+                # 十幾根，對它再問一次不會多出什麼——只是多送一個請求，而請求數
+                # 正是這支程式現在最稀缺的東西（見 `workers` 的說明）。
                 try:
                     df = yf.download(ticker, period=period, interval='1d',
                                      auto_adjust=True, progress=False, threads=False)
                 except Exception:
                     df = None
-            if df is None:
-                # 兩次都沒拿到。這**不是**「這檔今天沒過篩」，是「這檔沒問到」，
-                # 而那兩件事在上一版長得一模一樣（都是 return None、都不記帳）。
-                # 記在 SCREEN_ERRORS 裡，讓 __main__ 的
-                # `errors <= universe * 0.10` 那一半真的擋得住東西。
+            # ⚠️ **抓不到的時候，`yf.download` 回的是一個「空的 DataFrame」，
+            # 不是 None。** 實測：`yf.download('9999.TWO', ...)` 回的型別是
+            # DataFrame、`is None` 為 False、`len()` 為 0。
+            #
+            # 這一行的順序因此決定了一切。上一版是先問 `df is None`（永遠為假）
+            # 再問 `len(df) < 65`（0 < 65 為真），於是**每一檔沒抓到的股票都被
+            # 記成「新上市，歷史不足」**。而健康門檻會把 `too_short` 從分母裡
+            # 扣掉：
+            #
+            #     scannable = universe - too_short   # 1,988 − 350 = 1,638
+            #     ok_ratio  = scanned / scannable    # 1,638 / 1,638 = 100%
+            #
+            # 失敗的那幾百檔自己把分母扣掉了，比例永遠是 100%，門檻永遠綠燈。
+            # 實際的後果：2026-09-20 那份報告只有 543/891 檔上櫃（60.9%），
+            # 而它照常發布，沒有任何一個字說少了三分之一。
+            #
+            # 所以這裡先問「有沒有東西」，再問「東西夠不夠」。0 根是沒問到，
+            # 1~64 根才是新上市。
+            if df is None or len(df) == 0:
+                # 這**不是**「這檔今天沒過篩」，是「這檔沒問到」，而那兩件事在
+                # 更早的版本長得一模一樣（都是 return None、都不記帳）。
                 with _err_lock:
                     SCREEN_ERRORS['DownloadFailed'] += 1
                     if len(SCREEN_ERROR_SAMPLES) < 5:
@@ -1127,6 +1168,8 @@ def run(
                 # 拿到了，只是歷史不夠算 60MA（新上市）。這是正常的，每天都有
                 # 幾檔，**不可以**算成失敗——算成失敗的話，掛牌潮那幾週會誤觸
                 # 門檻，而誤觸一次之後就沒有人再相信那個門檻了。
+                #
+                # 修好記帳之後這個數字回到它真正的大小：全市場實測 2~4 檔。
                 with _scan_lock:
                     _too_short[0] += 1
                 return None

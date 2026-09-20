@@ -28,7 +28,6 @@
 """
 
 import pandas as pd
-import pytest
 
 import tw_trend_filter.pipeline as pl
 from tw_trend_filter.__main__ import main
@@ -251,3 +250,143 @@ def test_摘要要寫出_healthy_和拆解過的數字(tmp_path, monkeypatch):
 # 所以 parametrize 可以用。隔壁的 tw-six-metrics **不行**——那邊的
 # `scripts/run_tests.py` 是自製 runner，只收「零參數的 test_ 函式」，
 # parametrize 的那一個會以 TypeError 收場，而那個錯誤看起來像測試寫壞了。
+
+
+# ---------------------------------------------------------------------------
+# 抓不到的時候，yfinance 回的是**空的 DataFrame**，不是 None
+#
+# 上面那幾條都用「丟例外」模擬下載失敗，而真實世界的失敗**不長那個樣子**：
+# `yf.download('9999.TWO', ...)` 回的是一個型別為 DataFrame、`is None` 為 False、
+# `len()` 為 0 的東西。實測確認過。
+#
+# 於是 `screen_stock` 的判斷順序決定了一切。曾經是先問 `df is None`（永遠為假）
+# 再問 `len(df) < 65`（0 < 65 為真），所以**每一檔沒抓到的股票都被記成「新上市」**
+# ——而健康門檻會把 too_short 從分母裡扣掉，比例於是永遠是 100%。
+#
+# 生產環境的結果：2026-09-20 的報告只有 543/891 檔上櫃（60.9%），照常發布。
+
+
+def _empty_frame():
+    """yfinance 抓不到的時候真正回的東西。"""
+    return pd.DataFrame()
+
+
+def test_空的回應要記成下載失敗不是新上市(tmp_path):
+    """這一條是整個修正的重點。
+
+    `errors` 會讓門檻變紅，`too_short` 會把分母縮小讓門檻變綠——記錯一格，
+    同一份壞掉的資料從「擋下來」變成「照常發布」。
+    """
+    good = _good_frame(150)
+
+    def mixed(ticker, *a, **k):
+        return _empty_frame() if str(ticker).startswith('88') else good.copy()
+
+    r = _run_with(tmp_path, ['1101', '1102', '8801', '8802', '8803'], mixed)
+    assert r['too_short'] == 0, (
+        f"空的回應被記成「新上市」{r['too_short']} 檔。那會被從分母裡扣掉，"
+        '於是掃到的比例永遠是 100%，門檻永遠綠燈。'
+    )
+    assert r['errors'] == 3, f"errors={r['errors']}，三檔空的沒有被記成失敗"
+    assert r['error_kinds'].get('DownloadFailed') == 3
+    assert r['scanned'] == 2
+
+
+def test_大量空的回應會讓門檻變紅(tmp_path, monkeypatch):
+    """記帳修好之後，門檻要真的擋得住。
+
+    比例：五檔裡三檔空的 → scanned 2 / scannable 5 = 40%，遠低於 90%。
+    """
+    good = _good_frame(150)
+
+    def mixed(ticker, *a, **k):
+        return _empty_frame() if str(ticker).startswith('88') else good.copy()
+
+    code = _main_with(tmp_path, ['1101', '1102', '8801', '8802', '8803'],
+                      mixed, monkeypatch)
+    assert code == 2, (
+        '三分之二的股票沒抓到，門檻卻說健康。下一步就是 force push 蓋掉昨天。'
+    )
+
+
+def test_真的新上市仍然不算失敗(tmp_path):
+    """不要修過頭：1~64 根是新上市，0 根才是沒問到。
+
+    兩者都「不足 65 根」，但一個是市場的事實，一個是我們的失敗。
+    """
+    short, full = _good_frame(30), _good_frame(150)
+
+    def mixed(ticker, *a, **k):
+        return short.copy() if str(ticker).startswith('99') else full.copy()
+
+    r = _run_with(tmp_path, ['1101', '1102', '9901'], mixed)
+    assert r['too_short'] == 1 and r['errors'] == 0, (
+        f"too_short={r['too_short']} errors={r['errors']}：新上市被算成失敗了"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 分母的底線
+
+
+def test_涵蓋率底線擋得住分母被帶走(tmp_path, monkeypatch):
+    """就算有人又把某一種失敗記進 too_short，也不能整份發布出去。
+
+    `ok_ratio` 是「該掃的裡面掃到幾成」，而 too_short 會縮小分母——只要失敗
+    被誤記成 too_short，這個比例就會自己變成 100%。所以再加一條不看分母的
+    底線：掃到的對**整個母體**至少要有八成。
+
+    這裡用 200 檔（真的在掃全市場的規模），其中 100 檔只有 30 根。
+    `ok_ratio` 是 100/100 ＝ 100%，但 coverage 只有 50%。
+    """
+    short, full = _good_frame(30), _good_frame(150)
+    universe = [str(1000 + i) for i in range(100)] + [str(9000 + i) for i in range(100)]
+
+    def mixed(ticker, *a, **k):
+        return short.copy() if str(ticker).startswith('9') else full.copy()
+
+    code = _main_with(tmp_path, universe, mixed, monkeypatch)
+    assert code == 2, (
+        '一半的母體沒有進到報告裡，門檻卻說健康——because ok_ratio 的分母'
+        '已經被那一半自己帶走了'
+    )
+
+
+def test_煙霧測試的小母體不受底線影響(tmp_path, monkeypatch):
+    """`--limit 10` 那種跑法母體只有十檔，兩三檔太新就跌破八成。
+
+    而那一趟要證明的是「整條路走不走得通」，不是「今天蓋到多少市場」。
+    門檻誤觸一次就沒有人再相信它。
+    """
+    short, full = _good_frame(30), _good_frame(150)
+    universe = ['1101', '1102', '1103', '1104', '1105', '1106',
+                '9901', '9902', '9903', '9904']
+
+    def mixed(ticker, *a, **k):
+        return short.copy() if str(ticker).startswith('99') else full.copy()
+
+    assert _main_with(tmp_path, universe, mixed, monkeypatch) == 0
+
+
+# ---------------------------------------------------------------------------
+# 併發
+
+
+def test_預設併發是四不是八():
+    """8 workers 會被 Yahoo 靜靜地擋掉三分之一，而且**沒有比較快**。
+
+    全市場 1,979 檔、同一台機器實測：
+
+        8 workers   1.0～1.6 分   成功 1,276～1,607（64.5%～81.2%）
+        4 workers   1.7 分        成功 1,975（99.8%）
+
+    8 那一趟之所以看起來快，正是因為它有幾百檔根本沒問到——空的回應是**立刻**
+    回來的，不用等 timeout。跑得越快、失敗越多、看起來越快。
+    """
+    import inspect
+
+    assert pl.DEFAULT_WORKERS == 4, (
+        f'預設併發變成 {pl.DEFAULT_WORKERS} 了。調高之前先量涵蓋率：'
+        '失敗不會報錯，只會讓上櫃從名單上消失。'
+    )
+    assert inspect.signature(pl.run).parameters['workers'].default == pl.DEFAULT_WORKERS

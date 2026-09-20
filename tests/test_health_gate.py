@@ -59,8 +59,11 @@ def _run_with(tmp_path, universe, download):
             {c: '測試業' for c in universe},
         )
         pl.yf.download = download
+        # `retry_rounds=()`：這幾條測試的下載函式是**故意**丟例外的，而補問
+        # 對「故意壞掉」沒有意義，只會讓每一條多等 135 秒。補問本身由
+        # tests/test_retry.py 守。
         return pl.run(str(tmp_path), make_excel=False, workers=2,
-                      open_when_done=False, plotly_cdn=False)
+                      retry_rounds=(), open_when_done=False, plotly_cdn=False)
     finally:
         pl.load_tw_stock_universe = orig_universe
         pl.yf.download = orig_download
@@ -80,7 +83,7 @@ def _main_with(tmp_path, universe, download, monkeypatch):
     ))
     monkeypatch.setattr(pl.yf, 'download', download)
     return main(['--output-dir', str(tmp_path), '--no-excel',
-                 '--workers', '2', '--offline-plotly'])
+                 '--workers', '2', '--offline-plotly', '--no-retry'])
 
 
 # ---------------------------------------------------------------------------

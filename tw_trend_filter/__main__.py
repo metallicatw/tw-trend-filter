@@ -13,6 +13,7 @@ import sys
 from .pipeline import (
     DEFAULT_RULES,
     DEFAULT_WORKERS,
+    RETRY_ROUNDS,
     VERSION,
     Rules,
     UniverseIncomplete,
@@ -57,6 +58,7 @@ def _run(args, rules):
         args.output_dir,
         limit=args.limit,
         workers=args.workers,
+        retry_rounds=() if args.no_retry else RETRY_ROUNDS,
         period=args.period,
         make_excel=not args.no_excel,
         excel_charts=not args.no_excel_charts,
@@ -90,6 +92,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument('--workers', type=int, default=DEFAULT_WORKERS,
                     help=f'同時抓幾檔（預設 {DEFAULT_WORKERS}；調高會被 Yahoo '
                          f'靜靜地擋掉一部分，見 pipeline.DEFAULT_WORKERS）')
+    # 補問。預設與理由都在 `pipeline.RETRY_ROUNDS`。
+    #
+    # 關掉它的場合只有一種：你在跑煙霧測試，而且不想為了幾檔注定拿不到的代號
+    # 等兩分鐘。排程**不要**關——那兩分鐘買的正是「同一天跑兩次得到同一份名單」。
+    ap.add_argument('--no-retry', action='store_true',
+                    help='沒問到的那幾檔不要隔一段時間補問（見 pipeline.RETRY_ROUNDS）')
     ap.add_argument('--period', default='2y',
                     help='每一檔下載多長的歷史（yfinance 的 period，預設 2y）')
     ap.add_argument('--chart-years', type=float, default=2.0,

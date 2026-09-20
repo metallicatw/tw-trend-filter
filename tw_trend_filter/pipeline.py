@@ -22,6 +22,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 import os, sys, json, datetime, platform, tempfile, subprocess as _sp
+import time as _time
 from dataclasses import dataclass, fields
 from html import escape
 from io import StringIO
@@ -90,6 +91,60 @@ PLOTLY_CDN_FALLBACK = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 #: 不用等 timeout），所以跑得越快、失敗越多、看起來越快——8 workers 那一趟
 #: 1.0 分鐘跑完，正是因為它有 369 檔根本沒問到。
 DEFAULT_WORKERS = 4
+
+#: 沒問到的那幾檔，隔一段時間再問一次：``((等幾秒, 用幾條連線), …)``。
+#:
+#: ## 為什麼立刻重試沒有用
+#:
+#: 原本的重試是**當場**再送一次（換一條 session）。那對「這一次的連線壞掉」
+#: 有效，對限流完全無效——Yahoo 的限流是**按時間窗**算的，當場再問一次得到的
+#: 是同一句 `Too Many Requests`。2026-09-20 那一份的 log 就是這樣：162 檔全部
+#: 「兩次下載都沒拿到資料」，而 yfinance 自己印的那幾百行裡寫的是
+#: `YFRateLimitError('Too Many Requests. Rate limited. Try after a while.')`
+#: ——它連該怎麼辦都寫在句子裡了（try after a while），只是沒有人照做。
+#:
+#: ## 為什麼這解釋了「兩次跑差很多」
+#:
+#: 限流是**每個 IP**的，而 GitHub runner 的出口 IP 是和別人共用的。所以每一次
+#: 跑被擋掉的是隨機的一批，十分鐘後再跑又是另一批——使用者看到的就是「同樣的
+#: 資料、同樣的門檻，篩出來的檔數差很多」。補問把那一批救回來，兩次跑才會一致。
+#:
+#: 45 秒與 90 秒是留給時間窗過去用的，連線數降到 2 再降到 1 是為了不要在剛解除
+#: 限流的當下又立刻撞上去。只有真的有檔數沒問到才會等——全部順利的日子，這整段
+#: 的成本是零。
+RETRY_ROUNDS = ((45, 2), (90, 1))
+
+#: Yahoo 的限流長什麼樣。型別名（`YFRateLimitError`）和訊息都會變，所以兩種都認。
+_RATE_LIMIT_MARKS = ('ratelimit', 'too many requests', '429')
+
+
+#: 「問到了，但那個代號就是沒有資料」。這一句和「出了例外」要分得開。
+NO_DATA = '兩次下載都回空的'
+
+
+def _is_rate_limited(why: str) -> bool:
+    """這一則失敗訊息是不是「被限流」。
+
+    分得出來才知道該不該重跑：限流是我們這邊的問題（等一下就好），
+    而「這個代號沒有資料」是常態，重跑一百次也一樣。
+    """
+    w = (why or '').lower()
+    return any(m in w for m in _RATE_LIMIT_MARKS)
+
+
+def _worth_retry(why: str) -> bool:
+    """這一檔值不值得等一下再問一次。
+
+    值得的是**出過例外**的：限流（等時間窗過去）、連線被中斷、DNS 抽風。
+    不值得的是 Yahoo 好好地回了一份空表——那代表這個代號沒有資料（下市、
+    剛掛牌還沒報價、代號打錯），等多久都一樣。
+
+    這個分界同時決定了「要不要付那 135 秒」。全市場每天都有幾十檔是沒有資料
+    的正常代號，如果連它們也等，那就變成每天無條件多花兩分鐘去問一批注定
+    拿不到的東西。
+    """
+    return bool(why) and why != NO_DATA
+
 
 #: 這支程式版本號。出現在 Excel 抬頭、HTML 標題與 CLI 的 `--version`。
 VERSION = 'V3.1'
@@ -1029,6 +1084,7 @@ def run(
     *,
     limit: int = 0,
     workers: int = DEFAULT_WORKERS,
+    retry_rounds: tuple = RETRY_ROUNDS,
     period: str = '2y',
     make_excel: bool = True,
     excel_charts: bool = True,
@@ -1105,6 +1161,9 @@ def run(
     _scanned = [0]
     _too_short = [0]
     _scan_lock = _threading.Lock()
+    #: 這一輪沒問到的：``{ticker: 為什麼}``。補問成功就從這裡拿掉，
+    #: 全部補完才結算進 SCREEN_ERRORS（見 `_settle_failures`）。
+    _failed: dict[str, str] = {}
     # 每一檔的指標快照（**包含今天沒過篩的**）。網頁上的即時重篩讀這一份。
     SNAPSHOTS: list[dict] = []
     _snap_lock = _threading.Lock()
@@ -1119,25 +1178,37 @@ def run(
     CHARTS: dict[str, dict] = {}
     _chart_lock = _threading.Lock()
 
-    def screen_stock(ticker):
-        try:
+    def _download(ticker):
+        """下載一檔，回 ``(df, why)``。``why`` 只在拿不到東西的時候才有意義。
+
+        兩次嘗試：先用自訂 session（curl_cffi 模擬 Chrome 的 TLS 指紋），不行
+        再用預設連線——某些環境下自訂 session 反而會失敗。
+
+        條件是「一根都沒有」，不是「不到 65 根」。新上市的股票真的只有十幾根，
+        對它再問一次不會多出什麼，只是多送一個請求，而請求數正是這支程式最稀缺
+        的東西（見 `workers` 的說明）。
+
+        **`why` 要留著。** 上一版這裡把例外整個吞掉，樣本一律印「兩次下載都沒
+        拿到資料」——而那句話對「Yahoo 限流」和「這個代號不存在」是同一句。
+        2026-09-20 那天 162 檔沒掃到，log 裡真正的原因
+        （`YFRateLimitError('Too Many Requests')`）只出現在 yfinance 自己印的
+        那幾行裡，和摘要完全對不起來。
+        """
+        last = ''
+        for kw in ({'session': _YF_SESSION}, {}):
             try:
                 df = yf.download(ticker, period=period, interval='1d',
-                                 auto_adjust=True, progress=False, threads=False,
-                                 session=_YF_SESSION)
-            except Exception:
+                                 auto_adjust=True, progress=False, threads=False, **kw)
+            except Exception as e:                      # noqa: BLE001
+                last = f'{type(e).__name__}: {e}'
                 df = None
-            if df is None or len(df) == 0:
-                # 備援：某些環境下自訂 session 反而會失敗，改用預設連線再試一次。
-                #
-                # 條件是「一根都沒有」，不是「不到 65 根」。新上市的股票真的只有
-                # 十幾根，對它再問一次不會多出什麼——只是多送一個請求，而請求數
-                # 正是這支程式現在最稀缺的東西（見 `workers` 的說明）。
-                try:
-                    df = yf.download(ticker, period=period, interval='1d',
-                                     auto_adjust=True, progress=False, threads=False)
-                except Exception:
-                    df = None
+            if df is not None and len(df):
+                return df, ''
+        return df, (last or NO_DATA)
+
+    def screen_stock(ticker):
+        try:
+            df, why = _download(ticker)
             # ⚠️ **抓不到的時候，`yf.download` 回的是一個「空的 DataFrame」，
             # 不是 None。** 實測：`yf.download('9999.TWO', ...)` 回的型別是
             # DataFrame、`is None` 為 False、`len()` 為 0。
@@ -1159,10 +1230,12 @@ def run(
             if df is None or len(df) == 0:
                 # 這**不是**「這檔今天沒過篩」，是「這檔沒問到」，而那兩件事在
                 # 更早的版本長得一模一樣（都是 return None、都不記帳）。
+                #
+                # 記在 `_failed` 而不是直接加進 SCREEN_ERRORS：多數「沒問到」
+                # 是限流，而限流是**會過去的**——等一下再問一次多半就拿到了。
+                # 這一輪先記名字，補問完才結算（見 `_settle_failures`）。
                 with _err_lock:
-                    SCREEN_ERRORS['DownloadFailed'] += 1
-                    if len(SCREEN_ERROR_SAMPLES) < 5:
-                        SCREEN_ERROR_SAMPLES.append(f'{ticker}: 兩次下載都沒拿到資料')
+                    _failed[ticker] = why
                 return None
             if len(df) < 65:
                 # 拿到了，只是歷史不夠算 60MA（新上市）。這是正常的，每天都有
@@ -1346,6 +1419,25 @@ def run(
                     SCREEN_ERROR_SAMPLES.append(f'{ticker}: {type(e).__name__}: {e}')
             return None
 
+    def _settle_failures():
+        """補問都跑完之後，把還沒問到的結算進 SCREEN_ERRORS。
+
+        分兩類，因為它們該做的事完全不一樣：
+
+        * ``RateLimited``——Yahoo 說「Too Many Requests」。這是**我們這邊**的
+          問題（或者更常見：GitHub runner 的出口 IP 被別人打爆了），股票本身
+          好好的。數字大就代表這一份報告是在殘缺的母體上篩出來的。
+        * ``DownloadFailed``——問到了，但那個代號就是沒有資料。下市、剛掛牌
+          還沒有報價、代號打錯。這是常態，每天都有幾檔。
+
+        混在一起的時候，「162 檔沒掃到」這句話沒辦法回答「要不要重跑」。
+        """
+        for tk, why in sorted(_failed.items()):
+            kind = 'RateLimited' if _is_rate_limited(why) else 'DownloadFailed'
+            SCREEN_ERRORS[kind] += 1
+            if len(SCREEN_ERROR_SAMPLES) < 5:
+                SCREEN_ERROR_SAMPLES.append(f'{tk}: {why}')
+
     # ===============================================================
     # 4. 高質感 K 線 + 量能圖
     # ===============================================================
@@ -1522,6 +1614,39 @@ def run(
     with ThreadPoolExecutor(max_workers=workers) as executor:
         list(executor.map(_screen_and_collect, enumerate(TICKERS)))
 
+    # ── 沒問到的那幾檔，隔一段時間再問一次 ─────────────────────
+    #
+    # 這一段是「兩次跑差很多」那個症狀的解法。細節寫在 RETRY_ROUNDS 上面：
+    # 限流是按時間窗、按 IP 算的，所以當場重試沒有用，隔一下再問多半就拿到了。
+    # 沒有東西要補的日子，這整段是一個 `if not _failed: break`。
+    def _retry_one(ticker):
+        # 先從名單上拿掉。再失敗的話 screen_stock 會自己再記一次（連同新的
+        # 原因）——留著舊的那筆會讓「這次是為什麼失敗」停在第一次的答案上。
+        with _err_lock:
+            _failed.pop(ticker, None)
+        r = screen_stock(ticker)
+        with _lock:
+            if r:
+                RESULTS.append(r)
+                print(f"✅ {r['code']:>4s} {r['name']:<8s} "
+                      f"收:{r['close']:>7.2f} 量比:{r['vol_ratio']:.2f}x │ {r['trigger']}"
+                      f"  ←補問")
+
+    for wait, rw in (retry_rounds or ()):
+        todo = sorted(tk for tk, why in _failed.items() if _worth_retry(why))
+        if not todo:
+            break
+        limited = sum(1 for tk in todo if _is_rate_limited(_failed[tk]))
+        print(f'⏳ 有 {len(todo)} 檔出了例外沒問到（其中 {limited} 檔是被限流）。'
+              f'等 {wait} 秒，再用 {rw} 條連線補問一次…')
+        _time.sleep(wait)
+        before = len(_failed)
+        with ThreadPoolExecutor(max_workers=rw) as executor:
+            list(executor.map(_retry_one, todo))
+        print(f'   補回 {before - len(_failed)} 檔，還差 {len(_failed)} 檔')
+
+    _settle_failures()
+
     # 排序要有 tiebreaker。RESULTS 是 ThreadPool 的**完成順序**append 的，
     # 所以量比相同的兩檔在兩次跑之間會換位置——同樣的資料產出不一樣的 HTML
     # 與 Excel。加上代號當第二鍵，輸出就可重現。
@@ -1540,6 +1665,13 @@ def run(
             print(f'     {name:<28} {n:>5} 檔')
         for s in SCREEN_ERROR_SAMPLES:
             print(f'     例：{s}')
+        if SCREEN_ERRORS.get('RateLimited'):
+            # 這一行是寫給「為什麼兩次跑差很多」那個問題看的。
+            # RateLimited 不是「這幾檔有問題」，是「今天的篩選母體少了這幾檔」
+            # ——而少掉的是隨機的一批，所以下一次跑會得到不一樣的名單。
+            print(f'     ↑ 其中 {SCREEN_ERRORS["RateLimited"]} 檔連補問都還被 Yahoo'
+                  ' 限流（限流是按 IP 算的，而 runner 的出口 IP 和別人共用）。'
+                  '這幾檔沒有進入今天的篩選母體。')
     print('='*60)
 
     # ===============================================================
@@ -1992,6 +2124,9 @@ def run(
         'errors': errors,
         'too_short': _too_short[0],
         'error_kinds': dict(SCREEN_ERRORS),
+        # 前五筆失敗的**原文**。只有型別統計的話，「162 檔 DownloadFailed」
+        # 這句話沒辦法回答「是限流還是查無此股」——而那兩個的處置完全不同。
+        'error_samples': list(SCREEN_ERROR_SAMPLES),
         'date': today_str,
         'xlsx': OUTPUT_FILE,
         'html': html_path or '',

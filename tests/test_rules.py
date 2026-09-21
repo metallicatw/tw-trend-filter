@@ -237,8 +237,14 @@ def test_預設門檻讓這檔合成股通過(tmp_path):
 
 
 def test_量比門檻拉高就擋下來(tmp_path):
-    """合成的量比是 900,000 / 615,000 ≈ 1.46。門檻 1.5 就該擋住。"""
-    assert _run_with(Rules(vol_ratio=1.5), tmp_path) == 0
+    """合成的量比是 900,000 / 600,000 ＝ 1.50。門檻 1.6 就該擋住。
+
+    ⚠️ 分母是 **600,000 不是 615,000**：量比的分母排除當天。以前是
+    `rolling(20).mean()`（含當天），那會把今天自己的量灌進自己的基準，
+    於是「門檻 1.2」實際生效的是 1.213 倍。詳見 `screen_stock` 裡
+    `vol20_base` 那一段。
+    """
+    assert _run_with(Rules(vol_ratio=1.6), tmp_path) == 0
     assert _run_with(Rules(vol_ratio=1.4), tmp_path) == 1
 
 

@@ -184,6 +184,10 @@ RATE_LIMIT_STREAK = 5
 #: 第一次踩煞車停多久（秒）。
 RATE_LIMIT_COOLDOWN = 60.0
 
+#: 整趟總共最多停這麼久（秒）。job 的 timeout 是 90 分鐘，而下載本身要跑三十
+#: 分鐘上下——15 分鐘的等待預算是「還有餘裕跑完」和「等得夠久值得等」之間的位置。
+RATE_LIMIT_TOTAL_BUDGET = 900.0
+
 #: 停到最久不超過這麼久（秒）。連踩連停會翻倍，但封頂在這裡——再久下去，
 #: 整趟篩選就會超過排程給的時間，而「跑不完」和「被擋掉」一樣是沒有報告。
 RATE_LIMIT_MAX_COOLDOWN = 240.0
@@ -228,11 +232,13 @@ class RateLimitBreaker:
     def __init__(self, streak: int = RATE_LIMIT_STREAK,
                  cooldown: float = RATE_LIMIT_COOLDOWN,
                  max_cooldown: float = RATE_LIMIT_MAX_COOLDOWN,
+                 max_total_sleep: float = RATE_LIMIT_TOTAL_BUDGET,
                  sleep=None, clock=None):
         import threading as _threading
         self.streak_limit = streak
         self.cooldown = cooldown
         self.max_cooldown = max_cooldown
+        self.max_total_sleep = max_total_sleep
         self._sleep = sleep or _time.sleep
         self._clock = clock or _time.monotonic
         self._lock = _threading.Lock()
@@ -258,6 +264,13 @@ class RateLimitBreaker:
         if not _is_rate_limited(why):
             return
         with self._lock:
+            # **總預算。** 單次等待有封頂（240 秒），踩煞車的次數以前沒有。
+            # 1,900 檔在持續限流的日子最多可以踩約 380 次，而 job 的
+            # `timeout-minutes` 是 90——累積睡眠加上下載時間超過就會被取消，
+            # 於是沒有報告、也沒有 Excel release（那一步沒有 `always()`）。
+            # 「跑不完」和「被擋掉」的結果一樣，而煞車的設計目的正是避免後者。
+            if self.slept >= self.max_total_sleep:
+                return
             self._streak += 1
             if self._streak < self.streak_limit:
                 return
@@ -279,7 +292,13 @@ class RateLimitBreaker:
         with self._lock:
             if self._cool_until is None:
                 return 0.0
-            remain = self._cool_until - self._clock()
+            # 總預算也要擋在**真的睡下去**這一邊，不只擋在「要不要再踩」。
+            # 否則已經踩下去的那一次還是會把剩下的時間睡完。
+            if self.slept >= self.max_total_sleep:
+                self._cool_until = None
+                return 0.0
+            remain = min(self._cool_until - self._clock(),
+                         self.max_total_sleep - self.slept)
             if remain <= 0:
                 self._cool_until = None
                 return 0.0
@@ -916,7 +935,21 @@ def load_tw_stock_universe():
             mask = extracted['code'].notna()
             extracted = extracted[mask].copy()
             extracted['ticker'] = extracted['code'] + suffix
-            if len(extracted):
+            # **筆數要有下界。**
+            #
+            # 原本只問「有沒有解出東西」。那擋得住「整個交易所掛掉」（回空表 →
+            # 走 OpenAPI 備援），但擋不住「只回了一部分」——ISIN 那一頁回的是
+            # 一整張 HTML 表格，截斷成前 100 列一樣解得出來、一樣非空。
+            #
+            # 而那正是最糟的一種：母體從 1,988 縮成 100，於是健康門檻的分母
+            # 跟著縮，`coverage = scanned / universe` 永遠是 100%，整道門失效。
+            # 這和 `too_short` 把分母帶走那一次（見 `__main__` 的說明）是同一
+            # 種錯——**失敗把自己從分母裡拿掉**。
+            floor = UNIVERSE_FLOOR.get(suffix, 0)
+            if len(extracted) < floor:
+                print(f'   ⚠️ {suffix} 只解出 {len(extracted)} 檔（下界 {floor}）'
+                      '——當成沒拿到，改走備援。')
+            elif len(extracted):
                 all_rows.append(extracted)
                 got.add(suffix)
 
@@ -1347,6 +1380,16 @@ def compute_bollinger(close, period=20, k=2):
     return ma, up, dn, bw
 
 
+#: 每個交易所至少要解出幾檔，才算「這一份清單是完整的」。
+#:
+#: 實測 2026-09-21：上市 1,097 檔、上櫃 891 檔。下界取約七成——
+#: 它要擋的是「回了一份截斷的表格」，不是「今天少了幾檔下市股」。
+UNIVERSE_FLOOR = {'.TW': 800, '.TWO': 600}
+
+#: 六大與估值那一份最多可以是幾天前的。超過就當作沒有（見 `load_cross_feed`）。
+#: 正常落差是 1～3 天（含週末），連假最多 4 天。
+CROSS_MAX_AGE_DAYS = 5
+
 #: tw-six-metrics 發布的那一份，預設位置。
 CROSS_URL = 'https://metallicatw.github.io/tw-six-metrics/cross.json'
 
@@ -1385,8 +1428,31 @@ def load_cross_feed(url: str = '') -> dict:
               f'四部曲不受影響')
         return {}
     rows = payload.get('rows') or {}
+    as_of = str(payload.get('as_of') or '')
     print(f'✅ 六大與估值：{len(rows)} 檔　財報 {payload.get("quarter", "?")}'
-          f'　估值基準 {payload.get("as_of", "?")}')
+          f'　估值基準 {as_of or "?"}')
+
+    # **太舊就不要用。**
+    #
+    # 這一支 07:07 UTC 跑，對面的 Pages 在 07:41／08:47 才建站——所以每天抓到
+    # 的必然是**昨天**那一份。那是可接受的（目標價與下檔價和股價無關，一天不會
+    # 變多少），但「昨天」和「上個月」之間沒有任何一道門：對面連續幾天沒發布，
+    # 這邊照抓照用，沒有一個字會變紅。
+    #
+    # 而 `reward_risk()` 的整段說明在論證「報酬風險比要用**今天**的股價算」。
+    # 用一份兩週前的目標價去算，算出來的東西看起來和平常一模一樣。
+    #
+    # 5 個日曆天：含週末的正常落差是 1～3 天，連假最多 4 天。
+    if as_of:
+        try:
+            age = (_taipei_now().date()
+                   - datetime.date.fromisoformat(as_of[:10])).days
+        except ValueError:
+            age = None
+        if age is not None and age > CROSS_MAX_AGE_DAYS:
+            print(f'::warning::六大與估值那一份是 {as_of} 的，已經 {age} 天沒更新'
+                  f'（上限 {CROSS_MAX_AGE_DAYS} 天）——這一趟不拿它算報酬風險比。')
+            return {}
     return payload
 
 
@@ -1623,9 +1689,37 @@ def run(
             ma20 = close.rolling(20).mean()
             ma60 = close.rolling(60).mean()
             boll_ma, boll_up, boll_dn, bw = compute_bollinger(close)
-            donchian = close.rolling(20).max().shift(1)
+            # 前 20 日的**最高價**，不是收盤最高。
+            #
+            # README 與報告上的觸發訊號都寫「突破前 20 日最高價（Donchian）」，
+            # 而程式原本用的是 `close.rolling(20).max()`。用收盤比較容易成立
+            # （收盤最高 ≤ 最高價最高），40 檔實測有 1 檔（2.5%）的判定會翻掉
+            # ——也就是約 2.5% 的標的是因為一個比文件寬鬆的條件進名單的。
+            #
+            # `shift(1)` 本身是對的：窗口是 −21…−2，不含今天。
+            donchian = df['High'].rolling(20).max().shift(1)
             atr_val = float(compute_atr(df).iloc[-1])
-            vol_ratio = float(volume.iloc[-1]) / vol20 if vol20 else 0.0
+            # 量比的分母**排除當天**。
+            #
+            # 原本是拿 `vol20`（含當天的 20 日均量）去除，而那會把今天自己的量
+            # 灌進自己的基準：前 19 日各 1000 股、今天 1200 股（真實量比 1.20）
+            #
+            #     rolling(20).mean() 含今天 = 1010.0
+            #     量比（含）= 1.1881   ← 被第四關刷掉
+            #     量比（排除）= 1.2000 ← README 說的那個定義，剛好通過
+            #
+            # 解 `20V/(V+19a) = 1.2` → V = 1.2128a，也就是實際生效的門檻是
+            # **1.213 倍**而不是 1.2。偏差是系統性的、只往「更嚴」一個方向，
+            # 而且剛好落在門檻附近——1.20~1.213 那一段每天被無聲刷掉；
+            # 報告上印的量比也偏低，和券商軟體對不起來。
+            #
+            # 同一個檔案裡 `_looks_like_stub` 用的就是排除當天的定義
+            # （`iloc[-21:-1]`），兩種並存。統一成排除當天這一個。
+            #
+            # 實測 40 檔（資料截到 2026-09-18）：中位數 1.286 → 1.321，
+            # 第四關的判定翻轉 0 檔——這不是換一組門檻，是把同一個門檻算對。
+            vol20_base = float(volume.iloc[-21:-1].mean()) if len(volume) >= 21 else vol20
+            vol_ratio = float(volume.iloc[-1]) / vol20_base if vol20_base else 0.0
 
             # 最近一次黃金交叉是幾天前（1 = 昨天收盤那一根），找不到就 -1。
             # 存「幾天前」而不是「有沒有」，是因為回看天數是可調的：存布林值就
@@ -2510,11 +2604,42 @@ def run(
             except Exception as e:
                 print(f'⚠️ 自動開啟失敗（{target}）：{e}')
 
+    # ── 全市場快照存檔 ────────────────────────────────────────
+    #
+    # 這支程式幾乎不留歷史：報告推到一條只有一個 commit 的孤兒分支、圖表資料
+    # 由 Pages 覆蓋式發布、Excel 三個分頁都只裝**通過篩選**的那幾檔。於是
+    # 1,900 檔的指標（量比、卡在哪一關、布林寬、六大、報酬風險比）只活在當天
+    # 那份 index.html 裡，隔天被蓋掉。
+    #
+    # 代價是「9/15 那天 2454 的量比是多少、卡在哪一關」隔天就永遠答不出來
+    # ——回測與「為什麼這檔沒進名單」都無從查起。而那份資料在這裡已經算好了。
+    #
+    # 1,900 列 × 24 欄，gzip 之後約 150 KB。`daily.yml` 把它掛進當天的
+    # Excel release（不進 git，Releases 不過期）。
+    snap_path = ''
+    if SNAPSHOTS:
+        import gzip as _gzip
+        stamp = (f'{_asof[0]:%Y-%m-%d}' if _asof[0] is not None else today_str)
+        snap_path = os.path.join(output_dir, f'snapshot_{stamp}.json.gz')
+        with _gzip.open(snap_path, 'wt', encoding='utf-8') as fh:
+            json.dump({
+                'asof': stamp,
+                'generated_at': now.isoformat(),
+                'version': VERSION,
+                'rules': {f.name: getattr(rules, f.name) for f in fields(rules)},
+                'columns': list(SNAPSHOT_COLUMNS),
+                'rows': [snapshot_row(s) for s in
+                         sorted(SNAPSHOTS, key=lambda x: x['code'])],
+            }, fh, ensure_ascii=False, separators=(',', ':'))
+        print(f'🗄️ 全市場快照：{snap_path}'
+              f'（{len(SNAPSHOTS)} 檔，{os.path.getsize(snap_path) / 1024:.0f} KB）')
+
     print()
     print('=' * 60)
     print(f'  篩選完成！通過 {len(RESULTS)} 檔，產出在 {output_dir}')
     print('=' * 60)
     return {
+        'snapshot_file': snap_path,
         'results': RESULTS,
         'count': len(RESULTS),
         # `scanned` 原本回 len(TICKERS)——那是母體大小，不是真的掃到幾檔。
@@ -2870,7 +2995,9 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
             ? '<div class="nb-cross"><span title="六大財務指標最新綜合評分">六大 ' +
               (row[C.six] === null || row[C.six] === undefined
                 ? '—' : row[C.six].toFixed(2)) +
-              '</span><span title="報酬風險比（無風險 ＝ 股價已低於下檔價；空頭 ＝ 預期報酬為負）">' +
+              '</span><span title="報酬風險比（無風險 ＝ 股價已低於下檔價；空頭 ＝ 預期報酬為負）'
+              + (TF_CROSS_AS_OF.as_of ? '。估值基準 ' + TF_CROSS_AS_OF.as_of
+                 + '，財報 ' + (TF_CROSS_AS_OF.quarter || '?') : '') + '">' +
               '報酬/風險 ' + tfRrText(row) + '</span></div>'
             : '') +
           (shortWhy
@@ -3667,6 +3794,16 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
     if not data_dir:
         extra_list = []
     else:
+        # 先清空。
+        #
+        # 前端是「用代號直接組網址」（不需要一份索引，見下面的說明），所以
+        # 舊的檔案留著就是一顆定時炸彈：下市股票的 JSON 會一直在，點下去照樣
+        # 拿得到一份幾個月前的圖，而且沒有任何地方說它是舊的。
+        #
+        # GitHub runner 每次都是乾淨的，所以排程上看不到這件事——本機連跑、
+        # 或哪天換成自架 runner 就會看到。
+        import shutil as _shutil
+        _shutil.rmtree(data_dir, ignore_errors=True)
         os.makedirs(data_dir, exist_ok=True)
     written = 0
     series_map = {}
@@ -4742,5 +4879,7 @@ document.addEventListener('DOMContentLoaded', function() {
     return html_path
 
 
-if __name__ == '__main__':
-    main()
+# 正式入口是 `__main__.py`。這裡原本還留著一行 `main()`，而這個模組裡
+# 根本沒有 `main`——`python tw_trend_filter/pipeline.py` 會以
+# `NameError: name 'main' is not defined` 收場。那是從單機版移植時
+# 留下來的殘骸，而它看起來像一個有效的入口。

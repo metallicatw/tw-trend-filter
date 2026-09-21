@@ -14,6 +14,7 @@ from .pipeline import (
     DEFAULT_RULES,
     DEFAULT_WORKERS,
     RETRY_ROUNDS,
+    SNAPSHOT_DAYS,
     VERSION,
     Rules,
     UniverseIncomplete,
@@ -75,8 +76,30 @@ def _run(args, rules):
     )
 
 
+#: 指令打錯的結束碼。
+#:
+#: **不可以是 2。** 2 在這個 repo 有明確的意思——「跑完了但不可信」（母體不完整
+#: 或覆蓋率不足），而 `daily.yml` 看到 2 會印
+#:
+#:     ::warning::母體覆蓋率不足，這一趟不發布報告
+#:
+#: 然後 `exit 0`。argparse 的用法錯誤預設也回 2，於是手動觸發時把一個門檻打錯
+#: （`1.2 倍` 打成 `1.2倍`）的結果是：程式**根本沒跑**，摘要上卻寫「母體覆蓋率
+#: 不足」，job 綠燈，真正的錯誤訊息埋在 log 裡。
+EXIT_USAGE = 3
+
+
+class _Parser(argparse.ArgumentParser):
+    """用法錯誤回 `EXIT_USAGE`，不要和「跑完了但不可信」共用 2。"""
+
+    def exit(self, status=0, message=None):          # noqa: D102
+        if message:
+            self._print_message(message, sys.stderr)
+        raise SystemExit(EXIT_USAGE if status == 2 else status)
+
+
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(
+    ap = _Parser(
         prog='tw-trend-filter',
         description=f'台股順勢交易篩選系統 {VERSION}：全市場掃描，產出 Excel 與互動線圖。',
     )
@@ -163,6 +186,25 @@ def main(argv: list[str] | None = None) -> int:
                    help=f'停損 = 收盤 − 這個倍數 × ATR(14)（預設 {d.atr_stop:g}）')
 
     args = ap.parse_args(argv)
+
+    # ⚠️ **`--lookback` 不可以超過快照存了幾天。**
+    #
+    # `passes()` 裡有一行 `look = min(max(int(rules.lookback), 0), SNAPSHOT_DAYS)`
+    # ——超過就**安靜地夾住**。而 Excel 第一分頁會照使用者填的數字印：
+    #
+    #     --lookback 30
+    #     Excel：「過去 30 日內：月季線黃金交叉 或 布林頻寬壓縮 ≤ 12%」
+    #     摘要：「lookback 10→30」
+    #     引擎：只看 20 日
+    #
+    # 三份文件一致地說謊，而這正是這個 repo 反覆自我警告的那一種錯
+    # （`Rules` 的 docstring、`daily.yml` 的註解都拿 tw-six 的 `yearly_limit`
+    # 當前車之鑑）。網頁那個輸入框有 `max`，CLI 與 workflow input 沒有。
+    #
+    # 夾住改成擋下來：一個報告說 A、實際跑 B 的結果，比一個跑不起來的指令糟。
+    if args.lookback > SNAPSHOT_DAYS:
+        ap.error(f'--lookback 最多 {SNAPSHOT_DAYS}（快照只存這麼多天，'
+                 f'超過的部分引擎看不到，而 Excel 會照你填的數字印）')
 
     rules = Rules(
         min_price=args.min_price,
@@ -288,6 +330,7 @@ def main(argv: list[str] | None = None) -> int:
             # 以前全都印 `date`——讀者看到的是「今天的突破清單」，其實是昨天的。
             fh.write(f"asof={result.get('asof') or result['date']}\n")
             fh.write(f"xlsx={result['xlsx']}\n")
+            fh.write(f"snapshot={result.get('snapshot_file') or ''}\n")
             # 「今天只有 3 檔通過」和「今天有人把量比調到 3 倍」在摘要上不該
             # 長得一樣。改過就寫出改了什麼，沒改就寫 default。
             changed = result.get('rules_changed') or {}

@@ -151,8 +151,23 @@ jobs:
             "${flags[@]}"
           code=$?
           set -e
+          # 3 ＝ 指令打錯（argparse）。以前它也是 2，於是手動觸發時把一個門檻
+          # 打錯的結果是：程式根本沒跑，摘要上卻寫「母體覆蓋率不足」、job 綠燈。
+          if [ "$code" -eq 3 ]; then
+            echo "::error::指令的參數有問題，程式根本沒有跑起來（詳見上面的錯誤訊息）"
+            exit 1
+          fi
           if [ "$code" -eq 2 ]; then
+            # 排程：綠燈＋警告。上游抽風是常態，每次都紅會讓人開始忽略通知，
+            # 而網站會繼續顯示昨天那份好的。
+            #
+            # 手動觸發：**紅燈**。按下去的人就在看，而「我按了它卻什麼都沒換」
+            # 需要一個看得見的答案——一條黃字在 Actions 的清單上和成功長得一樣。
             echo "::warning::母體覆蓋率不足，這一趟不發布報告（Excel 仍然照常留存）"
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "::error::手動觸發的這一趟不可信，沒有發布任何東西"
+              exit 1
+            fi
             exit 0
           fi
           exit "$code"
@@ -185,15 +200,25 @@ jobs:
           set -euo pipefail
           tag="excel-${DAY:-$(date -u +%F)}"
           file=$(ls output/*.xlsx | head -1)
+          # 全市場快照也掛上去。Excel 三個分頁都只裝**通過篩選**的那幾檔，
+          # 而 1,900 檔的指標（量比、卡在哪一關、布林寬、六大、報酬風險比）
+          # 本來只活在當天那份 index.html 裡，隔天被 force push 蓋掉。
+          # 掛進 release 之後，「9/15 那天 2454 卡在哪一關」才答得出來。
+          # 約 150 KB，不進 git。
+          snap=$(ls output/snapshot_*.json.gz 2>/dev/null | head -1 || true)
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "release $tag 已經在，覆蓋附件"
             gh release upload "$tag" "$file" --clobber
+            [ -n "$snap" ] && gh release upload "$tag" "$snap" --clobber
           else
-            gh release create "$tag" "$file" \
+            # shellcheck disable=SC2086
+            gh release create "$tag" "$file" $snap \
               --title "Excel 報表 ${DAY}" \
               --notes "台股順勢交易篩選 ${DAY}：${COUNT} 檔通過。
 
-          這一份是當日的完整 Excel 報表（篩選總覽、指標明細、個股 K 線圖）。
+          這一份是當日的完整 Excel 報表（篩選總覽、指標明細、個股 K 線圖），
+          外加一份 snapshot_${DAY}.json.gz——**全市場**每一檔的指標快照
+          （不只通過的那幾檔），用來回答「那一天這檔卡在哪一關」。
           每個交易日一份，不會過期。"
           fi
           echo "  $(basename "$file") → $tag"

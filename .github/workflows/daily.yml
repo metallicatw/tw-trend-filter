@@ -177,7 +177,9 @@ jobs:
         if: hashFiles('output/*.xlsx') != ''
         env:
           GH_TOKEN: ${{ github.token }}
-          DAY: ${{ steps.screen.outputs.date }}
+          # 用**資料基準日**，不是跑的那一天：週末／盤中跑會砍到上一個
+          # 交易日，而 tag 上寫跑的日期會讓兩份不同日子的報表撞名。
+          DAY: ${{ steps.screen.outputs.asof || steps.screen.outputs.date }}
           COUNT: ${{ steps.screen.outputs.count }}
         run: |
           set -euo pipefail
@@ -242,8 +244,20 @@ jobs:
       # 而 `healthy` 本身怎麼算出來的，見 `__main__` 與 `pipeline.screen_stock`：
       # 這道門檻曾經有一段時間是完全沒有作用的，因為 `scanned` 數的是「跑完
       # 幾檔」而不是「真的掃到幾檔」。
+      #
+      # ⚠️ **安全帶改看 `publishable`，不是 `healthy`。**
+      # `healthy` 只回答「這一趟的資料可信嗎」，它對「這一趟是誰、為了什麼跑
+      # 的」一無所知，而這條分支覆蓋掉就沒有第二份。實測兩條會蓋掉正式報告的
+      # 路：
+      #
+      #   * 按 Run workflow 填 `limit=50`（上面 input 的說明就是教人這樣驗）
+      #     → universe 50 → 八成覆蓋率那條被關掉 → healthy=yes → 50 檔版上線。
+      #   * 手動改一組門檻試跑 → healthy=yes → 那份非預設的報告上線，而網站上
+      #     完全看不出它的門檻和平常不一樣。
+      #
+      # `publishable` 多問三件事：掃的是全市場、沒有 `--limit`、門檻是預設。
       - name: 發布報告到 report 分支
-        if: steps.screen.outputs.healthy == 'yes'
+        if: steps.screen.outputs.publishable == 'yes'
         run: |
           test -s index.html || { echo "::error::沒有產生 index.html"; exit 1; }
           cp index.html /tmp/report.html
@@ -253,7 +267,7 @@ jobs:
           git rm -rq --cached .
           cp /tmp/report.html index.html
           git add -f index.html
-          git commit -q -m "報告：${{ steps.screen.outputs.date }}（${{ steps.screen.outputs.count }} 檔通過）"
+          git commit -q -m "報告：${{ steps.screen.outputs.asof || steps.screen.outputs.date }}（${{ steps.screen.outputs.count }} 檔通過）"
           # force：這條分支本來就是「只有最新那一份」，不是歷史。
           git push -f origin report
 
@@ -280,7 +294,7 @@ jobs:
       #
       # 兩個站都在 metallicatw.github.io 之下，同源，沒有 CORS 問題。
       - name: 準備 Pages 內容
-        if: steps.screen.outputs.healthy == 'yes'
+        if: steps.screen.outputs.publishable == 'yes'
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -307,19 +321,19 @@ jobs:
       # `enablement: true`：第一次跑的時候順手把 Pages 打開（權限是上面那個
       # `pages: write`），省掉一次「去 Settings 按一下」而且沒有人記得要按。
       - uses: actions/configure-pages@v5
-        if: steps.screen.outputs.healthy == 'yes'
+        if: steps.screen.outputs.publishable == 'yes'
         continue-on-error: true
         with:
           enablement: true
 
       - uses: actions/upload-pages-artifact@v3
-        if: steps.screen.outputs.healthy == 'yes'
+        if: steps.screen.outputs.publishable == 'yes'
         continue-on-error: true
         with:
           path: pages
 
       - name: 發布 Pages
-        if: steps.screen.outputs.healthy == 'yes'
+        if: steps.screen.outputs.publishable == 'yes'
         continue-on-error: true
         id: pages
         uses: actions/deploy-pages@v4
@@ -337,6 +351,9 @@ jobs:
             echo "* 母體：${{ steps.screen.outputs.universe }} 檔（其中 ${{ steps.screen.outputs.too_short || 0 }} 檔新上市、歷史不足，算不了 60MA）"
             echo "* 真的掃到：${{ steps.screen.outputs.scanned }} 檔 ｜ 沒掃成：${{ steps.screen.outputs.errors || 0 }} 檔"
             echo "* 這一趟算不算數：**${{ steps.screen.outputs.healthy || '不明' }}**"
+            echo "* 可以發布嗎：**${{ steps.screen.outputs.publishable || '不明' }}**（full run＋預設門檻＋資料可信）"
+            echo "* 資料基準：**${{ steps.screen.outputs.asof || steps.screen.outputs.date }}**"
+            echo "* 記帳對得起來嗎：${{ steps.screen.outputs.balanced || '不明' }}（scanned＋errors＋too_short ＝ 母體）"
             echo "* 通過：**${{ steps.screen.outputs.count }}** 檔"
             # 「今天只有 3 檔通過」和「今天有人把量比調到 3 倍」不該長得一樣。
             echo "* 門檻：${{ steps.screen.outputs.rules || 'default' }}"

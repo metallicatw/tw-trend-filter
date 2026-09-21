@@ -233,10 +233,37 @@ def main(argv: list[str] | None = None) -> int:
     # 「今天蓋到多少市場」。門檻誤觸一次就沒有人再相信它，這一條也不例外。
     coverage  = (result['scanned'] / universe) if universe else 0.0
     full_run  = universe >= 100
+    # **記帳要對得起來。**
+    #
+    # `scanned + errors + too_short` 應該等於 `universe`。對不上，代表有一條
+    # 路沒有記帳或記了兩次——而那正是這個門檻唯一看不見的失敗方式：
+    # `screen_stock` 曾經在指標算完**之前**就記 scanned，於是 cross feed 的
+    # schema 一漂移，同一檔同時算進 scanned 和 errors，報告裡少掉 150 檔而
+    # coverage 仍然是 100%。
+    #
+    # 這條不是門檻，是**不變式**。它不該有容忍度：對不上就是程式的問題。
+    booked    = result['scanned'] + errors + too_short
+    balanced  = (booked == universe)
     healthy   = (scannable > 0
+                 and balanced
                  and ok_ratio >= 0.90
                  and (coverage >= 0.80 or not full_run)
                  and errors <= scannable * 0.10)
+    # **「跑得動」和「可以拿去蓋掉昨天那份」是兩件事。**
+    #
+    # `daily.yml` 用 force push 把報告推到一個只有一個 commit 的孤兒分支，
+    # 覆蓋掉就沒有第二份。而 healthy 只回答「這一趟的資料可信嗎」，它對
+    # 「這一趟是誰、為了什麼跑的」一無所知：
+    #
+    #   * `--limit 50` 的煙霧測試 → universe 50 → full_run 為假 → 八成覆蓋率
+    #     那條整個關掉 → healthy=yes（實測）→ 正式報告被 50 檔版蓋掉。
+    #   * 手動改一組門檻試跑 → 同樣 healthy=yes → 那份非預設的報告上線。
+    #
+    # 所以另外輸出一個 `publishable`：可信、而且是**照預設門檻掃全市場**的
+    # 那一趟才算數。
+    limited     = bool(getattr(args, 'limit', 0))
+    default_rules = not (result.get('rules_changed') or {})
+    publishable = healthy and full_run and not limited and default_rules
 
     # 讓 workflow 的後續步驟拿得到「今天通過幾檔」，不必去 parse 上面那堆輸出。
     summary = os.environ.get('GITHUB_OUTPUT')
@@ -249,7 +276,17 @@ def main(argv: list[str] | None = None) -> int:
             fh.write(f"too_short={too_short}\n")
             fh.write(f"coverage={coverage:.3f}\n")
             fh.write(f"healthy={'yes' if healthy else 'no'}\n")
+            fh.write(f"balanced={'yes' if balanced else 'no'}\n")
+            fh.write(f"publishable={'yes' if publishable else 'no'}\n")
+            fh.write(f"limited={'yes' if limited else 'no'}\n")
             fh.write(f"date={result['date']}\n")
+            # **資料基準**：這份報告算到哪一天的收盤為止。
+            #
+            # 和 `date`（跑的那一天）不一樣。週末、開盤前、盤中跑的時候，
+            # 資料會被砍到上一個交易日（見 pipeline 的 `stub_vote` 與
+            # `session_unfinished`），而 release tag、commit 訊息、報告標題
+            # 以前全都印 `date`——讀者看到的是「今天的突破清單」，其實是昨天的。
+            fh.write(f"asof={result.get('asof') or result['date']}\n")
             fh.write(f"xlsx={result['xlsx']}\n")
             # 「今天只有 3 檔通過」和「今天有人把量比調到 3 倍」在摘要上不該
             # 長得一樣。改過就寫出改了什麼，沒改就寫 default。

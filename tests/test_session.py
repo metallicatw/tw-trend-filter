@@ -251,3 +251,143 @@ def test_均量門檻的單位要和資料一致():
     assert '股' in line and '張' not in line, line
     units = {row[0]: row[2] for row in pl.LIVE_FIELDS}
     assert units['min_vol20'] == '股', units['min_vol20']
+
+
+# ---------------------------------------------------------------------------
+# 「今天這一場還沒**結束**」——和「還沒開始」是兩件事
+#
+# ## 實測（2026-09-21 星期一 11:30 台北，台股正在交易）
+#
+#     2330  V/V20 0.53    2317  V/V20 0.28    2412  V/V20 0.51
+#     2882  V/V20 0.31    1301  V/V20 0.25    中位數 0.31
+#     stub_vote() = False                      ← 一個字都沒說
+#
+# `_looks_like_stub` 要求「收盤和開盤都和前一根一模一樣」，那是**還沒開盤**的
+# 長相；盤中那一根的收盤是跳動的，三個條件永遠不成立。於是程式宣告「資料基準：
+# 今天（真的收過盤的）」，然後拿半場的量去比全天的均量——第四關是「當日量 ≥
+# 20 日均量 × 1.2」，所以整份報告 0 檔。和佔位棒那個 bug 的症狀逐字相同。
+#
+# ## 為什麼用時鐘而不是用量
+#
+# 五檔權值股量比**中位數**在 459 個真的收過盤的交易日上的分佈：
+#
+#     P0.5 0.382   P1 0.432   P2 0.485   P5 0.541   P10 0.612   P50 0.891
+#
+# 門檻訂 0.5 會誤判 2.4% 的正常交易日、訂 0.6 會誤判 8.7%；而收盤前半小時的量
+# 早就爬過任何一個能用的門檻。量是又鈍又會誤傷的訊號。時鐘是精確的。
+
+
+def _at(h, m=0):
+    tz = pl.datetime.timezone(pl.datetime.timedelta(hours=8))
+    return pl.datetime.datetime(2026, 9, 21, h, m, tzinfo=tz)
+
+
+def _today_frame(days=150):
+    """最後一根就是「今天」（2026-09-21）的資料。"""
+    df = _series(days=days, start='2026-02-20')
+    idx = list(df.index[:-1]) + [pd.Timestamp('2026-09-21')]
+    df.index = pd.DatetimeIndex(idx)
+    return df
+
+
+def test_盤中就是還沒結束():
+    assert pl.session_unfinished([_today_frame()], now=_at(11, 30))
+
+
+def test_開盤前也算還沒結束():
+    """`_looks_like_stub` 也擋得住這一種，但這一條不依賴那一根長什麼樣子。"""
+    assert pl.session_unfinished([_today_frame()], now=_at(8, 55))
+
+
+def test_收盤之後就算結束():
+    """13:30 收盤，緩衝到 14:00——排程跑在 15:07。"""
+    assert not pl.session_unfinished([_today_frame()], now=_at(14, 0))
+    assert not pl.session_unfinished([_today_frame()], now=_at(15, 7))
+
+
+def test_最後一根不是今天就不管現在幾點():
+    """週末早上跑：最後一根是上週五，那一根是完整的。
+
+    （週末那一根佔位棒是另一回事，由 `stub_vote` 擋。）
+    """
+    assert not pl.session_unfinished([_series()], now=_at(10, 0))
+
+
+def test_一檔都沒問到就不要亂動資料_盤中版():
+    assert not pl.session_unfinished([], now=_at(11, 0))
+    assert not pl.session_unfinished([None, pd.DataFrame()], now=_at(11, 0))
+
+
+def test_盤中跑要砍到前一個交易日(tmp_path, monkeypatch):
+    """接到 `run()` 上：整條路要真的走通，不是只有偵測器會回 True。"""
+    base = _today_frame()
+    monkeypatch.setattr(pl, '_taipei_now', lambda: _at(11, 30))
+    res = _run(tmp_path, monkeypatch, lambda *a, **k: base)
+    assert res['asof'] == f'{base.index[-2]:%Y-%m-%d}', (
+        f"盤中跑卻用了今天的資料（asof={res['asof']}）"
+    )
+
+
+def test_收盤之後跑一根都不砍(tmp_path, monkeypatch):
+    base = _today_frame()
+    monkeypatch.setattr(pl, '_taipei_now', lambda: _at(15, 7))
+    res = _run(tmp_path, monkeypatch, lambda *a, **k: base)
+    assert res['asof'] is None, f"收盤後跑卻被砍到 {res['asof']}"
+
+
+def test_砍到哪一天由所有權值股一起決定(tmp_path, monkeypatch):
+    """原本取的是 `probes[0]` 的倒數第二根。
+
+    「投到的那幾檔都停在同一天」是一個沒有被驗證的假設：權值股偶爾也會停牌
+    或少一根，而那一檔剛好排在第一個的話，整個市場會被砍錯一天。
+    """
+    full = _today_frame()
+    short = full.iloc[:-1]          # 這一檔今天沒有那一根（少一根）
+    first = PROBES[0]
+
+    def download(ticker, *a, **k):
+        return short if ticker == first else full
+
+    monkeypatch.setattr(pl, '_taipei_now', lambda: _at(11, 30))
+    res = _run(tmp_path, monkeypatch, download)
+    assert res['asof'] == f'{full.index[-2]:%Y-%m-%d}', (
+        f"被第一檔的倒數第二根帶走了（asof={res['asof']}，"
+        f"應該是 {full.index[-2]:%Y-%m-%d}）"
+    )
+
+
+def test_算到一半丟例外的那幾檔不可以算成掃到(tmp_path, monkeypatch):
+    """`scanned` 以前在指標算完**之前**就加了。
+
+    於是上游 cross feed 的 schema 一漂移（多一個欄位、解包炸掉），同一檔
+    同時算進 scanned 和 errors：
+
+        真的掃到 10/10 檔   ⚠️ 有 3 檔沒有掃成   snapshots 只有 7 筆
+        ok_ratio 1.0   coverage 1.0   healthy=yes
+
+    報告裡少掉三成，而健康門檻的分子說 100%。
+    """
+    base = _series()
+    bad = {f'{c}.TW' for c in CODES[:3]}
+
+    class Boom(pd.DataFrame):
+        """長得像資料、但算到一半會炸。"""
+
+    def download(ticker, *a, **k):
+        if ticker in bad:
+            df = base.copy()
+            # 讓指標那一段炸掉：Close 變成不能做算術的東西。
+            df['Close'] = df['Close'].astype(object)
+            df.iloc[-1, df.columns.get_loc('Close')] = '壞掉'
+            return df
+        return base
+
+    res = _run(tmp_path, monkeypatch, download)
+    assert res['errors'] == len(bad), res['error_kinds']
+    assert res['scanned'] == len(CODES) - len(bad), (
+        f"丟例外的 {len(bad)} 檔被算成掃到了（scanned={res['scanned']}／"
+        f"母體 {len(CODES)}）"
+    )
+    assert res['scanned'] + res['errors'] + res['too_short'] == len(CODES), (
+        '記帳對不起來：scanned + errors + too_short != 母體'
+    )

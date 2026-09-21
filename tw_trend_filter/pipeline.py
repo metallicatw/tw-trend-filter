@@ -380,6 +380,64 @@ def _looks_like_stub(df) -> bool:
 STUB_VOTE_RATIO = 0.5
 
 
+#: 台股 13:30 收盤。留 30 分鐘緩衝給 Yahoo 把當日 K 棒結算完。
+SESSION_SETTLED_HOUR = 14
+
+
+def _taipei_now():
+    """台北現在時間。runner 跑在 UTC，所以不能用 `datetime.now()`。"""
+    tz = datetime.timezone(datetime.timedelta(hours=8))
+    return datetime.datetime.now(tz)
+
+
+def session_unfinished(frames, now=None) -> bool:
+    """最後一根是不是「今天這一場**還沒結束**」。
+
+    ## 為什麼需要這一條（`stub_vote` 擋不住它）
+
+    `_looks_like_stub` 要求「收盤和開盤都和前一根一模一樣」。那是**還沒開盤**
+    的長相。盤中那一根的收盤是跳動的，三個條件永遠不成立——所以盤中跑的時候
+    `stub_vote()` 回 False，程式會宣告「資料基準：今天（真的收過盤的）」，
+    然後拿**半場的量**去比全天的均量。
+
+    2026-09-21（星期一）11:30 台北實測，台股正在交易：
+
+        2330  V/V20 0.53      2317  V/V20 0.28      2412  V/V20 0.51
+        2882  V/V20 0.31      1301  V/V20 0.25      中位數 0.31
+        stub_vote() = False   ← 一個字都沒說
+
+    第四關是「當日量 ≥ 20 日均量 × 1.2」，所以這一趟的結果是 0 檔——和
+    佔位棒那個 bug 的症狀逐字相同，只差在「還沒收盤」而不是「還沒開盤」。
+
+    ## 為什麼是看時鐘，不是看量
+
+    先試過量：五檔權值股的量比**中位數**，在 459 個真的收過盤的交易日上是
+
+        P0.5 0.382   P1 0.432   P2 0.485   P5 0.541   P10 0.612   P50 0.891
+
+    而現在盤中是 0.31。也就是說門檻訂 0.5 會誤判 2.4% 的正常交易日、訂 0.6
+    會誤判 8.7%——而且 13:00（收盤前半小時）的量早就爬過任何一個能用的門檻，
+    所以它連「盤中」都擋不乾淨。量是一個又鈍又會誤傷的訊號。
+
+    時鐘則是精確的：台股 13:30 收盤，收盤之前那一根**一定**不完整，之後
+    一定完整。誤判率是零，而且不必調參數。
+
+    排程本身跑在 15:07，不受影響；這一條守的是手動觸發、失敗後 re-run、
+    以及哪天有人動了 cron。
+    """
+    now = now or _taipei_now()
+    if now.hour >= SESSION_SETTLED_HOUR:
+        return False
+    today = now.date()
+    for df in frames:
+        if df is None or not len(df):
+            continue
+        last = pd.to_datetime(df.index[-1])
+        if last.date() == today:
+            return True
+    return False
+
+
 def stub_vote(frames) -> bool:
     """投票：這一批（權值股）的最後一根是不是佔位棒。
 
@@ -1534,10 +1592,21 @@ def run(
                         _too_short[0] += 1
                     return None
             close, volume = df['Close'], df['Volume']
-            # 資料拿到了、長度夠、欄位讀得開——到這裡才算真的掃到這一檔。
-            # 之後再丟例外的話，那是程式的問題，由 SCREEN_ERRORS 那一半負責。
-            with _scan_lock:
-                _scanned[0] += 1
+            # ⚠️ **這裡不要加 `_scanned`。**
+            #
+            # 上一版在這裡就加了，理由是「資料拿到了、長度夠、欄位讀得開」。
+            # 但這一行之後還有兩百行指標計算與 cross feed 解包，而那一段丟出
+            # 的例外由末尾的 `except` 記進 SCREEN_ERRORS——於是**同一檔同時
+            # 算進 scanned 和 errors**，而健康門檻的分子是 scanned。
+            #
+            # 實測（模擬上游 cross.json 多一個欄位，10 檔裡打到 3 檔）：
+            #
+            #     真的掃到 10/10 檔   ⚠️ 有 3 檔沒有掃成   snapshots 只有 7 筆
+            #     ok_ratio 1.0   coverage 1.0   healthy=yes
+            #
+            # 也就是 schema 一漂移，報告裡少掉的那幾檔對門檻完全隱形。這正是
+            # 「健康門檻從來沒有作用過」那個 bug 的鏡像版。改成算完才記帳，
+            # `scanned + errors + too_short == universe` 才是真的。
 
             # 指標**全部算完**，才拿門檻去判。
             #
@@ -1625,6 +1694,10 @@ def run(
             snap['rr_free'] = rr_free
             with _snap_lock:
                 SNAPSHOTS.append(snap)
+            # 指標算完、快照也留下來了——**到這裡才算真的掃到這一檔**。
+            # 為什麼不是更早，見上面 `close, volume = ...` 那一段。
+            with _scan_lock:
+                _scanned[0] += 1
 
             # 畫圖要用的那幾條序列。**在判定之前**留下來，因為今天沒過篩的那幾檔
             # 正是放寬門檻之後會需要圖的那些。欄位名稱和 `results` 的那幾個一模
@@ -1889,15 +1962,28 @@ def run(
                 d = d.copy()
                 d.columns = d.columns.droplevel(1)
             probes.append(d)
+    reason = ''
     if probes and stub_vote(probes):
-        # 投到的那幾檔都停在同一天，取第一檔的倒數第二根即可。
-        idx = pd.to_datetime(probes[0].index).tz_localize(None)
-        _asof[0] = idx[-2]
-        print('⚠️ 權值股的最後一根是「還沒開盤」的佔位棒'
-              '（開盤收盤都和前一根一模一樣、量不到均量的一半）'
-              '——今天那一場交易還沒發生。')
-        print(f'   整批算到 {_asof[0]:%Y-%m-%d} 為止。'
-              '（吃到佔位棒的話，量比會變成均量的一成，第四關會全滅。）')
+        reason = ('權值股的最後一根是「還沒開盤」的佔位棒'
+                  '（開盤收盤都和前一根一模一樣、量不到均量的一半）'
+                  '——今天那一場交易還沒發生')
+    elif probes and session_unfinished(probes):
+        reason = ('現在還沒收盤（台股 13:30，緩衝到 14:00）'
+                  '——最後一根是**半場**的量，拿去比全天的均量，第四關會全滅')
+    if reason:
+        # 取**所有**投到票的權值股裡最新的那個「前一根」，不是第一檔的。
+        #
+        # 「投到的那幾檔都停在同一天」是一個沒有被驗證的假設：權值股偶爾也會
+        # 停牌或少一根，而那一檔剛好排在第一個的話，整個市場會被砍錯一天。
+        prevs = []
+        for d in probes:
+            idx = pd.to_datetime(d.index).tz_localize(None)
+            if len(idx) >= 2:
+                prevs.append(idx[-2])
+        if prevs:
+            _asof[0] = max(prevs)
+            print(f'⚠️ {reason}。')
+            print(f'   整批算到 {_asof[0]:%Y-%m-%d} 為止。')
     elif probes:
         idx = pd.to_datetime(probes[0].index).tz_localize(None)
         print(f'📅 資料基準：{idx[-1]:%Y-%m-%d}（權值股的最後一根是真的收過盤的）')
@@ -2391,6 +2477,7 @@ def run(
         # 不做——本機自己跑一份不需要多那 1,900 個檔案。
         extra_charts=CHARTS, data_dir=data_dir, data_base=data_base,
         cross=CROSS,
+        asof=None if _asof[0] is None else f'{_asof[0]:%Y-%m-%d}',
     )
 
     # 排程要的是一個固定的檔名（`index.html`），因為下游——tw-six-metrics 的建站
@@ -3462,7 +3549,7 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
                            link_base='', plotly_cdn=True, chart_years=2.0,
                            excel_url='', rules=None, snapshots=None,
                            extra_charts=None, data_dir='', data_base='',
-                           cross=None):
+                           cross=None, asof=None):
     """產生互動線圖那一份 HTML，回傳檔案路徑。
 
     和本機版的三個差別，全都是因為這一份要放上網、給手機開：
@@ -4582,8 +4669,15 @@ document.addEventListener('DOMContentLoaded', function() {
         #
         # 「共 N 檔通過」改成「**預設門檻**共 N 檔通過」：底下那排卡片現在會隨著
         # 你調的門檻變，兩個數字不一樣是正常的，而不說清楚就會看起來像壞掉。
+        # 「篩選日期」是**跑的時間**。資料基準是另一件事：週末、開盤前、盤中
+        # 跑的時候，資料會被砍到上一個交易日（見 `stub_vote` 與
+        # `session_unfinished`），而這一行以前只印跑的時間——讀者看到的是
+        # 「今天的突破清單」，其實是昨天的收盤。兩個不一樣才印第二個。
         '<div class="meta">\u7be9\u9078\u65e5\u671f\uff1a' + ts_display + ' ' +
         now.strftime('%H:%M') +
+        (('&nbsp;|&nbsp;\u8cc7\u6599\u57fa\u6e96\uff1a<b style="color:#f0c27f">'
+          + str(asof).replace('-', '/') + '</b>') if asof and str(asof)[:10] != today_str
+         else '') +
         '&nbsp;|&nbsp;\u9810\u8a2d\u9580\u6abb\u5171&nbsp;<b style="color:#3fb950">' +
         str(n) + '</b>&nbsp;\u6a94\u901a\u904e</div>',
         # 〔調整篩選條件〕就在這一行底下，**不收合**——它是這一頁的控制器，改了

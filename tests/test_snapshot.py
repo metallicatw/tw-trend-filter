@@ -341,13 +341,13 @@ def test_網頁上的預設值就是這一次真的跑的那組門檻():
 
 
 def test_沒有快照就只剩那把尺():
-    """沒有快照的時候只留〔預設篩選條件〕那顆燈泡，不畫一個按了沒反應的表單。
+    """沒有快照的時候只留〔預設篩選條件〕那份內容，不畫一個按了沒反應的表單。
 
     （`build_interactive_html` 那一層現在會直接擋掉沒有快照的呼叫——見
     `test_沒有快照的報告根本產不出來`。這一條守的是 `_live_block` 自己。）
     """
     html = _live_block(DEFAULT_RULES)
-    assert '預設篩選條件' in html
+    assert 'id="tf-rules"' in html
     assert 'id="live"' not in html
     assert 'tfPass' not in html
 
@@ -429,11 +429,11 @@ def test_快照傳得到報告頁上(tmp_path):
     assert 'id="tf-snap"' in html
     assert 'function tfPass' in html
     # 〔調整篩選條件〕不收合：它是這一頁的控制器，改了就換掉左邊那排卡片。
-    # 收起來的是右邊那顆燈泡裡的〔預設篩選條件〕——它是一個彈出視窗
-    # （為什麼不是 <details>，見 tests/test_rules_dialog.py）。
+    # 〔預設篩選條件〕移到外層網站的燈泡裡了（見 tests/test_report_links.py），
+    # 這一頁只帶著它的內容。
     assert '<div id="live">' in html
-    assert '<dialog id="rules"' in html
-    assert '預設篩選條件' in html
+    assert '<template id="tf-rules">' in html
+    assert '<dialog' not in html
 
 
 def test_沒有快照的報告根本產不出來(tmp_path):

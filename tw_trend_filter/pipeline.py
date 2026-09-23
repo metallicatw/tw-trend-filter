@@ -2729,8 +2729,9 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
     改門檻 → 左邊那排卡片當場換掉 → 點一張就看那一檔的圖。和以前的操作完全一樣，
     差別只在那排卡片不再是排程當天篩出來的那一組，而是**你現在這組門檻**篩出來的。
 
-    所以它不收合。收合的是〔預設篩選條件〕那把尺（右邊的燈泡）——那是查一次就
-    記得的東西，而輸入框是每次都要用的。
+    所以它不收合。〔預設篩選條件〕那把尺已經移出這一頁，併進外層網站標題旁的
+    燈泡（見下面的 `<template id="tf-rules">`）——那是查一次就記得的東西，
+    而輸入框是每次都要用的。
 
     ## 為什麼做得到即時，而不是按一下等三十分鐘
 
@@ -2767,25 +2768,20 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
         f'<li><b>{escape(label)}</b><span>{escape(text)}</span></li>'
         for label, text in rules.describe()
     )
-    # 〔預設篩選條件〕：右邊那顆燈泡。它是一把查一次就記得的尺，而輸入框是每次
-    # 都要用的——兩者的使用頻率差一個數量級，所以只有它收起來。
+    # 〔預設篩選條件〕的內容。**這一頁上不再顯示它**——使用者要的是把它併進
+    # 外層網站〔趨勢X六大X報酬〕標題旁那顆燈泡，這一頁上那顆按鈕和彈出視窗整個
+    # 拿掉（2026-09-23）。
     #
-    # 用 <dialog> 而不是 <details>。理由見 `rulesOpen()` 上面那一段：內嵌展開的
-    # 內容會被 `#topbar` 那個捲動容器裁掉，而且是在**每一個**視窗寬度上。
+    # 但內容仍然在這裡產生，放進一個 `<template>`：它不會被畫出來，而外層網站建
+    # 站時會把它原樣抽出來塞進燈泡（tw-six-metrics `report/build.py` 的
+    # `trend_rules_html`）。四道門檻的數字（股價 > 10、量比 ≥ 1.2……）只有這邊
+    # 知道；在那邊另外寫一份，改了門檻之後燈泡就會安靜地說錯話。
     tip = (
-        '<button type="button" id="rules-btn" class="rules-btn"'
-        ' aria-haspopup="dialog" aria-controls="rules" title="預設篩選條件">'
-        '<span aria-hidden="true">\U0001F4A1</span>'
-        '<span class="tiplabel">預設篩選條件</span></button>'
-        '<dialog id="rules" class="rules-dlg" aria-labelledby="rules-h">'
-        '<div class="rules-hd"><b id="rules-h">'
-        '<span aria-hidden="true">\U0001F4A1</span> 預設篩選條件</b>'
-        '<button type="button" class="rules-x" aria-label="關閉">✕</button>'
-        '</div>'
-        f'<div class="tipbox"><ol>{items}</ol>'
+        '<template id="tf-rules">'
+        f'<ol>{items}</ol>'
         '<p class="stop">停損：進場後設在 <b>'
         f'收盤 − {rules.atr_stop:g} × ATR(14)</b>，'
-        '固定不放寬；收盤跌破 20MA 考慮出場。</p></div></dialog>'
+        '固定不放寬；收盤跌破 20MA 考慮出場。</p></template>'
     )
     if not snapshots:
         return tip
@@ -2970,11 +2966,6 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
         // 全市場每一檔都抓得到。後者才是常態，所以只看 TF_DRAWN 的話，放寬門檻
         // 多出來的股票每一張卡片都會被標成「沒有圖」——而它們其實點得開。
         const drawn = Object.prototype.hasOwnProperty.call(TF_DRAWN, code) || !!TF_DATA;
-        const ext = TF_LINK
-          ? '<a class="nb-ext" href="' + TF_LINK + '/' + code + '.html" target="_blank"' +
-            ' rel="noopener" title="看這一檔的六大財務指標評等"' +
-            ' onclick="event.stopPropagation()">六大↗</a>'
-          : '';
         const tags = triggers.map(function (t) {{
           return '<span class="nb-tag">' + tfEsc(t) + '</span>';
         }}).join('');
@@ -2987,22 +2978,50 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
           '<span class="nb-pct ' + cls + '">' + sign + Math.abs(chg).toFixed(2) +
           ' (' + pct.toFixed(2) + '%)</span></div>' +
           '<div class="nb-ind">' + tfEsc(row[C.industry] || '') + '</div>' +
-          // 六大與報酬風險比。**永遠顯示**，不只在 #cross 那個入口——一檔技術面
-          // 在動的股票，下一個問題本來就是體質和價位，而那兩個數字已經在手上。
-          // 對面沒發資料的時候整列不出現，而不是印兩個破折號佔一行。
-          (row[C.six] !== null && row[C.six] !== undefined ||
-           row[C.rr] !== null && row[C.rr] !== undefined || row[C.rr_free]
-            ? '<div class="nb-cross"><span title="六大財務指標最新綜合評分">六大 ' +
-              (row[C.six] === null || row[C.six] === undefined
-                ? '—' : row[C.six].toFixed(2)) +
-              '</span><span title="報酬風險比（無風險 ＝ 股價已低於下檔價；空頭 ＝ 預期報酬為負）'
-              + (TF_CROSS_AS_OF.as_of ? '。估值基準 ' + TF_CROSS_AS_OF.as_of
-                 + '，財報 ' + (TF_CROSS_AS_OF.quarter || '?') : '') + '">' +
-              '報酬/風險 ' + tfRrText(row) + '</span></div>'
-            : '') +
           (shortWhy
             ? '<div class="nb-why">' + tfEsc(shortWhy) + '</div>' : '') +
-          '<div class="nb-tagrow">' + tags + ext + '</div></div>';
+          '<div class="nb-tagrow">' + tags + '</div>' +
+          tfCrossLinks(row) + '</div>';
+      }}
+
+      // 卡片最底下那兩顆：〔六大 2.17 ↗〕〔報酬/風險 1.77 ↗〕。
+      //
+      // **永遠顯示**，不只在 #cross 那個入口——一檔技術面在動的股票，下一個問題
+      // 本來就是體質和價位，而那兩個數字已經在手上。
+      //
+      // 它們是**按鈕**，直接跳到個股頁對應的那一個分頁：六大 → #six（〔六大財務
+      // 指標評等〕），報酬/風險 → #eps（〔EPS預估與估價〕，報酬風險比就是那一頁
+      // 算的）。個股頁把分頁寫在網址的 hash 上，開啟時會直接停在那一頁。
+      //
+      // 手機與桌機是**同一個位置**（卡片最底下）。以前桌機是一行小字夾在產業和
+      // 觸發訊號之間、另外再一顆〔六大↗〕；手機則因為觸發訊號收起來，那一行自然
+      // 落到底。兩種排法讓同一個東西在兩個寬度上找的位置不一樣。
+      //
+      // 對面沒發資料的時候整列不出現，而不是印兩個破折號佔一行。沒有 TF_LINK
+      // （本機版）的時候是兩個不能點的標籤，不是兩個點了 404 的連結。
+      function tfCrossLinks(row) {{
+        const six = row[C.six];
+        const hasSix = six !== null && six !== undefined;
+        const hasRr = row[C.rr] !== null && row[C.rr] !== undefined || row[C.rr_free];
+        if (!hasSix && !hasRr) return '';
+        const code = row[C.code];
+        const rrTitle = '報酬風險比（無風險 ＝ 股價已低於下檔價；空頭 ＝ 預期報酬為負）' +
+          (TF_CROSS_AS_OF.as_of ? '。估值基準 ' + TF_CROSS_AS_OF.as_of +
+            '，財報 ' + (TF_CROSS_AS_OF.quarter || '?') : '');
+        function one(label, value, tab, title) {{
+          const text = '<span class="k">' + label + '</span> <b>' + value + '</b>';
+          if (!TF_LINK) {{
+            return '<span class="nb-lnk" title="' + tfEsc(title) + '">' + text + '</span>';
+          }}
+          return '<a class="nb-lnk" href="' + TF_LINK + '/' + tfEsc(code) + '.html#' + tab +
+            '" target="_blank" rel="noopener" title="' + tfEsc(title) + '"' +
+            ' onclick="event.stopPropagation()">' + text + '<i>↗</i></a>';
+        }}
+        return '<div class="nb-cross">' +
+          one('六大', hasSix ? six.toFixed(2) : '—', 'six',
+              '六大財務指標最新綜合評分——開啟〔六大財務指標評等〕') +
+          one('報酬/風險', tfRrText(row), 'eps', rrTitle + '——開啟〔EPS預估與估價〕') +
+          '</div>';
       }}
 
       function tfApply() {{
@@ -3945,11 +3964,23 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         # 換行，不是擠成一排。門檻放寬之後一檔可以同時觸發四個訊號，而四顆
         # 徽章塞進 300px 的側欄裡，每一顆都會被截成「黃…」「布…」——四個
         # 都認不出來，等於那一列不存在。寧可高一點。
-        # 六大與報酬風險比。**手機上不收**——`.nb-tagrow` 在窄螢幕是收起來的
-        # （觸發訊號在圖表區上方還看得到），但這兩個數字別的地方沒有，收掉
-        # 就等於手機上這個功能不存在。所以它只有一行、字更小。
-        '.nb-cross{display:flex;justify-content:space-between;gap:6px;margin-top:3px;'
-            'font-size:10.5px;color:#a9b4c0;font-variant-numeric:tabular-nums}'
+        # 六大與報酬風險比：卡片最底下的兩顆連結鈕（見 `tfCrossLinks`）。
+        # **手機上不收**——`.nb-tagrow` 在窄螢幕是收起來的（觸發訊號在圖表區上方
+        # 還看得到），但這兩個數字別的地方沒有，收掉就等於手機上這個功能不存在。
+        #
+        # 顏色和圖表區那顆〔詳細資訊↗〕同一系（藍）：藍色在這一頁上的意思就是
+        # 「這是一條出口，會開到個股頁」。
+        '.nb-cross{display:flex;gap:6px;margin-top:7px;font-variant-numeric:tabular-nums}'
+        '.nb-lnk{flex:1 1 0;min-width:0;display:inline-flex;align-items:baseline;'
+            'justify-content:center;gap:3px;padding:3px 8px;border-radius:6px;'
+            'font-size:11px;line-height:1.35;white-space:nowrap;text-decoration:none;'
+            'color:#79c0ff;background:rgba(88,166,255,.10);'
+            'border:1px solid rgba(88,166,255,.34)}'
+        '.nb-lnk .k{color:#8b949e}'
+        '.nb-lnk b{color:#e6edf3;font-weight:600}'
+        '.nb-lnk i{font-style:normal;color:#58a6ff;font-size:10px}'
+        'a.nb-lnk:hover{background:rgba(88,166,255,.24);border-color:#58a6ff}'
+        'span.nb-lnk{cursor:default}'
         '.nbshort{opacity:.72}'
         '.nb-why{font-size:10px;color:#d9a441;margin-top:3px;white-space:normal;line-height:1.35}'
         '.sb-sep{margin:14px 6px 6px;padding-top:10px;border-top:1px solid #30363d;'
@@ -3960,22 +3991,14 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         '.nb-tag{display:inline-block;flex:0 0 auto;padding:2px 8px;'
             'border-radius:11px;font-size:10.5px;background:rgba(240,194,127,.14);'
             'color:#f0c27f;border:1px solid rgba(240,194,127,.32);white-space:nowrap}'
-        # 側欄卡片上那個「六大↗」。刻意做得比觸發訊號那顆淡一點：它是一條出口，
-        # 不是這一頁在講的事。
-        # 換行之後 `margin-left:auto` 會把它推到自己一行的最右邊——那正是要的：
-        # 它是一條出口，不是觸發訊號的一部分。
-        '.nb-ext{margin-left:auto;flex:0 0 auto;padding:2px 8px;border-radius:11px;'
-            'font-size:10.5px;text-decoration:none;background:rgba(88,166,255,.12);'
-            'color:#58a6ff;border:1px solid rgba(88,166,255,.30);white-space:nowrap}'
-        '.nb-ext:hover{background:rgba(88,166,255,.24);border-color:#58a6ff}'
         # 圖表區那顆同樣的出口，做成一顆徽章，跟 20MA／停損那幾顆並排。
         'a.badge.link{text-decoration:none;background:rgba(88,166,255,.16);'
             'color:#79c0ff;border-color:rgba(88,166,255,.42)}'
         'a.badge.link:hover{background:rgba(88,166,255,.30);border-color:#58a6ff}'
         # ── 〔調整篩選條件〕：頁首的控制器，**不收合** ──────────
         #
-        # 它決定左邊那排卡片是哪幾檔。每次進來都要用，所以攤開；收起來的是右邊
-        # 那顆燈泡裡的〔預設篩選條件〕——那是查一次就記得的一把尺。
+        # 它決定左邊那排卡片是哪幾檔。每次進來都要用，所以攤開。〔預設篩選條件〕
+        # 那把尺查一次就記得，已經移到外層網站標題旁的燈泡裡。
         '#live{margin-top:6px}'
         '#live .live-fields{display:flex;flex-wrap:wrap;gap:6px 10px}'
         '#live label{display:inline-flex;align-items:center;gap:4px;'
@@ -4004,50 +4027,6 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         '#live #live-count.hit{color:#7ee787}'
         '#live #live-count.miss{color:#8b949e}'
         '#live #live-count.stale{color:#f0c27f}'
-        # ── 〔預設篩選條件〕：那顆燈泡 ────────────────────────
-        #
-        # 彈出視窗，不是內嵌展開。內嵌那一版在**每一個**寬度上都被 `#topbar`
-        # 的 `overflow-y:auto` 裁掉（那是保險絲，見上面），按下去像沒反應。
-        # 完整的量測寫在 `rulesOpen()` 上面。
-        #
-        # `position:fixed` 寫死在這裡而不是靠 `showModal()` 的 top layer：
-        # 拿不到 `<dialog>` 的舊瀏覽器走 `open` 屬性那條路，而那時候它是
-        # `position:absolute`——又會被裁一次。
-        '.rules-btn{margin-left:auto;cursor:pointer;background:transparent;'
-            'color:#8b949e;display:inline-flex;align-items:center;gap:5px;'
-            'padding:4px 12px;min-height:30px;'      # 手指按得到
-            'border:1px solid #30363d;border-radius:12px;'
-            'font-family:inherit;font-size:11.5px;white-space:nowrap}'
-        '.rules-btn:hover{color:#e6edf3;border-color:#58a6ff}'
-        # `max-width` 一定要自己寫。瀏覽器的預設樣式表給 `<dialog>` 的是
-        # `max-width:calc(100% - 6px - 2em)`，而那條是**另一個屬性**——只寫
-        # `width` 蓋不掉它，它會回頭把 width 夾住。實測 390px 的螢幕上量到 360
-        # （390 − 6 − 2×12），右邊白白少一條。
-        '.rules-dlg{position:fixed;z-index:200;inset:0;margin:auto;padding:0;'
-            'width:min(560px,calc(100vw - 32px));max-width:none;'
-            'max-height:min(78vh,520px);overflow:auto;overscroll-behavior:contain;'
-            'background:#161b22;color:#8b949e;border:1px solid #30363d;'
-            'border-left:3px solid #58a6ff;border-radius:10px;'
-            'box-shadow:0 14px 44px rgba(0,0,0,.6);text-align:left;'
-            'font-family:inherit;font-size:12px;line-height:1.6}'
-        '.rules-dlg::backdrop{background:rgba(1,4,9,.66)}'
-        # 標題列黏在頂端：內容比視窗長的時候，捲到一半還看得到〔✕〕。
-        '.rules-hd{position:sticky;top:0;z-index:1;display:flex;'
-            'align-items:center;gap:8px;padding:9px 10px 9px 13px;'
-            'background:#161b22;border-bottom:1px solid #21262d}'
-        '.rules-hd b{flex:1;color:#e6edf3;font-size:13px}'
-        '.rules-x{background:transparent;border:1px solid #30363d;'
-            'border-radius:7px;color:#8b949e;cursor:pointer;'
-            'font-family:inherit;font-size:14px;line-height:1;'
-            'min-width:36px;min-height:36px}'      # 手指按得到
-        '.rules-x:hover{color:#e6edf3;border-color:#58a6ff}'
-        '.rules-dlg .tipbox{padding:11px 13px 14px}'
-        '.rules-dlg ol{margin:0;padding-left:0;list-style:none;display:grid;gap:4px}'
-        '.rules-dlg li{display:grid;grid-template-columns:auto 1fr;gap:8px;'
-            'align-items:baseline;line-height:1.55}'
-        '.rules-dlg li b{color:#e6edf3;font-weight:600;white-space:nowrap}'
-        '.rules-dlg .stop{margin:9px 0 0;color:#8b949e}'
-        '.rules-dlg .stop b{color:#ff7b72}'
         # ── 側欄：沒有圖的那幾檔 ─────────────────────────────
         #
         # 「沒有圖」不是錯誤，是這一頁的邊界：放寬門檻多出來的股票，排程當天沒有
@@ -4066,15 +4045,40 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         '#tf-note a:hover{text-decoration:underline}'
         # 抓回來那幾張圖的容器。高度要**明確**——Plotly 畫進一個沒有高度的
         # div 會得到一張 450px 的預設圖，和旁邊那幾張對不起來。
-        '#tf-pane{display:flex;flex-direction:column;width:100%;height:100%;'
-            'min-height:0;padding:10px 16px 12px}'
+        '#tf-pane{display:flex;flex-direction:column;width:100%;'
+            'flex:1 0 auto;min-height:100%;padding:10px 16px 12px}'
         # `display:flex` 會蓋掉 hidden 屬性預設的 display:none——沒有這一行，
         # 那一格會一直在畫面上（而且是空的）。
         '#tf-pane[hidden]{display:none}'
         '.tf-pane-head{display:flex;align-items:baseline;gap:10px;'
             'font-size:13px;color:#8b949e;padding:0 0 6px}'
         '.tf-pane-head b{color:#e6edf3;font-size:15px}'
-        '#tf-plot{flex:1 1 auto;min-height:0}'
+        # 桌機上圖**有一個下限**，而那個下限跟著寬度走。
+        #
+        # 以前 `min-height:0`：圖拿到的就是視窗扣掉頁首、個股抬頭、時間範圍之後
+        # 剩下的。嵌在〔六大〕網站 78vh 的 iframe 裡，1440×900 的桌機上量到圖
+        # 880×431——價格那一格只有兩百出頭的高度，卻有八百多的寬度，四比一。
+        # 三個月的 K 線被壓成一條帶子，使用者說的「壓太扁平了，看不出變化」
+        # 就是這個比例。
+        #
+        # 下限是 `52cqw`（圖表欄寬度的 52%，約 2:1），夾在 440~720 之間。
+        # 視窗夠高的時候圖照樣長到填滿（`flex:1 1 auto`）；不夠高的時候不再被壓
+        # 扁，而是 #chartcol 自己捲（它本來就是 overflow-y:auto；#tf-pane 因此
+        # 改成「至少填滿、可以更高」，不再是剛好 100%）。外層網站那一頁
+        # 同時把 iframe 拉到幾乎一整個視窗高（見 tw-six-metrics 的 iframe.embed.tall），
+        # 所以正常的桌機上根本捲不到。
+        #
+        # `cqw` 要一個容器：#chartcol 設成 inline-size 的查詢容器。不認得 cqw
+        # 的瀏覽器會把第二條整條丟掉，退回第一條的 440px。
+        #
+        # `flex-basis:0`，不是 auto。auto 的話 flex 會拿**圖目前的像素高度**當起點，
+        # 而那個高度正是上一次 fitPlotSize 寫回去的——#tf-pane 能長高之後，這就變
+        # 成一個只會變大的棘輪：1240×900 實測圖長到 755、欄內多出 120px 要捲。
+        # 從 0 起算、由 min-height 墊底、剩下的空間用 grow 分，圖的大小就只由
+        # 容器決定，不由它自己上一次的大小決定。
+        '#tf-plot{flex:1 1 0;'
+            'min-height:440px;min-height:clamp(440px,52cqw,720px)}'
+        '#chartcol{container-type:inline-size}'
         # 〔篩選〕按鈕。做得比〔回到預設〕重一點——它是這一列的主要動作。
         '#live .live-bar button.go{background:#238636;color:#fff;'
             'border-color:#2ea043;font-weight:700}'
@@ -4157,16 +4161,17 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
             '.nb-code{font-size:14px}'
             '.nb-close{font-size:13px}'
             '.nb-bot{font-size:11px;margin-top:1px}'
-            # 觸發訊號和那顆「六大↗」在這個寬度塞不下，收起來——它們在圖表區
-            # 上方仍然看得到。產業留著，那是一行字。
+            # 觸發訊號在這個寬度塞不下，收起來——它們在圖表區上方仍然看得到。
+            # 產業留著，那是一行字。
             '.nb-tagrow{display:none}'
             '.nb-ind{font-size:10px;margin-top:2px}'
-            # 132px 寬的卡片上，「六大 0.83」和「報酬/風險 —」並排放不下，
-            # 於是「報酬/風險」被折成「報酬/風」＋「險」——一個被切斷的欄位名
-            # 比沒有那個欄位更糟。改成上下兩行，每一行自己不折。
-            '.nb-cross{font-size:10px;margin-top:2px;flex-direction:column;gap:0;'
-                'justify-content:flex-start}'
-            '.nb-cross>span{white-space:nowrap}'
+            # 132px 寬的卡片上兩顆並排放不下（「報酬/風險」會被折成「報酬/風」
+            # ＋「險」——一個被切斷的欄位名比沒有那個欄位更糟）。改成上下兩顆，
+            # 各佔滿一行、每一顆自己不折。高度 26px：手指按得到，又不會把卡片撐太高。
+            '.nb-cross{flex-direction:column;gap:4px;margin-top:5px}'
+            '.nb-lnk{flex:0 0 auto;justify-content:flex-start;min-height:26px;'
+                'align-items:center;padding:2px 7px;font-size:10.5px}'
+            '.nb-lnk b{margin-left:auto}'
             '.nb-why{font-size:9.5px}'
             # 手機上側欄是一條**橫向**滑動的列，所以那條分隔不能是一條橫線
             # ——橫線在橫向的列裡等於把兩區疊在一起。改成一塊窄的直立分隔，
@@ -4176,7 +4181,10 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
                 'white-space:normal;line-height:1.4;display:flex;align-items:center}'
             '#chartcol{flex:1 1 auto;height:auto;min-height:0;overflow:visible}'
             # 高度由**寬度**決定，不是由剩下多少決定。實測 366px 寬 → 432px 高。
+            # min-height 歸零：桌機那條 52cqw 的下限是給橫的螢幕用的，手機上
+            # 圖高由上面這一條（寬度的 118%）決定，兩條不能疊在一起。
             '.plot{flex:0 0 auto;height:clamp(320px,118vw,520px)}'
+            '#tf-plot{flex:0 0 auto;min-height:0}'
             '.tf-fold{display:inline-flex;align-items:center}'
             # 用 class 開關，不是 `hidden`。`[hidden]{display:none}` 是 (0,1,0)，
             # 上面 `#live .live-fields{display:flex}` 是 (1,1,0)——`hidden` 會輸，
@@ -4184,22 +4192,18 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
             '#live.folded .live-fields{display:none}'
             '#live .live-bar{flex-wrap:wrap;gap:8px;margin-top:0}'
             '#live .live-bar button{min-height:34px;padding:6px 14px}'
-            '.badge{font-size:11.5px;padding:4px 10px}'
+            # 四顆（量比／布林寬／ATR／詳細資訊↗）排在**同一列**，不折行。
+            # 桌機上本來就是一列；手機上照桌機的字級會折成兩列，第四顆自己掉到
+            # 第二行，看起來像另一組東西。字與內距縮小、圖表區左右留白從 16 縮到
+            # 10：實測四顆加間距共 297px，336px 寬（360 的手機、嵌在 iframe 裡）
+            # 也放得下。真的放不下時橫向滑，不折行。
+            '.badge-row{flex-wrap:nowrap;gap:4px;overflow-x:auto;'
+                'scrollbar-width:none;-webkit-overflow-scrolling:touch}'
+            '.badge-row::-webkit-scrollbar{display:none}'
+            '.badge{flex:0 0 auto;font-size:10.5px;padding:4px 6px}'
+            '#tf-pane{padding:10px 10px 12px}'
             '.trig-line{font-size:12px;margin:2px 0 6px}'
             '.rbtn{padding:6px 14px;font-size:12px}'   # 手指按得到
-            # 〔預設篩選條件〕在手機上改成貼著底的抽屜。
-            #
-            # 置中的視窗在直式螢幕上有兩個毛病：上下各留一大塊死白，而視窗本身
-            # 離拇指最遠。貼著底就沒有這兩件事——它從最近的那一邊長出來，而且
-            # 不管內容多長，第一行永遠在可視範圍裡。
-            # 高度寫兩次，後面那一次用 dvh：手機瀏覽器的網址列會收合，而 `vh`
-            # 量的是**網址列收起來之後**那個比較大的高度，所以只寫 vh 的抽屜在
-            # 網址列還在的時候底部有一截在畫面外。不認得 dvh 的瀏覽器會把第二行
-            # 整條丟掉，剛好退回第一行。
-            '.rules-dlg{inset:auto 0 0 0;margin:0;width:100%;max-width:none;'
-                'max-height:78vh;max-height:78dvh;'
-                'border-left:1px solid #30363d;border-top:3px solid #58a6ff;'
-                'border-radius:14px 14px 0 0}'
         '}'
     )
 
@@ -4274,65 +4278,6 @@ function syncHdHeight() {
   var hd = document.getElementById('topbar');
   var h = hd ? hd.offsetHeight : 0;
   document.documentElement.style.setProperty('--hd-h', h + 'px');
-}
-
-/* ── 〔預設篩選條件〕：彈出視窗 ──────────────────────────────
-
-   ## 為什麼不是 <details>
-
-   原本它是一個 `<details>`，展開的內容 `position:absolute` 掛在按鈕底下。那在
-   **每一個**視窗寬度上都是壞的，而且壞得很安靜——按下去看起來像沒反應。
-
-   原因是 `#topbar` 有 `max-height:66vh;overflow-y:auto`（那是保險絲：頁首長高
-   會把 `#main` 的高度算成負數）。而一個 `overflow` 不是 visible 的祖先，會把
-   絕對定位的子孫裁掉。實測（無頭瀏覽器量 2026-09-20 那份報告）：
-
-       桌機 1400×900   盒子 y 111–247，#topbar 只到 116  → 看得見 5px
-       手機  390×844   盒子 y 186–415，#topbar 只到 189  → 看得見 3px
-       小手機 360×640  盒子 y 186–434，#topbar 只到 189  → 看得見 3px
-
-   把 `#topbar` 的 overflow 拿掉不是選項——那條保險絲在守一個更糟的症狀
-   （圖表區整個消失而且捲不回來）。
-
-   ## 為什麼是 <dialog>
-
-   `showModal()` 把元素放進瀏覽器的 **top layer**。那一層不在任何祖先的裁切
-   範圍裡，所以這個問題從根上不存在；順便 Esc 關閉、焦點鎖在視窗內、背景遮罩
-   三件事都由瀏覽器做，不必自己寫。
-
-   舊瀏覽器（沒有 `showModal`）退回 `open` 屬性那條路。那時候 `<dialog>` 是
-   `position:absolute`，所以 CSS 裡把 `position:fixed` 寫死——否則會被裁第二次。
-   那條路沒有原生的 Esc 與遮罩，兩者都在下面補上。 */
-function rulesDlg() { return document.getElementById('rules'); }
-
-function rulesOpen() {
-  var d = rulesDlg();
-  if (!d || d.open) return;
-  if (typeof d.showModal === 'function') d.showModal();
-  else d.setAttribute('open', '');
-}
-
-function rulesClose() {
-  var d = rulesDlg();
-  if (!d || !d.open) return;
-  if (typeof d.close === 'function') d.close();
-  else d.removeAttribute('open');
-}
-
-function bindRules() {
-  var btn = document.getElementById('rules-btn');
-  if (btn) btn.addEventListener('click', rulesOpen);
-  var d = rulesDlg();
-  if (!d) return;
-  var x = d.querySelector('.rules-x');
-  if (x) x.addEventListener('click', rulesClose);
-  /* 點遮罩關掉。遮罩的點擊事件 target 就是 `<dialog>` 自己——內容全都包在
-     子元素裡，所以點到內容時 target 是那個子元素，不會誤關。 */
-  d.addEventListener('click', function (e) { if (e.target === d) rulesClose(); });
-  /* 退回 `open` 屬性的那條路沒有原生 Esc，補一個。 */
-  document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape' && d.open && typeof d.showModal !== 'function') rulesClose();
-  });
 }
 
 /* ── 讓圖表填滿 .plot 容器的實際像素高度（而非寫死的 760）────
@@ -4546,10 +4491,15 @@ function tfBadges(code) {
     html += '<span class="badge gold">ATR ' + atr.toFixed(2) + '</span>';
   /* 技術面看完，下一個問題是這家公司的體質——那個答案在隔壁那個網站上。
      target="_blank"：這一頁的圖表是有狀態的（選了哪一檔、拉到哪個範圍），
-     在原地跳走會把那些全部丟掉。 */
+     在原地跳走會把那些全部丟掉。
+
+     字是「6168詳細資訊↗」，不是「六大財務指標評等 6168↗」：它開的是整份個股
+     頁（十個分頁），不只是六大那一頁——六大那一頁由卡片底下那顆〔六大〕直達。
+     短一點也才放得進手機上量比／布林寬／ATR 那一列（見手機版的 .badge-row）。 */
   if (url)
-    html += '<a class="badge link" href="' + url + '" target="_blank" rel="noopener">' +
-            '六大財務指標評等 ' + tfEsc(code) + '↗</a>';
+    html += '<a class="badge link" href="' + url + '" target="_blank" rel="noopener"' +
+            ' title="開啟 ' + tfEsc(code) + ' 的個股頁">' +
+            tfEsc(code) + '詳細資訊↗</a>';
   badges.innerHTML = html;
 
   /* 觸發條件用**現在這組門檻**算出來的那幾個（tfPass 的回傳值），不是排程當天
@@ -4779,7 +4729,6 @@ window.addEventListener('resize', function() {
    會把前一個開好的圖蓋掉，但蓋不掉側欄上的那個亮框。 */
 document.addEventListener('DOMContentLoaded', function() {
   syncHdHeight();
-  bindRules();
 });
 """
     js = js.replace('INFO_JS_PLACEHOLDER', info_js)\
@@ -4818,7 +4767,7 @@ document.addEventListener('DOMContentLoaded', function() {
         '&nbsp;|&nbsp;\u9810\u8a2d\u9580\u6abb\u5171&nbsp;<b style="color:#3fb950">' +
         str(n) + '</b>&nbsp;\u6a94\u901a\u904e</div>',
         # 〔調整篩選條件〕就在這一行底下，**不收合**——它是這一頁的控制器，改了
-        # 就換掉左邊那排卡片。收起來的是右邊那顆燈泡裡的〔預設篩選條件〕。
+        # 就換掉左邊那排卡片。〔預設篩選條件〕移到外層網站標題旁的燈泡裡了。
         #
         # `drawn` 取自 stock_infos 而不是 results：畫圖的迴圈會跳過資料不足的那
         # 幾檔，而側欄卡片對應的圖是照 stock_infos 編號的。用 results 的索引，

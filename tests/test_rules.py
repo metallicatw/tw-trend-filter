@@ -513,7 +513,10 @@ def test_報告網頁上看得到篩選條件(tmp_path):
     出現「網頁說 1.2、Excel 說 1.1」，而那種不一致沒有任何症狀。
     """
     text = _report_html(DEFAULT_RULES, tmp_path)
-    assert 'id="rules"' in text and '篩選條件' in text
+    # 2026-09-23 起這份說明不在報告頁上顯示，而是放在 `<template id="tf-rules">`
+    # 裡，由外層網站抽出去塞進〔趨勢X六大X報酬〕旁那顆燈泡（見
+    # tests/test_report_links.py）。內容仍然只有這一份，來自 `describe()`。
+    assert 'id="tf-rules"' in text
     for label, _ in DEFAULT_RULES.describe():
         assert label in text, f'少了 {label}'
     assert '布林頻寬壓縮 ≤ 12%' in text
@@ -533,4 +536,4 @@ def test_沒給門檻就整塊不出現():
     import tw_trend_filter.pipeline as pl
 
     assert pl._live_block(None) == ''
-    assert 'id="rules"' in pl._live_block(DEFAULT_RULES)
+    assert 'id="tf-rules"' in pl._live_block(DEFAULT_RULES)

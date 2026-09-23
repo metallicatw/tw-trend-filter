@@ -645,6 +645,51 @@ SNAPSHOT_PRECISION: dict[str, int] = {
 }
 
 
+#: 快照裡拿去和門檻比的那幾格，比較的方向。
+#:
+#: 存成小數第 N 位**本身**就可能把答案翻過來：量比 1.1999996 四捨五入到六位是
+#: 1.2，`1.2 < 1.2` 為假 → 通過；桌機版拿 float64 比，1.1999996 < 1.2 → 淘汰。
+#: 機率很小，但「差一檔對不起來」正是要根除的事。
+#:
+#: 解法是**朝判定安全的方向**取整，而不是四捨五入：
+#:
+#: * 判定是「值 > 門檻才過」（close / vol20 / amt20 / six / rr）→ **無條件進位**
+#: * 判定是「值 ≥ 門檻才過」（vol_ratio）                     → **無條件捨去**
+#: * 判定是「值 ≤ 門檻才算」（bw，布林壓縮）                   → **無條件進位**
+#:
+#: 只要門檻本身落在這個小數位數的格點上（畫面上的數字框最細到 0.01），取整之後
+#: 的比較結果和 float64 原值**逐位相同**——證明見 `_toward` 的說明，
+#: `tests/test_desktop_parity.py` 拿亂數驗過。
+SNAPSHOT_DIRECTION: dict[str, str] = {
+    'close': 'up', 'vol20': 'up', 'amt20': 'up', 'six': 'up', 'rr': 'up',
+    'vol_ratio': 'down', 'bw': 'up',
+}
+
+
+def _toward(value: float, digits: int, direction: str) -> float:
+    """取到小數第 `digits` 位，但朝 `direction`（'up' 進位／'down' 捨去）。
+
+    為什麼這樣就和原值比得一模一樣：設 g 是 ≥ x 的最小格點（進位）。對任何一個
+    格點上的門檻 t，
+
+        x ≤ t  ⇔  g ≤ t      （t 是 ≥ x 的格點，而 g 是其中最小的）
+        x > t  ⇔  g > t      （上一行的否定）
+
+    捨去是鏡像。四捨五入沒有這個性質：它可能把 x 往門檻的另一邊推。
+
+    不用 `math.ceil(x * 10**d)`：乘法本身有誤差，0.12 × 1e6 會得到
+    120000.00000000001，進位之後變成 0.120001——一個剛好等於門檻的值被推到門檻
+    外面。這裡先四捨五入到最近的格點，再看它落在 x 的哪一邊，全程只做精確的比較。
+    """
+    g = round(value, digits) if digits else float(round(value))
+    step = 10.0 ** -digits
+    if direction == 'up' and g < value:
+        g = round(g + step, digits) if digits else g + 1
+    elif direction == 'down' and g > value:
+        g = round(g - step, digits) if digits else g - 1
+    return int(g) if digits == 0 else g
+
+
 def _snap_round(key: str, value: float) -> float:
     """照 `SNAPSHOT_PRECISION` 存一個數字。
 
@@ -656,6 +701,9 @@ def _snap_round(key: str, value: float) -> float:
     壞掉，而不是安靜地沿用某個預設值。
     """
     digits = SNAPSHOT_PRECISION[key]
+    direction = SNAPSHOT_DIRECTION.get(key)
+    if direction:
+        return _toward(value, digits, direction)
     return round(value) if digits == 0 else round(value, digits)
 
 
@@ -1394,6 +1442,113 @@ CROSS_MAX_AGE_DAYS = 5
 CROSS_URL = 'https://metallicatw.github.io/tw-six-metrics/cross.json'
 
 
+def indicator_snapshot(df):
+    """一檔的指標與快照數字。回 ``(numbers, ind)``。
+
+    ``numbers`` 是快照裡除了代號／名稱／產業／六大之外的每一格（已照
+    `SNAPSHOT_PRECISION`／`SNAPSHOT_DIRECTION` 取整）；``ind`` 是畫圖與 Excel
+    要用的原始序列與數值。
+
+    從 `run()` 裡的 `screen_stock` 抽出來，是為了讓 `tests/test_desktop_parity.py`
+    能拿同一份 OHLCV 餵給它和桌機版 V3.1 的判定，逐檔比對——判定寫在一個巢狀
+    函式裡的時候，沒有辦法在不下載 1,900 檔的情況下測它。
+    """
+    close, volume = df['Close'], df['Volume']
+    price = float(close.iloc[-1])
+    vol20 = float(volume.rolling(20).mean().iloc[-1])
+    amt20 = float((close*volume).rolling(20).mean().iloc[-1])
+    ma20 = close.rolling(20).mean()
+    ma60 = close.rolling(60).mean()
+    boll_ma, boll_up, boll_dn, bw = compute_bollinger(close)
+    # 前 20 日的**最高收盤價**——和桌機版 V3.1 逐字相同（2026-09-23 改回）。
+    #
+    # 這一行曾經被改成 `df['High'].rolling(20).max()`（最高價），理由是
+    # README 寫「前 20 日最高價」。那是一個「文件 vs 程式」的判斷，而真正
+    # 的規格是**使用者桌機上那支程式**：改完之後雲端和桌機每天對不起來。
+    # 2026-09-23 那天差了 4 檔（禾榮科、群聯、萊德光電、貿聯——四檔都是
+    # 收盤站上前 20 日最高收盤、卻還在盤中高點之下）。
+    #
+    # 文件改成跟程式一致，不是反過來。`tests/test_desktop_parity.py`
+    # 把桌機版的判定原封不動抄進去逐檔比對，誰再改一次定義就紅燈。
+    #
+    # `shift(1)`：窗口是 −21…−2，不含今天。
+    donchian = close.rolling(20).max().shift(1)
+    atr_val = float(compute_atr(df).iloc[-1])
+    # 量比 ＝ 今天的量 ÷ **含今天**的 20 日均量——和桌機版 V3.1 逐字相同
+    # （2026-09-23 改回）。
+    #
+    # 這一行曾經被改成分母「排除當天」（`iloc[-21:-1]`），理由是那樣比較
+    # 貼近教科書。但規格是桌機上那支程式，不是教科書：改完之後同一檔在兩
+    # 邊的量比不一樣，剛好落在 1.2 附近的那幾檔就一邊進、一邊出。
+    # 2026-09-23 實例：貿聯-KY 桌機 1.2145／雲端 1.1965，潤泰全 桌機
+    # 1.1921／雲端 1.2004。
+    vol_ratio = float(volume.iloc[-1]) / vol20 if vol20 else 0.0
+
+    # 最近一次黃金交叉是幾天前（1 = 昨天收盤那一根），找不到就 -1。
+    # 存「幾天前」而不是「有沒有」，是因為回看天數是可調的：存布林值就
+    # 回答得了任何一個回看天數，存一個布林值只回答得了當初那一個。
+    cross_ago = -1
+    for i in range(1, min(SNAPSHOT_DAYS, len(ma20) - 1) + 1):
+        if (float(ma20.iloc[-i]) > float(ma60.iloc[-i])
+                and float(ma20.iloc[-i - 1]) <= float(ma60.iloc[-i - 1])):
+            cross_ago = i
+            break
+
+    don_last = (None if pd.isna(donchian.iloc[-1])
+                else round(float(donchian.iloc[-1]), 2))
+    # 漲跌與漲跌幅。放進快照是因為側欄那排卡片現在由前端畫——它要畫
+    # 的是**通過目前門檻**的那幾檔，而那一組隨時會變，所以每一檔都得
+    # 自己帶著卡片上要顯示的東西。
+    prev = float(close.iloc[-2]) if len(close) > 1 else price
+    chg = round(price - prev, 2)
+    chg_pct = round(chg / prev * 100, 2) if prev else 0.0
+    # ②④ 的「兩個算出來的數字互比」在這裡就用完整的 float64 判掉。
+    #
+    # 這幾個判定沒有任何規則參數在調它們（`Rules` 裡沒有對應欄位），
+    # 所以答案今天算完就不會再變——而它們正是**多存幾位小數也不保險**
+    # 的那一種：close 和 ma60 可以差在小數第十位，四捨五入到哪一位都
+    # 可能把答案翻過來。存成布林值，判定就和桌機版逐位相同。
+    #
+    # ma20/ma60/boll_up/donchian 因此退回純顯示用（見 SNAPSHOT_PRECISION）。
+    ma20_last = float(ma20.iloc[-1])
+    ma60_last = float(ma60.iloc[-1])
+    boll_up_last = float(boll_up.iloc[-1])
+    don_raw = None if pd.isna(donchian.iloc[-1]) else float(donchian.iloc[-1])
+    trend_ok = price > ma60_last and ma20_last > ma60_last
+    brk_boll = price > boll_up_last
+    brk_don = don_raw is not None and price > don_raw
+
+
+    numbers = {
+        'close': _snap_round('close', price),
+        'vol20': _snap_round('vol20', vol20),
+        'amt20': _snap_round('amt20', amt20),
+        'ma20': _snap_round('ma20', ma20_last),
+        'ma60': _snap_round('ma60', ma60_last),
+        'cross_ago': cross_ago,
+        # bw 是拿去和 squeeze 門檻比的（≤ 門檻才算壓縮），所以**無條件進位**
+        # 到第六位：門檻在格點上時，判定和 float64 原值逐位相同（見 `_toward`）。
+        'bw': [_toward(float(v), 6, SNAPSHOT_DIRECTION['bw'])
+               if not pd.isna(v) else 9.0
+               for v in bw.iloc[-SNAPSHOT_DAYS:]],
+        'boll_up': _snap_round('boll_up', boll_up_last),
+        'donchian': don_last,
+        'vol_ratio': _snap_round('vol_ratio', vol_ratio),
+        'trend_ok': trend_ok,
+        'brk_boll': brk_boll,
+        'brk_don': brk_don,
+        'atr14': _snap_round('atr14', atr_val),
+        'chg': chg,
+        'chg_pct': chg_pct,
+    }
+    ind = {
+        'price': price, 'vol20': vol20, 'amt20': amt20, 'ma20': ma20, 'ma60': ma60,
+        'boll_ma': boll_ma, 'boll_up': boll_up, 'boll_dn': boll_dn, 'bw': bw,
+        'atr_val': atr_val, 'vol_ratio': vol_ratio,
+    }
+    return numbers, ind
+
+
 def load_cross_feed(url: str = '') -> dict:
     """抓 `cross.json`：{代號: [六大, 目標價, 下檔價]}，外加 `as_of` 與 `quarter`。
 
@@ -1657,7 +1812,7 @@ def run(
                     with _scan_lock:
                         _too_short[0] += 1
                     return None
-            close, volume = df['Close'], df['Volume']
+            volume = df['Volume']
             # ⚠️ **這裡不要加 `_scanned`。**
             #
             # 上一版在這裡就加了，理由是「資料拿到了、長度夠、欄位讀得開」。
@@ -1683,100 +1838,16 @@ def run(
             # 檔**的指標值，包括今天沒過的那些。沒有它們，放寬門檻就找不回任何
             # 東西，只能重跑一次三十分鐘的排程。
             code = ticker.split('.')[0]
-            price = float(close.iloc[-1])
-            vol20 = float(volume.rolling(20).mean().iloc[-1])
-            amt20 = float((close*volume).rolling(20).mean().iloc[-1])
-            ma20 = close.rolling(20).mean()
-            ma60 = close.rolling(60).mean()
-            boll_ma, boll_up, boll_dn, bw = compute_bollinger(close)
-            # 前 20 日的**最高價**，不是收盤最高。
-            #
-            # README 與報告上的觸發訊號都寫「突破前 20 日最高價（Donchian）」，
-            # 而程式原本用的是 `close.rolling(20).max()`。用收盤比較容易成立
-            # （收盤最高 ≤ 最高價最高），40 檔實測有 1 檔（2.5%）的判定會翻掉
-            # ——也就是約 2.5% 的標的是因為一個比文件寬鬆的條件進名單的。
-            #
-            # `shift(1)` 本身是對的：窗口是 −21…−2，不含今天。
-            donchian = df['High'].rolling(20).max().shift(1)
-            atr_val = float(compute_atr(df).iloc[-1])
-            # 量比的分母**排除當天**。
-            #
-            # 原本是拿 `vol20`（含當天的 20 日均量）去除，而那會把今天自己的量
-            # 灌進自己的基準：前 19 日各 1000 股、今天 1200 股（真實量比 1.20）
-            #
-            #     rolling(20).mean() 含今天 = 1010.0
-            #     量比（含）= 1.1881   ← 被第四關刷掉
-            #     量比（排除）= 1.2000 ← README 說的那個定義，剛好通過
-            #
-            # 解 `20V/(V+19a) = 1.2` → V = 1.2128a，也就是實際生效的門檻是
-            # **1.213 倍**而不是 1.2。偏差是系統性的、只往「更嚴」一個方向，
-            # 而且剛好落在門檻附近——1.20~1.213 那一段每天被無聲刷掉；
-            # 報告上印的量比也偏低，和券商軟體對不起來。
-            #
-            # 同一個檔案裡 `_looks_like_stub` 用的就是排除當天的定義
-            # （`iloc[-21:-1]`），兩種並存。統一成排除當天這一個。
-            #
-            # 實測 40 檔（資料截到 2026-09-18）：中位數 1.286 → 1.321，
-            # 第四關的判定翻轉 0 檔——這不是換一組門檻，是把同一個門檻算對。
-            vol20_base = float(volume.iloc[-21:-1].mean()) if len(volume) >= 21 else vol20
-            vol_ratio = float(volume.iloc[-1]) / vol20_base if vol20_base else 0.0
-
-            # 最近一次黃金交叉是幾天前（1 = 昨天收盤那一根），找不到就 -1。
-            # 存「幾天前」而不是「有沒有」，是因為回看天數是可調的：存布林值就
-            # 回答得了任何一個回看天數，存一個布林值只回答得了當初那一個。
-            cross_ago = -1
-            for i in range(1, min(SNAPSHOT_DAYS, len(ma20) - 1) + 1):
-                if (float(ma20.iloc[-i]) > float(ma60.iloc[-i])
-                        and float(ma20.iloc[-i - 1]) <= float(ma60.iloc[-i - 1])):
-                    cross_ago = i
-                    break
-
-            don_last = (None if pd.isna(donchian.iloc[-1])
-                        else round(float(donchian.iloc[-1]), 2))
-            # 漲跌與漲跌幅。放進快照是因為側欄那排卡片現在由前端畫——它要畫
-            # 的是**通過目前門檻**的那幾檔，而那一組隨時會變，所以每一檔都得
-            # 自己帶著卡片上要顯示的東西。
-            prev = float(close.iloc[-2]) if len(close) > 1 else price
-            chg = round(price - prev, 2)
-            chg_pct = round(chg / prev * 100, 2) if prev else 0.0
-            # ②④ 的「兩個算出來的數字互比」在這裡就用完整的 float64 判掉。
-            #
-            # 這幾個判定沒有任何規則參數在調它們（`Rules` 裡沒有對應欄位），
-            # 所以答案今天算完就不會再變——而它們正是**多存幾位小數也不保險**
-            # 的那一種：close 和 ma60 可以差在小數第十位，四捨五入到哪一位都
-            # 可能把答案翻過來。存成布林值，判定就和桌機版逐位相同。
-            #
-            # ma20/ma60/boll_up/donchian 因此退回純顯示用（見 SNAPSHOT_PRECISION）。
-            ma20_last = float(ma20.iloc[-1])
-            ma60_last = float(ma60.iloc[-1])
-            boll_up_last = float(boll_up.iloc[-1])
-            don_raw = None if pd.isna(donchian.iloc[-1]) else float(donchian.iloc[-1])
-            trend_ok = price > ma60_last and ma20_last > ma60_last
-            brk_boll = price > boll_up_last
-            brk_don = don_raw is not None and price > don_raw
-
+            numbers, ind = indicator_snapshot(df)
+            price, vol20, amt20 = ind['price'], ind['vol20'], ind['amt20']
+            ma20, ma60 = ind['ma20'], ind['ma60']
+            boll_ma, boll_up, boll_dn, bw = (ind['boll_ma'], ind['boll_up'],
+                                             ind['boll_dn'], ind['bw'])
+            atr_val, vol_ratio = ind['atr_val'], ind['vol_ratio']
             snap = {
                 'code': code, 'name': NAME_MAP.get(code, code),
                 'industry': lookup_industry(code, ISIN_INDUSTRY),
-                'close': _snap_round('close', price),
-                'vol20': _snap_round('vol20', vol20),
-                'amt20': _snap_round('amt20', amt20),
-                'ma20': _snap_round('ma20', ma20_last),
-                'ma60': _snap_round('ma60', ma60_last),
-                'cross_ago': cross_ago,
-                # bw 是拿去和 squeeze 門檻比的，而門檻來自畫面上的數字框
-                # （step 0.01）。存到小數第六位，要翻轉得有人打到第七位。
-                'bw': [round(float(v), 6) if not pd.isna(v) else 9.0
-                       for v in bw.iloc[-SNAPSHOT_DAYS:]],
-                'boll_up': _snap_round('boll_up', boll_up_last),
-                'donchian': don_last,
-                'vol_ratio': _snap_round('vol_ratio', vol_ratio),
-                'trend_ok': trend_ok,
-                'brk_boll': brk_boll,
-                'brk_don': brk_don,
-                'atr14': _snap_round('atr14', atr_val),
-                'chg': chg,
-                'chg_pct': chg_pct,
+                **numbers,
             }
             # 六大與估值。`price` 就是上面那個收盤價——報酬風險比因此和四部曲
             # 用的是同一天的同一個數字，見 `reward_risk` 的說明。

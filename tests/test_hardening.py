@@ -18,46 +18,32 @@ import tw_trend_filter.pipeline as pl
 # 量比的分母
 
 
-def test_量比的分母排除當天():
-    """以前是 `rolling(20).mean()`——把今天自己的量灌進自己的基準。
+def test_量比的分母含當天_和桌機版一樣():
+    """2026-09-23 改回桌機版 V3.1 的定義：今天的量 ÷ 含今天的 20 日均量。
 
-        前 19 日各 1000 股、今天 1200 股（真實量比 1.20）
-        含今天的均量 = 1010.0  → 量比 1.1881  ← 被第四關刷掉
-        排除今天     = 1000.0  → 量比 1.2000  ← README 說的那個定義
-
-    解 `20V/(V+19a) = 1.2` → V = 1.2128a，也就是實際生效的門檻是 **1.213 倍**。
-    偏差是系統性的、只往「更嚴」一個方向，而且剛好落在門檻附近。
+    曾經改成「排除當天」（比較貼近教科書），結果是和桌機版每天對不起來——剛好
+    落在 1.2 附近的那幾檔一邊進、一邊出（貿聯-KY 桌機 1.2145／雲端 1.1965）。
+    規格是桌機上那支程式。逐檔比對見 `tests/test_desktop_parity.py`。
     """
     src = (ROOT / 'tw_trend_filter/pipeline.py').read_text('utf-8')
-    assert 'vol20_base = float(volume.iloc[-21:-1].mean())' in src
-    assert 'vol_ratio = float(volume.iloc[-1]) / vol20_base' in src
-    assert 'vol_ratio = float(volume.iloc[-1]) / vol20 ' not in src, (
-        '還有地方用含當天的均量算量比'
-    )
-
-
-def test_那個偏差算出來就是1_213倍():
-    """不是估的：19 天 1000 股、今天 V 股，解 20V/(V+19000) = 1.2。"""
-    a = 1000.0
-    v = 1.2 * 19 * a / (20 - 1.2)
-    assert round(v / a, 3) == 1.213
-    # 也就是說，量比剛好 1.20 的那一檔，在舊算法下算出來是：
-    assert round(20 * 1.2 * a / (1.2 * a + 19 * a), 4) == 1.1881
+    assert 'vol_ratio = float(volume.iloc[-1]) / vol20 if vol20 else 0.0' in src
+    assert 'vol20_base' not in src, '又有地方用排除當天的均量算量比'
 
 
 # ---------------------------------------------------------------------------
 # Donchian
 
 
-def test_Donchian看最高價不是收盤():
-    """README 與報告上的觸發訊號都寫「突破前 20 日最高價」。
+def test_Donchian看收盤_和桌機版一樣():
+    """2026-09-23 改回桌機版 V3.1 的定義：前 20 日**最高收盤價**。
 
-    用收盤比較容易成立（收盤最高 ≤ 最高價最高），40 檔實測有 1 檔（2.5%）
-    的判定會翻掉——約 2.5% 的標的是因為一個比文件寬鬆的條件進名單的。
+    曾經改成最高價（README 當時這樣寫），結果 9/23 那天少了禾榮科、群聯、萊德
+    光電、貿聯四檔——收盤站上前 20 日最高收盤、但還在盤中高點之下。README 已
+    改成和程式一致。逐檔比對見 `tests/test_desktop_parity.py`。
     """
     src = (ROOT / 'tw_trend_filter/pipeline.py').read_text('utf-8')
-    assert "donchian = df['High'].rolling(20).max().shift(1)" in src
-    assert 'donchian = close.rolling(20).max()' not in src
+    assert 'donchian = close.rolling(20).max().shift(1)' in src
+    assert "donchian = df['High'].rolling(20).max()" not in src
 
 
 # ---------------------------------------------------------------------------

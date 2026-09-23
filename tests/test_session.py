@@ -55,9 +55,10 @@ def _series(days=150, start='2025-01-01'):
     idx = pd.bdate_range(start, periods=days)
     return pd.DataFrame(
         {'Open': [c * 0.995 for c in closes],
-         # 最高價只比收盤高 0.1%。Donchian 現在看的是**最高價**（以前看收盤），
-         # 而這份資料每天漲 0.21%——高 2% 的話今天的收盤永遠突破不了前一天的
-         # 最高價，整份合成資料就過不了第四關。
+         # 最高價只比收盤高 0.1%。Donchian 看的是前 20 日**最高收盤**（和桌機
+         # 版 V3.1 一樣），所以這一格其實不影響判定；保持貼近收盤，是讓這份
+         # 資料在兩種 Donchian 定義下都過得了——判定改來改去，這組測試問的是
+         # 佔位棒，不該跟著翻。
          'High': [c * 1.001 for c in closes],
          'Low': [c * 0.98 for c in closes],
          'Close': closes,

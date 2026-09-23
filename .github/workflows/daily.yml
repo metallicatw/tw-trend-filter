@@ -12,9 +12,19 @@ name: 每日篩選
 # 下游 tw-six-metrics 的 pages 排程在 08:47 UTC（台北 16:47）來抓這一份，所以
 # 這一趟要在 100 分鐘內跑完。job 的 timeout 是 90 分鐘，所以「跑不完」會先變成
 # 一次失敗，而不是讓下游安靜地抓到昨天那一份。
+#
+# ## 保險那一班（2026-09-23 加）
+#
+# 台北 18:17 再排一班。GitHub 負載高的時候會延遲甚至直接丟掉排程，而丟掉就是
+# 當天沒有趨勢報告。它開頭先看 Pages 上的報告是不是今天篩的（「篩選日期：今天」），
+# 是就直接結束——15:07 那班成功的日子它什麼都不做。15:07 那班跑了但沒有發布
+# （資料不健康、國定假日）的日子，它會再試一次；假日那一次一樣不會發布。
+# 整條 workflow 共用一把鎖（concurrency: daily），兩班不會同時跑。
+# 下游 tw-six-metrics 21:47 那一班建站時會把它帶進去。
 on:
   schedule:
     - cron: "07 7 * * 1-5"
+    - cron: "17 10 * * 1-5"
   workflow_dispatch:
     inputs:
       limit:
@@ -74,7 +84,32 @@ permissions:
   id-token: write
 
 jobs:
+  # 只有保險那一班（18:17）會真的檢查；主班與手動觸發一律照跑。
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - id: check
+        env:
+          SCHED: ${{ github.event.schedule }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != "schedule" ] || [ "$SCHED" != "17 10 * * 1-5" ]; then
+            exit 0
+          fi
+          today="$(TZ=Asia/Taipei date +%Y/%m/%d)"
+          # 查詢字串是為了繞過 Pages 前面那層 CDN 的快取（最多十分鐘）。
+          if curl -fsSL --max-time 60 "https://metallicatw.github.io/tw-trend-filter/?t=$(date +%s)" \
+               | grep -q "篩選日期：$today"; then
+            echo "::notice::今天（$today）的趨勢報告已經發布了，保險這一班不必跑"
+            echo "skip=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::15:07 那一班今天沒有發布報告（被 GitHub 延遲、丟掉，或資料不健康），保險這一班補跑"
+          fi
+
   screen:
+    needs: gate
+    if: needs.gate.outputs.skip != 'yes'
     runs-on: ubuntu-latest
     # 全市場約 1,900 檔，八條連線大約 20～35 分鐘。90 分鐘的上限是留給
     # Yahoo 偶爾變慢的那幾天，而不是讓一個卡住的 job 燒掉六小時。

@@ -3027,6 +3027,17 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
       }}
 
       // 一張側欄卡片。這是**唯一**一份實作——Python 那一份拿掉了。
+      // 收盤價旁邊那顆小圖示：開 Yahoo 股市那一檔的〔技術分析〕（新分頁）。
+      // 網址只帶代號、不帶 .TW／.TWO——Yahoo 自己會導到對的市場（實測上市、上櫃
+      // 都是 200、標題是對的那一檔），而這份快照裡本來就沒有市場別。
+      // stopPropagation：整張卡片點下去是開這一頁的圖，點圖示不該連圖一起換掉。
+      function tfYahoo(code) {{
+        return '<a class="nb-yf" href="https://tw.stock.yahoo.com/quote/' +
+          encodeURIComponent(code) + '/technical-analysis" target="_blank" rel="noopener"' +
+          ' title="Yahoo股市技術分析" aria-label="' + tfEsc(code) + ' Yahoo 技術分析"' +
+          ' onclick="event.stopPropagation()"></a>';
+      }}
+
       // 台股慣例：漲紅、跌綠。
       function tfCard(row, triggers, i, shortWhy) {{
         const code = row[C.code], chg = row[C.chg], pct = row[C.chg_pct];
@@ -3044,7 +3055,8 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
           (shortWhy ? ' nbshort' : '') + '" id="sb-' + i +
           '" data-code="' + tfEsc(code) + '" onclick="tfOpen(\\'' + tfEsc(code) + '\\')">' +
           '<div class="nb-top"><span class="nb-code">' + tfEsc(code) + '</span>' +
-          '<span class="nb-close ' + cls + '">' + row[C.close].toFixed(2) + '</span></div>' +
+          '<span class="nb-px"><span class="nb-close ' + cls + '">' + row[C.close].toFixed(2) +
+          '</span>' + tfYahoo(code) + '</span></div>' +
           '<div class="nb-bot"><span class="nb-name">' + tfEsc(row[C.name]) + '</span>' +
           '<span class="nb-pct ' + cls + '">' + sign + Math.abs(chg).toFixed(2) +
           ' (' + pct.toFixed(2) + '%)</span></div>' +
@@ -4021,6 +4033,15 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         '.nb-top{display:flex;justify-content:space-between;align-items:baseline}'
         '.nb-code{font-size:16px;font-weight:bold;color:#e6edf3}'
         '.nb-close{font-size:16px;font-weight:bold;color:#e6edf3}'
+        # 收盤價＋Yahoo 技術分析圖示（和 tw-six-metrics 清單上那顆同一個圖形）。
+        '.nb-px{display:inline-flex;align-items:center;gap:5px}'
+        '.nb-yf{display:inline-flex;align-items:center;justify-content:center;width:18px;'
+            'height:18px;border-radius:4px;border:1px solid #30363d;background:#0d1117;'
+            'color:#58a6ff;text-decoration:none;flex:0 0 auto}'
+        '.nb-yf:hover{border-color:#58a6ff;background:#161b22}'
+        '.nb-yf::before{content:"";width:13px;height:13px;background:currentColor;'
+            '-webkit-mask:url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27 fill=%27none%27 stroke=%27%23000%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27%3E%3Cpath d=%27M1.5 14.5h13%27 stroke-width=%271.3%27 opacity=%27.55%27/%3E%3Cpath d=%27M2 11.5l3.6-4 2.8 2.6L14 3.6M10.4 3.4H14v3.6%27 stroke-width=%271.7%27/%3E%3C/svg%3E") center/contain no-repeat;'
+            'mask:url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27 fill=%27none%27 stroke=%27%23000%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27%3E%3Cpath d=%27M1.5 14.5h13%27 stroke-width=%271.3%27 opacity=%27.55%27/%3E%3Cpath d=%27M2 11.5l3.6-4 2.8 2.6L14 3.6M10.4 3.4H14v3.6%27 stroke-width=%271.7%27/%3E%3C/svg%3E") center/contain no-repeat}'
         # 台股慣例：漲紅、跌綠。這裡原本是反過來的（美股慣例），對著台股報價
         # 看會整個讀反——紅色在這個市場代表的是「今天賺了」。
         '.nb-close.up{color:#f85149}'

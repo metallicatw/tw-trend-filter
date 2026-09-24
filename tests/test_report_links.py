@@ -117,8 +117,22 @@ def test_六大與報酬風險是連到個股頁分頁的按鈕():
     assert 'href="https://x.test/stock/6168.html#eps"' in html, "報酬/風險沒有連到 #eps"
     assert html.count('class="nb-lnk"') == 2
     # 按鈕在卡片裡：不擋下冒泡的話，點按鈕會同時觸發「選這一檔」。
-    assert html.count("event.stopPropagation()") == 2
+    # 三顆：六大、報酬/風險、收盤價旁邊的 Yahoo 技術分析（2026-09-24）
+    assert html.count("event.stopPropagation()") == 3
     assert "2.17" in html and "1.77" in html
+
+
+@needs_node
+def test_收盤價旁邊有Yahoo技術分析圖示():
+    """點圖示開 Yahoo 那一檔的〔技術分析〕；卡片本身點下去照舊是開這一頁的圖。"""
+    html = _card_html("https://x.test/stock", code="6168", six=2.17, rr=1.77)
+    assert 'href="https://tw.stock.yahoo.com/quote/6168/technical-analysis"' in html
+    yf = html[html.index('class="nb-yf"'):]
+    yf = yf[:yf.index("</a>")]
+    assert 'target="_blank"' in yf and "event.stopPropagation()" in yf
+    # 圖示緊貼在收盤價後面（同一個 .nb-px 裡）
+    px = html[html.index('class="nb-px"'):]
+    assert px.index('class="nb-close') < px.index('class="nb-yf"') < px.index("</span></div>")
 
 
 @needs_node
@@ -134,7 +148,8 @@ def test_兩顆按鈕在卡片最底下_舊的六大箭頭拿掉了():
 @needs_node
 def test_沒有個股頁網址就是標籤不是壞連結():
     html = _card_html("", code="6168", six=2.17, rr=1.77)
-    assert "<a " not in html
+    # 唯一的連結是收盤價旁邊那顆 Yahoo 技術分析——它不依賴個股頁網址
+    assert html.count("<a ") == 1 and '<a class="nb-yf"' in html
     assert html.count('class="nb-lnk"') == 2
 
 

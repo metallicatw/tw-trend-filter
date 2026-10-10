@@ -64,6 +64,19 @@ def test_母體有下界():
     assert 'elif len(extracted):' in src, '下界沒有真的擋住 got.add'
 
 
+def test_ISIN頁用cp950解碼_碁字不會變亂碼():
+    """宏碁、安碁、啟碁、建碁……名字裡有「碁」的股票，報告上全變成「宏��」。
+
+    「碁」是倚天擴充字（Big5 F9D6），Python 的 big5 表沒有它；cp950 有。
+    """
+    raw = '6174  安碁'.encode('cp950') + b' ' + '6690  安碁資訊'.encode('cp950')
+    assert raw.decode('cp950') == '6174  安碁 6690  安碁資訊'
+    assert '\ufffd' in raw.decode('big5', 'replace'), '如果 big5 也解得出來，這條測試就沒意義了'
+    src = (ROOT / 'tw_trend_filter/pipeline.py').read_text('utf-8')
+    assert "resp.encoding = 'cp950'" in src
+    assert "resp.encoding = 'big5'" not in src
+
+
 # ---------------------------------------------------------------------------
 # 指令打錯不要和「跑完了但不可信」共用結束碼
 

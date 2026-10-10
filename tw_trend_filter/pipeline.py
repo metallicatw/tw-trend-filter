@@ -973,7 +973,11 @@ def load_tw_stock_universe():
     ]:
         try:
             resp = requests.get(url, timeout=20, headers={'User-Agent':'Mozilla/5.0'})
-            resp.encoding = 'big5'
+            # **cp950，不是 big5。** Python 的 big5 編碼表沒有倚天擴充字
+            # （碁 F9D6、銹、裏、墻、恒、粧、嫺），解出來變成 �，而且位元組錯位
+            # 會連帶吃掉後面的字：宏碁→「宏��」、安碁資訊→「安�硌穈T」。
+            # 證交所的 ISIN 頁實際是 cp950（微軟版 Big5，含這幾個字）。
+            resp.encoding = 'cp950'
             tables = pd.read_html(StringIO(resp.text), header=0)
             df = tables[0].dropna(how='all').astype(str)
 
@@ -3011,7 +3015,7 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
         if (r.min_six > 0 && (row[C.six] === null || row[C.six] === undefined)) {{
           return '沒有六大評分';
         }}
-        return '沒有報酬風險比（多半是缺〔年度交易資訊〕，算不出本益比區間）';
+        return '沒有報酬風險比（多半是歷年本益比不足 3 個完整年度，算不出本益比區間）';
       }}
 
       // 「這一檔為什麼沒有報酬風險比」——只有兩種，而它們的意思正好相反。

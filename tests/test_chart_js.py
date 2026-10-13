@@ -290,3 +290,14 @@ def test_視窗範圍不會把停損線切掉():
     s = _series()
     lo, hi, _vhi = _chart_window(s)
     assert lo <= s["stop"] <= hi, f"停損 {s['stop']} 落在 [{lo}, {hi}] 外面"
+
+
+def test_布林三條軌道上下軌都在圖例上():
+    """2026-10-13：圖例上有〔布林上軌〕卻沒有〔布林下軌〕。
+
+    兩條是同一個顏色、同一種虛線，只標一條，讀者會以為下面那條是別的東西。
+    中軌是灰色細點線、不是通道的邊，維持不上圖例。
+    """
+    fig = _py_figure(_series())
+    shown = {t.get("name") for t in fig["data"] if t.get("showlegend")}
+    assert {"布林上軌", "布林下軌"} <= shown, shown

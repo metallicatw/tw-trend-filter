@@ -3578,7 +3578,8 @@ def _chart_figure(s):
         x=dates, y=bd, mode='lines', name='布林下軌',
         line=dict(color=BBC, width=1.2, dash='dot'),
         fill='tonexty', fillcolor='rgba(88,166,255,0.08)',
-        showlegend=False, hoverinfo='skip',
+        # 圖例上要有它（2026-10-13）：上軌有、下軌沒有，讀者會以為那條虛線是別的東西
+        showlegend=True, hoverinfo='skip',
     ), row=1, col=1)
 
     # ③ BB 中軌

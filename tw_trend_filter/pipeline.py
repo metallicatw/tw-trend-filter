@@ -1615,6 +1615,97 @@ def load_cross_feed(url: str = '') -> dict:
     return payload
 
 
+# ── Yahoo 整天缺一根：用官方逐日行情補（2026-10-13）─────────────────────────
+#
+# 2026-10-13 發現：Yahoo 的台股日線**整個市場**少了 2026-10-12（週一，正常交易日），
+# 往前比對 809 個官方交易日還少了 2025-08-01。少一根不只是圖上缺一天：
+#
+#   * 10/13 那一根的漲跌變成「對 10/08」——久元（6261）實際 -0.1，報告上是 +7.50（+9.82%）；
+#   * 20 日均量、量比、布林、20 日高點、ATR 的窗口全部往前多吃一天，
+#     量比 9.52x（實際 10/13 量 7,747 張、10/12 量 3,128 張）這種數字就是這樣來的。
+#
+# 補法：開掃前那五檔權值股（`SESSION_PROBES`）的日期聯集裡，「週一到週五卻沒有
+# 那一根」的日子逐一去 tw-six-metrics 問官方行情（它每天從證交所／櫃買中心抓下來，
+# 一天一個檔：`data/market/daily/prices/YYYY-MM-DD.csv.gz`）。問得到＝那天有交易、
+# 是 Yahoo 漏了；404＝國定假日。只補「全市場都缺」的日子——個股自己停牌少一根
+# 是真的沒有交易，不能補。
+#
+# 價格要換算成 Yahoo 的還原價（`auto_adjust=True`）：官方是原始價。用官方那一列的
+# 漲跌推回前一天的原始收盤（close − change，除權息日就是參考價），再和 Yahoo 前一天的
+# 還原收盤相除當換算倍數。量（股）兩邊單位相同，不換算。
+OFFICIAL_DAILY_URL = ('https://raw.githubusercontent.com/metallicatw/tw-six-metrics/'
+                      'main/data/market/daily/prices/{date}.csv.gz')
+
+
+def market_gaps(frames) -> list:
+    """權值股日期聯集裡，週一到週五卻一根都沒有的日子（不含最後一根之後）。"""
+    days = set()
+    for d in frames:
+        days.update(pd.to_datetime(d.index).tz_localize(None).normalize())
+    if len(days) < 2:
+        return []
+    lo, hi = min(days), max(days)
+    return [t for t in pd.bdate_range(lo, hi) if t not in days]
+
+
+def load_official_day(day, url: str = '') -> dict:
+    """一天的官方行情：{代號: (開, 高, 低, 收, 量, 前一天原始收盤)}。問不到（假日、斷線）回 {}。"""
+    import csv
+    import gzip
+    import io
+    import urllib.request
+
+    target = (url or OFFICIAL_DAILY_URL).format(date=f'{day:%Y-%m-%d}')
+    try:
+        with urllib.request.urlopen(target, timeout=20) as resp:
+            raw = resp.read()
+    except Exception:                               # noqa: BLE001 - 404 就是假日
+        return {}
+    try:
+        text = gzip.decompress(raw).decode('utf-8')
+    except OSError:
+        text = raw.decode('utf-8', 'replace')
+    out = {}
+    for r in csv.DictReader(io.StringIO(text)):
+        try:
+            o, h, lo, c = (float(r[k]) for k in ('open', 'high', 'low', 'close'))
+            v = float(r['volume'])
+            chg = float(r['change'] or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if c > 0 and o > 0:
+            out[str(r['code']).strip()] = (o, h, lo, c, v, c - chg)
+    return out
+
+
+def fill_gap_rows(df, code: str, gaps: dict):
+    """把 `gaps`（{日期: load_official_day 的結果}）裡這一檔有的那幾天補進 `df`。
+
+    `df` 是已經攤平欄位、去掉時區的日線（Open/High/Low/Close/Volume）。這一檔那天
+    沒有官方資料（停牌、還沒上市）就不補。回傳新的 DataFrame（照日期排好）。
+    """
+    if not gaps or df is None or not len(df):
+        return df
+    add = []
+    for day, rows in gaps.items():
+        row = rows.get(code)
+        if row is None or day in df.index or day < df.index[0] or day > df.index[-1]:
+            continue
+        o, h, lo, c, v, prev_raw = row
+        before = df.loc[df.index < day, 'Close']
+        k = 1.0
+        if len(before) and prev_raw > 0:
+            k = float(before.iloc[-1]) / prev_raw
+            if not (0.2 < k < 5):                    # 對不上（例如減資）就不換算
+                k = 1.0
+        add.append(pd.DataFrame({'Open': [o * k], 'High': [h * k], 'Low': [lo * k],
+                                 'Close': [c * k], 'Volume': [v]}, index=[day]))
+    if not add:
+        return df
+    out = pd.concat([df] + add)
+    return out[~out.index.duplicated(keep='first')].sort_index()
+
+
 def run(
     output_dir: str,
     *,
@@ -1634,6 +1725,7 @@ def run(
     data_dir: str = '',
     data_base: str = '',
     cross_url: str = '',
+    official_url: str = '',
     breaker: 'RateLimitBreaker | None' = None,
     session_probes: tuple | None = None,
 ) -> dict:
@@ -1709,6 +1801,8 @@ def run(
     #: 由開掃前的那一次投票決定，見 `stub_vote`。放進 list 是因為 `screen_stock`
     #: 是巢狀函式，要讀的是**投完票之後**的值。
     _asof = [None]
+    #: Yahoo 整個市場漏掉、官方查得到的日子：{日期: load_official_day 的結果}。開掃前填好。
+    _gaps: dict = {}
     # 每一檔的指標快照（**包含今天沒過篩的**）。網頁上的即時重篩讀這一份。
     SNAPSHOTS: list[dict] = []
     _snap_lock = _threading.Lock()
@@ -1801,6 +1895,8 @@ def run(
                 df.columns = df.columns.droplevel(1)
             df = df.dropna(subset=['Close','Volume'])
             df.index = pd.to_datetime(df.index).tz_localize(None)
+            # Yahoo 整個市場漏掉的那幾天，用官方行情補回來（見 `fill_gap_rows`）
+            df = fill_gap_rows(df, ticker.split('.')[0], _gaps)
             # 今天那一場交易還沒發生的話，整批砍到最後一個真的收過盤的日子
             # （見 `stub_vote`）。
             #
@@ -2156,6 +2252,18 @@ def run(
     elif probes:
         idx = pd.to_datetime(probes[0].index).tz_localize(None)
         print(f'📅 資料基準：{idx[-1]:%Y-%m-%d}（權值股的最後一根是真的收過盤的）')
+
+    # ── Yahoo 整天缺一根的日子：問官方行情補（見 `fill_gap_rows`）──────────
+    if official_url != '-' and probes:
+        for day in market_gaps(probes):
+            if _asof[0] is not None and day > _asof[0]:
+                continue
+            rows = load_official_day(day, official_url)
+            if rows:
+                _gaps[day] = rows
+        if _gaps:
+            print('🩹 Yahoo 整個市場少了這幾天，改用官方逐日行情補上：'
+                  + '、'.join(f'{d:%Y-%m-%d}（{len(r)} 檔）' for d, r in sorted(_gaps.items())))
 
     _lock    = threading.Lock()
     RESULTS  = []

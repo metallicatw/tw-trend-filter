@@ -71,6 +71,7 @@ def _run(args, rules):
         data_dir=args.data_dir,
         data_base=args.data_base,
         cross_url=args.cross_url,
+        official_url=args.official_url,
         open_when_done=args.local,
         rules=rules,
     )
@@ -142,6 +143,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument('--cross-url', default='',
                     help='六大評分與估值的來源（預設是 tw-six-metrics 的 '
                          'cross.json；填 "-" 代表不抓）')
+    # Yahoo 偶爾整個市場少一天（2026-10-12、2025-08-01），用官方逐日行情補。
+    ap.add_argument('--official-url', default='',
+                    help='官方逐日行情的網址樣板（{date} 換成 YYYY-MM-DD；預設是 tw-six-metrics 的 '
+                         'data/market/daily/prices；填 "-" 代表不補）')
     ap.add_argument('--link-base', default='',
                     help='個股頁連結的前綴，例如 '
                          'https://metallicatw.github.io/tw-six-metrics/stock')

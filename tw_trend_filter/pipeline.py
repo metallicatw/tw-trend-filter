@@ -3135,7 +3135,9 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
         if (row[C.rr_free]) return '無風險';
         const rr = row[C.rr];
         if (rr === null || rr === undefined) return '—';
-        return rr <= 0 ? '空頭' : rr.toFixed(2);
+        // 目標價低於股價＝價格高估（估值判斷）。2026-10-14 前叫「空頭」，但那是走勢用語：
+        // 高估值的股票走勢照樣可以是多頭，而這一頁本來就是在篩多頭走勢。
+        return rr <= 0 ? '價格高估' : rr.toFixed(2);
       }}
 
       // 一張側欄卡片。這是**唯一**一份實作——Python 那一份拿掉了。
@@ -3200,7 +3202,7 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
         const hasRr = row[C.rr] !== null && row[C.rr] !== undefined || row[C.rr_free];
         if (!hasSix && !hasRr) return '';
         const code = row[C.code];
-        const rrTitle = '報酬風險比（無風險 ＝ 股價已低於下檔價；空頭 ＝ 預期報酬為負）' +
+        const rrTitle = '報酬風險比（無風險 ＝ 股價已低於下檔價；價格高估 ＝ 目標價低於現價、預期報酬為負）' +
           (TF_CROSS_AS_OF.as_of ? '。估值基準 ' + TF_CROSS_AS_OF.as_of +
             '，財報 ' + (TF_CROSS_AS_OF.quarter || '?') : '');
         function one(label, value, tab, title) {{

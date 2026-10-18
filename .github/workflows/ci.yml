@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt pytest PyYAML
+      - run: python -m pytest tests -q
+
+      - name: 確認 plotly 的 CDN 網址拿得到
+        run: |
+          set -euo pipefail
+          for name in PLOTLY_CDN PLOTLY_CDN_FALLBACK; do
+            url=$(python -c "from tw_trend_filter.pipeline import $name; print($name)")
+            test -n "$url" || { echo "::error::$name 是空的"; exit 1; }
+            echo "檢查 $name = $url"
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -L "$url")
+            size=$(curl -sS -o /dev/null -w '%{size_download}' -L "$url")
+            echo "  HTTP $code，$size 位元組"
+            test "$code" = "200" || { echo "::error::$name 回 $code"; exit 1; }
+            test "$size" -gt 1000000 || {
+              echo "::error::$name 拿到的不是函式庫（只有 $size 位元組）"; exit 1; }
+          done
+
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: 掃 40 檔
+        id: smoke
+        run: |
+          set +e
+          python -m tw_trend_filter \
+            --output-dir output --limit 40 \
+            --link-base "https://metallicatw.github.io/tw-six-metrics/stock"
+          code=$?
+          set -e
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 2 ]; then
+            echo "::warning::上游資料不完整，這一趟不算數（結束碼 2）。整條路能不能走通這次沒有驗到。"
+            exit 0
+          fi
+          exit "$code"
+      - name: 確認產出
+        if: steps.smoke.outputs.code == '0'
+        run: |
+          ls -la output/
+          test -n "$(ls output/snapshot_*.json.gz 2>/dev/null)" || { echo "::error::沒有產生全市場快照"; exit 1; }
+          if [ -z "$(ls output/*.html 2>/dev/null)" ]; then
+            echo "::notice::這 40 檔今天沒有標的通過篩選，所以沒有 HTML——這是正常的"
+          fi

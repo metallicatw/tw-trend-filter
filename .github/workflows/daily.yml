@@ -1,0 +1,216 @@
+name: 每日篩選
+
+on:
+  schedule:
+    - cron: "07 7 * * 1-5"
+    - cron: "17 10 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "只掃前 N 檔（留空 = 全市場）。用來快速驗證整條路走不走得通。"
+        required: false
+        default: ""
+      min_price:
+        description: "① 股價下限，元（留空 = 10）"
+        required: false
+        default: ""
+      min_amount_m:
+        description: "① 20日均成交額下限，百萬元（留空 = 50）"
+        required: false
+        default: ""
+      lookback:
+        description: "③ 往回看幾個交易日找黃金交叉／壓縮（留空 = 10）"
+        required: false
+        default: ""
+      squeeze:
+        description: "③ 布林頻寬壓縮門檻，比例（留空 = 0.12，也就是 12%）"
+        required: false
+        default: ""
+      vol_ratio:
+        description: "④ 當日量 ÷ 20日均量的下限（留空 = 1.2）"
+        required: false
+        default: ""
+      atr_stop:
+        description: "停損 = 收盤 − 這個倍數 × ATR(14)（留空 = 3）"
+        required: false
+        default: ""
+
+concurrency:
+  group: daily
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - id: check
+        env:
+          SCHED: ${{ github.event.schedule }}
+          TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != "schedule" ] || [ "$SCHED" != "17 10 * * 1-5" ]; then
+            exit 0
+          fi
+          today="$(TZ=Asia/Taipei date +%Y/%m/%d)"
+          git init -q r && cd r
+          if git fetch -q --depth 1 "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" report 2>/dev/null \
+             && git show FETCH_HEAD:index.html | grep -q "篩選日期：$today"; then
+            echo "skip=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::earlier run did not publish; running now"
+          fi
+
+  screen:
+    needs: gate
+    if: needs.gate.outputs.skip != 'yes'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment:
+      name: github-pages
+      url: ${{ steps.pages.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: 全市場篩選
+        id: screen
+        env:
+          LIMIT: ${{ github.event.inputs.limit || 0 }}
+          MIN_PRICE:    ${{ github.event.inputs.min_price }}
+          MIN_AMOUNT_M: ${{ github.event.inputs.min_amount_m }}
+          LOOKBACK:     ${{ github.event.inputs.lookback }}
+          SQUEEZE:      ${{ github.event.inputs.squeeze }}
+          VOL_RATIO:    ${{ github.event.inputs.vol_ratio }}
+          ATR_STOP:     ${{ github.event.inputs.atr_stop }}
+        run: |
+          set +e
+          flags=()
+          [ -n "$MIN_PRICE" ]    && flags+=(--min-price    "$MIN_PRICE")
+          [ -n "$MIN_AMOUNT_M" ] && flags+=(--min-amount-m "$MIN_AMOUNT_M")
+          [ -n "$LOOKBACK" ]     && flags+=(--lookback     "$LOOKBACK")
+          [ -n "$SQUEEZE" ]      && flags+=(--squeeze      "$SQUEEZE")
+          [ -n "$VOL_RATIO" ]    && flags+=(--vol-ratio    "$VOL_RATIO")
+          [ -n "$ATR_STOP" ]     && flags+=(--atr-stop     "$ATR_STOP")
+          python -m tw_trend_filter \
+            --output-dir output \
+            --index index.html \
+            --link-base "https://metallicatw.github.io/tw-six-metrics/stock" \
+            --data-dir pages/trend-d \
+            --data-base "https://metallicatw.github.io/tw-trend-filter/trend-d" \
+            --cross-url "https://metallicatw.github.io/tw-six-metrics/cross.json" \
+            --limit "$LIMIT" \
+            "${flags[@]}"
+          code=$?
+          set -e
+          if [ "$code" -eq 3 ]; then
+            echo "::error::指令的參數有問題，程式根本沒有跑起來（詳見上面的錯誤訊息）"
+            exit 1
+          fi
+          if [ "$code" -eq 2 ]; then
+            echo "::warning::母體覆蓋率不足，這一趟不發布報告"
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "::error::手動觸發的這一趟不可信，沒有發布任何東西"
+              exit 1
+            fi
+            exit 0
+          fi
+          exit "$code"
+
+      - name: 發布全市場快照到 Releases
+        if: hashFiles('output/snapshot_*.json.gz') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DAY: ${{ steps.screen.outputs.asof || steps.screen.outputs.date }}
+          COUNT: ${{ steps.screen.outputs.count }}
+        run: |
+          set -euo pipefail
+          tag="snap-${DAY:-$(date -u +%F)}"
+          snap=$(ls output/snapshot_*.json.gz | head -1)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag 已經在，覆蓋附件"
+            gh release upload "$tag" "$snap" --clobber
+          else
+            gh release create "$tag" "$snap" \
+              --title "${DAY}" --notes ""
+          fi
+          echo "  $(basename "$snap") → $tag"
+
+      - name: 發布報告到 report 分支
+        if: steps.screen.outputs.publishable == 'yes'
+        run: |
+          test -s index.html || { echo "::error::沒有產生 index.html"; exit 1; }
+          npm install --prefix /tmp/ts --no-save --silent typescript@5.6.3 >/dev/null 2>&1 || true
+          NODE_PATH=/tmp/ts/node_modules python tools/strip_comments.py index.html
+          cp index.html /tmp/report.html
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan report
+          git rm -rq --cached .
+          cp /tmp/report.html index.html
+          git add -f index.html
+          git commit -q -m "report"
+          git push -f origin report
+
+      - name: 準備 Pages 內容
+        if: steps.screen.outputs.publishable == 'yes'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          test -s index.html || { echo "::error::沒有產生 index.html"; exit 1; }
+          mkdir -p pages
+          printf '<!doctype html><meta name="robots" content="noindex,nofollow"><title>404</title>' > pages/index.html
+          n=$(find pages/trend-d -name '*.json' 2>/dev/null | wc -l)
+          du -sh pages 2>/dev/null || true
+          echo "Pages：$n 檔的圖表資料（不放報告頁）"
+          if [ "$n" -eq 0 ]; then
+            echo "::warning::圖表資料一個檔都沒有——報告上點沒過篩的股票會說抓不到"
+          fi
+
+      - uses: actions/configure-pages@v5
+        if: steps.screen.outputs.publishable == 'yes'
+        continue-on-error: true
+        with:
+          enablement: true
+
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.screen.outputs.publishable == 'yes'
+        continue-on-error: true
+        with:
+          path: pages
+
+      - name: 發布 Pages
+        if: steps.screen.outputs.publishable == 'yes'
+        continue-on-error: true
+        id: pages
+        uses: actions/deploy-pages@v4
+
+      - name: 摘要
+        if: always()
+        run: |
+          {
+            echo "### 台股順勢交易篩選 ${{ steps.screen.outputs.date }}"
+            echo ""
+            echo "* 母體：${{ steps.screen.outputs.universe }} 檔（其中 ${{ steps.screen.outputs.too_short || 0 }} 檔新上市、歷史不足，算不了 60MA）"
+            echo "* 真的掃到：${{ steps.screen.outputs.scanned }} 檔 ｜ 沒掃成：${{ steps.screen.outputs.errors || 0 }} 檔"
+            echo "* 這一趟算不算數：**${{ steps.screen.outputs.healthy || '不明' }}**"
+            echo "* 可以發布嗎：**${{ steps.screen.outputs.publishable || '不明' }}**（full run＋預設門檻＋資料可信）"
+            echo "* 資料基準：**${{ steps.screen.outputs.asof || steps.screen.outputs.date }}**"
+            echo "* 記帳對得起來嗎：${{ steps.screen.outputs.balanced || '不明' }}（scanned＋errors＋too_short ＝ 母體）"
+            echo "* 通過：**${{ steps.screen.outputs.count }}** 檔"
+            echo "* 門檻：${{ steps.screen.outputs.rules || 'default' }}"
+            echo "* 全市場快照在 Releases（每個交易日一份）"
+          } >> "$GITHUB_STEP_SUMMARY"

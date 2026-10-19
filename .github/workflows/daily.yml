@@ -46,7 +46,7 @@ permissions:
 
 jobs:
   gate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       skip: ${{ steps.check.outputs.skip }}
     steps:
@@ -70,7 +70,7 @@ jobs:
   screen:
     needs: gate
     if: needs.gate.outputs.skip != 'yes'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     environment:
       name: github-pages

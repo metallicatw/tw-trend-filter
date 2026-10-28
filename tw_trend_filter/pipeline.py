@@ -148,6 +148,45 @@ def _looks_like_stub(df) -> bool:
 
 
 STUB_VOTE_RATIO = 0.5
+CLOSED_VOTE_RATIO = 0.6
+
+
+def _flat(df):
+    if df is not None and isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.droplevel(1)
+    return df
+
+
+def closed_days(frames, ratio: float = CLOSED_VOTE_RATIO) -> set:
+    votes: dict = {}
+    n = 0
+    for df in frames:
+        df = _flat(df)
+        if df is None or not len(df):
+            continue
+        try:
+            vol, hi, lo = df['Volume'].astype(float), df['High'].astype(float), df['Low'].astype(float)
+        except Exception:                               # noqa: BLE001
+            continue
+        n += 1
+        idx = pd.to_datetime(df.index).tz_localize(None).normalize()
+        for d, v, h, l in zip(idx, vol, hi, lo):
+            if v == 0 and h == l:
+                votes[d] = votes.get(d, 0) + 1
+    if not n:
+        return set()
+    need = max(2, ratio * n) if n >= 2 else 1
+    return {d for d, k in votes.items() if k >= need}
+
+
+def drop_closed(df, closed: set):
+    if not closed or df is None or not len(df):
+        return df
+    idx = pd.to_datetime(df.index)
+    if getattr(idx, 'tz', None) is not None:
+        idx = idx.tz_localize(None)
+    return df[~idx.normalize().isin(list(closed))]
 
 
 SESSION_SETTLED_HOUR = 14
@@ -970,6 +1009,7 @@ def run(
     _breaker = breaker if breaker is not None else RateLimitBreaker()
     _asof = [None]
     _gaps: dict = {}
+    _closed: set = set()
     SNAPSHOTS: list[dict] = []
     _snap_lock = _threading.Lock()
     CHARTS: dict[str, dict] = {}
@@ -1007,6 +1047,7 @@ def run(
                 df.columns = df.columns.droplevel(1)
             df = df.dropna(subset=['Close','Volume'])
             df.index = pd.to_datetime(df.index).tz_localize(None)
+            df = drop_closed(df, _closed)
             df = fill_gap_rows(df, ticker.split('.')[0], _gaps)
             if _asof[0] is not None:
                 df = df[df.index <= _asof[0]]
@@ -1139,6 +1180,16 @@ def run(
                 d = d.copy()
                 d.columns = d.columns.droplevel(1)
             probes.append(d)
+    _closed.update(closed_days(probes))
+    if _closed:
+        print('⛔ 這幾天整個市場沒有交易（例如颱風停止上班上課而休市），Yahoo 仍放了一根量為 0 的平盤 K 棒，'
+              '已從每一檔剔除：' + '、'.join(f'{d:%Y-%m-%d}' for d in sorted(_closed)))
+        probes = [drop_closed(_flat(d), _closed) for d in probes]
+        probes = [d for d in probes if d is not None and len(d)]
+        lasts = [pd.to_datetime(d.index[-1]).tz_localize(None) for d in probes]
+        if lasts and max(_closed) > max(lasts):
+            _asof[0] = max(lasts)
+            print(f'   今天休市，整批算到 {_asof[0]:%Y-%m-%d} 為止。')
     reason = ''
     if probes and stub_vote(probes):
         reason = ('權值股的最後一根是「還沒開盤」的佔位棒'

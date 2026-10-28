@@ -257,3 +257,41 @@ def test_算到一半丟例外的那幾檔不可以算成掃到(tmp_path, monkey
     assert res['scanned'] + res['errors'] + res['too_short'] == len(CODES), (
         '記帳對不起來：scanned + errors + too_short != 母體'
     )
+
+
+def _with_closed(df, *, last=True):
+    prev = df.iloc[-1] if last else df.iloc[-6]
+    c = float(prev['Close'])
+    row = pd.DataFrame({'Open': [c], 'High': [c], 'Low': [c], 'Close': [c], 'Volume': [0]},
+                       index=[df.index[-1] + pd.Timedelta(days=1)] if last else [df.index[-5] - pd.Timedelta(hours=12)])
+    out = pd.concat([df, row]).sort_index()
+    return out
+
+
+def test_颱風停市那一根量為零的平盤棒要剔除_當天算到前一個交易日(tmp_path, monkeypatch):
+    base = _series()
+    res = _run(tmp_path, monkeypatch, lambda *a, **k: _with_closed(base))
+    assert res['asof'] == f'{base.index[-1]:%Y-%m-%d}'
+    assert len(res['results']) == len(CODES), f"只過了 {len(res['results'])}/{len(CODES)} 檔"
+
+
+def test_停市日留在歷史裡也要剔除_不能拉低均量(tmp_path, monkeypatch):
+    base = _series()
+    i = max(k for k in range(len(base) - 1) if (base.index[k + 1] - base.index[k]).days == 3 and k < len(base) - 3)
+    c = float(base['Close'].iloc[i])
+    row = pd.DataFrame({'Open': [c], 'High': [c], 'Low': [c], 'Close': [c], 'Volume': [0]},
+                       index=[base.index[i] + pd.Timedelta(days=1)])
+    closed = pd.concat([base, row]).sort_index()
+    ref = _run(tmp_path / 'a', monkeypatch, lambda *a, **k: base)
+    got = _run(tmp_path / 'b', monkeypatch, lambda *a, **k: closed)
+    r1 = {r['code']: r['vol_ratio'] for r in ref['results']}
+    r2 = {r['code']: r['vol_ratio'] for r in got['results']}
+    assert r1 and r1 == r2, '停市那一根沒有剔除，20 日均量被拉低了'
+    assert got['asof'] is None
+
+
+def test_少數幾檔量為零不算停市():
+    a, b = _series(), _series()
+    frames = [_with_closed(a)] + [b] * 4
+    assert pl.closed_days(frames) == set()
+    assert len(pl.closed_days([_with_closed(_series())] * 5)) == 1

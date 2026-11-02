@@ -1595,6 +1595,16 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
           ' onclick="event.stopPropagation()"></a>';
       }}
 
+      // 名稱旁的〔概況〕：開金股道〔籌碼雷達〕的〈基本面與籌碼概況〉面板（全站一致）。
+      // TF_LINK 是個股頁的位置（…/stock），籌碼雷達在它的上一層。沒有 TF_LINK 就不放。
+      function tfIns(code) {{
+        if (!TF_LINK) return '';
+        const site = TF_LINK.replace(/\/?stock$/, '');
+        return '<a class="nb-ins" href="' + (site ? site + '/' : '') + 'radar.html#t1-' +
+          encodeURIComponent(code) + '-ins" target="_blank" rel="noopener"' +
+          ' title="基本面與籌碼概況（籌碼雷達，另開分頁）" onclick="event.stopPropagation()">概況</a>';
+      }}
+
       // 台股慣例：漲紅、跌綠。
       function tfCard(row, triggers, i, shortWhy) {{
         const code = row[C.code], chg = row[C.chg], pct = row[C.chg_pct];
@@ -1614,7 +1624,7 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
           '<div class="nb-top"><span class="nb-code">' + tfEsc(code) + '</span>' +
           '<span class="nb-px"><span class="nb-close ' + cls + '">' + row[C.close].toFixed(2) +
           '</span>' + tfYahoo(code) + '</span></div>' +
-          '<div class="nb-bot"><span class="nb-name">' + tfEsc(row[C.name]) + '</span>' +
+          '<div class="nb-bot"><span class="nb-name">' + tfEsc(row[C.name]) + tfIns(code) + '</span>' +
           '<span class="nb-pct ' + cls + '">' + sign + Math.abs(chg).toFixed(2) +
           ' (' + pct.toFixed(2) + '%)</span></div>' +
           '<div class="nb-ind">' + tfEsc(row[C.industry] || '') + '</div>' +
@@ -2376,6 +2386,9 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         '.nb-bot{display:flex;justify-content:space-between;align-items:baseline;'
             'margin-top:2px;font-size:12px;color:#8b949e}'
         '.nb-pct{font-weight:bold}'
+        '.nb-ins{margin-left:6px;padding:0 6px;border:1px solid #30363d;border-radius:999px;'
+            'color:#58a6ff;font-size:11px;font-weight:600;text-decoration:none;white-space:nowrap}'
+        '.nb-ins:hover{border-color:#58a6ff;background:#161b22}'
         '.nb-pct.up{color:#f85149}'
         '.nb-pct.dn{color:#3fb950}'
         '.nb-pct.fl{color:#8b949e}'

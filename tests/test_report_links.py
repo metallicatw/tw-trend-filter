@@ -94,7 +94,8 @@ def test_六大與報酬風險是連到個股頁分頁的按鈕():
     assert 'href="https://x.test/stock/6168.html#six"' in html, "六大沒有連到 #six"
     assert 'href="https://x.test/stock/6168.html#eps"' in html, "報酬/風險沒有連到 #eps"
     assert html.count('class="nb-lnk"') == 2
-    assert html.count("event.stopPropagation()") == 4               # Yahoo、六大、報酬/風險、概況
+    assert html.count("event.stopPropagation()") == 3
+    assert 'onclick="return tfInsOpen(event, this)"' in html and 'data-ins="6168"' in html
     assert 'href="https://x.test/radar.html#t1-6168-ins"' in html, "名稱旁的〔概況〕沒有連到籌碼雷達"
     assert "2.17" in html and "1.77" in html
 

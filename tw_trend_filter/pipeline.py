@@ -1595,14 +1595,27 @@ def _live_block(rules, snapshots=None, drawn=None, link_base='', data_base='',
           ' onclick="event.stopPropagation()"></a>';
       }}
 
-      // 名稱旁的〔概況〕：開金股道〔籌碼雷達〕的〈基本面與籌碼概況〉面板（全站一致）。
+      // 名稱旁的〔概況〕：在金股道裡（這份報告嵌在〔趨勢×六大×報酬〕的 iframe）就請外層頁面
+      // 在右側打開〈基本面與籌碼概況〉面板；單獨打開報告時照連結到〔籌碼雷達〕。
       // TF_LINK 是個股頁的位置（…/stock），籌碼雷達在它的上一層。沒有 TF_LINK 就不放。
       function tfIns(code) {{
         if (!TF_LINK) return '';
         const site = TF_LINK.replace(/\/?stock$/, '');
-        return '<a class="nb-ins" href="' + (site ? site + '/' : '') + 'radar.html#t1-' +
-          encodeURIComponent(code) + '-ins" target="_blank" rel="noopener"' +
-          ' title="基本面與籌碼概況（籌碼雷達，另開分頁）" onclick="event.stopPropagation()">概況</a>';
+        return '<a class="nb-ins" data-ins="' + tfEsc(code) + '" href="' + (site ? site + '/' : '') +
+          'radar.html#t1-' + encodeURIComponent(code) + '-ins" target="_blank" rel="noopener"' +
+          ' title="基本面與籌碼概況" aria-label="' + tfEsc(code) + ' 基本面與籌碼概況" onclick="return tfInsOpen(event, this)">' +
+          '<svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><rect x="2.5" y="1.5" width="11" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5 5h6M5 8h6M5 11h4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></a>';
+      }}
+      function tfInsOpen(e, a) {{
+        e.stopPropagation();
+        try {{
+          if (window.parent !== window && window.parent.TWSIXIns) {{
+            e.preventDefault();
+            window.parent.TWSIXIns(a.getAttribute('data-ins'));
+            return false;
+          }}
+        }} catch (err) {{ /* 不同網域：照連結開 */ }}
+        return true;
       }}
 
       // 台股慣例：漲紅、跌綠。
@@ -2386,9 +2399,10 @@ def build_interactive_html(results, today_str, output_dir, now=None, *,
         '.nb-bot{display:flex;justify-content:space-between;align-items:baseline;'
             'margin-top:2px;font-size:12px;color:#8b949e}'
         '.nb-pct{font-weight:bold}'
-        '.nb-ins{margin-left:6px;padding:0 6px;border:1px solid #30363d;border-radius:999px;'
-            'color:#58a6ff;font-size:11px;font-weight:600;text-decoration:none;white-space:nowrap}'
-        '.nb-ins:hover{border-color:#58a6ff;background:#161b22}'
+        '.nb-ins{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;'
+            'margin-left:5px;border:1px solid #30363d;border-radius:4px;background:#0d1117;color:#8b949e;'
+            'text-decoration:none;vertical-align:-3px}'
+        '.nb-ins:hover{border-color:#58a6ff;color:#58a6ff;background:#161b22}'
         '.nb-pct.up{color:#f85149}'
         '.nb-pct.dn{color:#3fb950}'
         '.nb-pct.fl{color:#8b949e}'
